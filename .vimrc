@@ -1,4 +1,4 @@
-colorscheme slate
+colorscheme molokai 
 
 " Set compatibility to Vim only
 set nocompatible
