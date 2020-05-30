@@ -7,8 +7,13 @@ filetype off
 set rtp+=~/.vim/bundle/Vundle.vim
 call vundle#begin()
 
+" let Vundle manage Vundle, required
+Plugin 'VundleVim/Vundle.vim'
+
 Plugin 'flazz/vim-colorschemes'
 Plugin 'valloric/youcompleteme'
+Plugin 'dracula/vim', {'name':'dracula'}
+"Plugin 'neoclide/coc.nvim', {'branch': 'release'}
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -28,7 +33,8 @@ filetype plugin indent on    " required
 " " Put your non-Plugin stuff after this line
 " Turn on syntax highlighing
 
-colorscheme molokai
+"colorscheme molokai
+colorscheme dracula
 
 syntax on
 
