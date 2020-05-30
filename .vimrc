@@ -1,16 +1,36 @@
-colorscheme molokai 
-
 " Set compatibility to Vim only
 set nocompatible
 
 " Helps force plugins to load correctly when it is turned back on below
 filetype off
 
-" Turn on syntax highlighing
-syntax on
+set rtp+=~/.vim/bundle/Vundle.vim
+call vundle#begin()
 
-" For plugins to load correctly
-filetype plugin indent on
+Plugin 'flazz/vim-colorschemes'
+Plugin 'valloric/youcompleteme'
+
+" All of your Plugins must be added before the following line
+call vundle#end()            " required
+filetype plugin indent on    " required
+" To ignore plugin indent changes, instead use:
+" "filetype plugin on
+" "
+" " Brief help
+" " :PluginList       - lists configured plugins
+" " :PluginInstall    - installs plugins; append `!` to update or just
+" :PluginUpdate
+" " :PluginSearch foo - searches for foo; append `!` to refresh local cache
+" " :PluginClean      - confirms removal of unused plugins; append `!` to
+" auto-approve removal
+" "
+" " see :h vundle for more details or wiki for FAQ
+" " Put your non-Plugin stuff after this line
+" Turn on syntax highlighing
+
+colorscheme molokai
+
+syntax on
 
 set autoindent
 
