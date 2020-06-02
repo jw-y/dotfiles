@@ -10,10 +10,13 @@ call vundle#begin()
 " let Vundle manage Vundle, required
 Plugin 'VundleVim/Vundle.vim'
 
+" Plugins
 Plugin 'flazz/vim-colorschemes'
 Plugin 'valloric/youcompleteme'
 Plugin 'dracula/vim', {'name':'dracula'}
-"Plugin 'neoclide/coc.nvim', {'branch': 'release'}
+Plugin 'vim-airline/vim-airline'
+Plugin 'vim-airline/vim-airline-themes'
+Plugin 'tpope/vim-fugitive'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -33,24 +36,39 @@ filetype plugin indent on    " required
 " " Put your non-Plugin stuff after this line
 " Turn on syntax highlighing
 
+" -----------------------------
+"  Make Pretty
+" -----------------------------
 "colorscheme molokai
 colorscheme dracula
 
+let g:airline_powerline_fonts=1
+
+" -----------------------------
+"  Basic stuff
+" -----------------------------
 syntax on
 
 set autoindent
+set showcmd " Show (partial) command in status line
+set showmatch " Show matching brackest
+set ignorecase " Do case insensitive matching
+set smartcase " Do smart case matching
+set mouse=a " Enable mouse usage (all modes)
+set spelllang=en_us
+set paste
+set modelines=0 " Turn off modelines
+set number " Show liine numbers
+set ruler " Show file stats
+set visualbell " Blink cursor on error instead of beeping (grr)
 
-" Turn off modelines
-set modelines=0
-
-" Show liine numbers
-set number
-
-" Show file stats
-set ruler
-
-" Blink cursor on error instead of beeping (grr)
-set visualbell
+inoremap " ""<left>
+inoremap ' ''<left>
+inoremap ( ()<left>
+inoremap [ []<left>
+inoremap { {}<left>
+inoremap {<CR> {<CR>}<ESC>O
+inoremap {;<CR> {<CR>};<ESC>O
 
 set tabstop=4
 set shiftwidth=4
