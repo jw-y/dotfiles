@@ -40,6 +40,7 @@ filetype plugin indent on    " required
 "  Make Pretty
 " -----------------------------
 "colorscheme molokai
+let g:dracula_italic = 0
 colorscheme dracula
 
 let g:airline_powerline_fonts=1
