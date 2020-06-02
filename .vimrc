@@ -56,7 +56,7 @@ set ignorecase " Do case insensitive matching
 set smartcase " Do smart case matching
 set mouse=a " Enable mouse usage (all modes)
 set spelllang=en_us
-set paste
+" set paste
 set modelines=0 " Turn off modelines
 set number " Show liine numbers
 set ruler " Show file stats
