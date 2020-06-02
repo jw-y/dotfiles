@@ -53,6 +53,8 @@ set autoindent
 set showcmd " Show (partial) command in status line
 set showmatch " Show matching brackest
 set ignorecase " Do case insensitive matching
+set hlsearch
+set incsearch
 set smartcase " Do smart case matching
 set mouse=a " Enable mouse usage (all modes)
 set spelllang=en_us
