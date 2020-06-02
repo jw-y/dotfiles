@@ -76,6 +76,8 @@ inoremap { {}<left>
 inoremap {<CR> {<CR>}<ESC>O
 inoremap {;<CR> {<CR>};<ESC>O
 
+nnoremap <CR> :noh<CR><CR>
+
 set tabstop=4
 set shiftwidth=4
 set softtabstop=4
