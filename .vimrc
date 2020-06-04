@@ -19,6 +19,7 @@ Plugin 'vim-airline/vim-airline-themes'
 Plugin 'tpope/vim-fugitive'
 Plugin 'preservim/nerdtree'
 Plugin 'sonph/onehalf', {'rtp': 'vim/'}
+Plugin 'rakr/vim-one'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -49,6 +50,10 @@ let g:airline_theme = 'fruit_punch'
 let g:airline_powerline_fonts=1
 
 map <C-n> :NERDTreeToggle<CR>
+
+if (has("termguicolors"))
+    set termguicolors
+endif
 
 " -----------------------------
 "  Basic stuff
