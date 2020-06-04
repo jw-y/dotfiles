@@ -13,6 +13,7 @@ Plug 'preservim/nerdtree'
 Plug 'sonph/onehalf', {'rtp': 'vim/'}
 Plug 'rakr/vim-one'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
+Plug 'airblade/vim-gitgutter'
 
 call plug#end()
 
