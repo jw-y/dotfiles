@@ -1,43 +1,33 @@
 " Set compatibility to Vim only
 set nocompatible
 
-" Helps force plugins to load correctly when it is turned back on below
-filetype off
+call plug#begin('~/.vim/plugged')
 
-set rtp+=~/.vim/bundle/Vundle.vim
-call vundle#begin()
+Plug 'flazz/vim-colorschemes'
+""Plug 'valloric/youcompleteme'
+Plug 'dracula/vim', {'name':'dracula'}
+Plug 'vim-airline/vim-airline'
+Plug 'vim-airline/vim-airline-themes'
+Plug 'tpope/vim-fugitive'
+Plug 'preservim/nerdtree'
+Plug 'sonph/onehalf', {'rtp': 'vim/'}
+Plug 'rakr/vim-one'
+Plug 'neoclide/coc.nvim', {'branch': 'release'}
 
-" let Vundle manage Vundle, required
-Plugin 'VundleVim/Vundle.vim'
+call plug#end()
 
-" Plugins
-Plugin 'flazz/vim-colorschemes'
-Plugin 'valloric/youcompleteme'
-Plugin 'dracula/vim', {'name':'dracula'}
-Plugin 'vim-airline/vim-airline'
-Plugin 'vim-airline/vim-airline-themes'
-Plugin 'tpope/vim-fugitive'
-Plugin 'preservim/nerdtree'
-Plugin 'sonph/onehalf', {'rtp': 'vim/'}
-Plugin 'rakr/vim-one'
-
-" All of your Plugins must be added before the following line
-call vundle#end()            " required
 filetype plugin indent on    " required
-" To ignore plugin indent changes, instead use:
-" "filetype plugin on
-" "
-" " Brief help
-" " :PluginList       - lists configured plugins
-" " :PluginInstall    - installs plugins; append `!` to update or just
-" :PluginUpdate
-" " :PluginSearch foo - searches for foo; append `!` to refresh local cache
-" " :PluginClean      - confirms removal of unused plugins; append `!` to
-" auto-approve removal
-" "
-" " see :h vundle for more details or wiki for FAQ
-" " Put your non-Plugin stuff after this line
-" Turn on syntax highlighing
+
+" use <tab> for trigger completion and navigate to the next complete item
+function! s:check_back_space() abort
+    let col = col('.') - 1
+    return !col || getline('.')[col - 1]  =~ '\s'
+endfunction
+
+inoremap <silent><expr> <Tab>
+    \ pumvisible() ? "\<C-n>" :
+    \ <SID>check_back_space() ? "\<Tab>" :
+    \ coc#refresh()
 
 " -----------------------------
 "  Make Pretty
