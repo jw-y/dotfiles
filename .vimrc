@@ -40,10 +40,11 @@ filetype plugin indent on    " required
 " -----------------------------
 "  Make Pretty
 " -----------------------------
-"colorscheme molokai
-let g:dracula_italic = 0
-colorscheme dracula
+colorscheme monokai-chris
+"let g:dracula_italic = 0
+"colorscheme dracula
 
+let g:airline_theme = 'fruit_punch'
 let g:airline_powerline_fonts=1
 
 map <C-n> :NERDTreeToggle<CR>
