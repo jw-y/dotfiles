@@ -21,6 +21,11 @@ filetype plugin indent on    " required
 " -----------------------------
 "  Coc Configs
 " -----------------------------
+let g:coc_global_extensions = [
+    \ 'coc-clangd',
+    \ 'coc-pairs',
+    \ ]
+
 source ~/.vimrc.coc
 
 " -----------------------------
