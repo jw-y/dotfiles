@@ -56,6 +56,7 @@ map <C-n> :NERDTreeToggle<CR>
 syntax on
 
 set autoindent
+set smartindent
 set showcmd " Show (partial) command in status line
 set showmatch " Show matching brackest
 set ignorecase " Do case insensitive matching
@@ -67,8 +68,10 @@ set spelllang=en_us
 " set paste
 set modelines=0 " Turn off modelines
 set number " Show liine numbers
+set title " Change title name
 set ruler " Show file stats
 set visualbell " Blink cursor on error instead of beeping (grr)
+set cursorline
 
 inoremap " ""<left>
 inoremap ' ''<left>
@@ -83,6 +86,7 @@ nnoremap <CR> :noh<CR><CR>
 set tabstop=4
 set shiftwidth=4
 set softtabstop=4
+set smarttab
 set expandtab
 
 " Status bar
