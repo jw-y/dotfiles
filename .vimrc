@@ -18,16 +18,10 @@ call plug#end()
 
 filetype plugin indent on    " required
 
-" use <tab> for trigger completion and navigate to the next complete item
-function! s:check_back_space() abort
-    let col = col('.') - 1
-    return !col || getline('.')[col - 1]  =~ '\s'
-endfunction
-
-inoremap <silent><expr> <Tab>
-    \ pumvisible() ? "\<C-n>" :
-    \ <SID>check_back_space() ? "\<Tab>" :
-    \ coc#refresh()
+" -----------------------------
+"  Coc Configs
+" -----------------------------
+source ~/.vimrc.coc
 
 " -----------------------------
 "  Make Pretty
@@ -50,6 +44,7 @@ endif
 " -----------------------------
 syntax on
 
+set hidden
 set autoindent
 set smartindent
 set showcmd " Show (partial) command in status line
@@ -68,13 +63,13 @@ set ruler " Show file stats
 set visualbell " Blink cursor on error instead of beeping (grr)
 set cursorline
 
-inoremap " ""<left>
-inoremap ' ''<left>
-inoremap ( ()<left>
-inoremap [ []<left>
-inoremap { {}<left>
-inoremap {<CR> {<CR>}<ESC>O
-inoremap {;<CR> {<CR>};<ESC>O
+" inoremap " ""<left>
+" inoremap ' ''<left>
+" inoremap ( ()<left>
+" inoremap [ []<left>
+" inoremap { {}<left>
+" inoremap {<CR> {<CR>}<ESC>O
+" inoremap {;<CR> {<CR>};<ESC>O
 
 nnoremap <CR> :noh<CR><CR>
 
