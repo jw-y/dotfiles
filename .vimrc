@@ -4,7 +4,7 @@ set nocompatible
 call plug#begin('~/.vim/plugged')
 
 Plug 'flazz/vim-colorschemes'
-""Plug 'valloric/youcompleteme'
+"Plug 'valloric/youcompleteme'
 Plug 'dracula/vim', {'name':'dracula'}
 Plug 'vim-airline/vim-airline'
 Plug 'vim-airline/vim-airline-themes'
@@ -43,9 +43,9 @@ let g:airline_powerline_fonts=1
 
 map <C-n> :NERDTreeToggle<CR>
 
-if (has("termguicolors"))
-    set termguicolors
-endif
+"if (has("termguicolors"))
+"    set termguicolors
+"endif
 
 " -----------------------------
 "  Basic stuff
