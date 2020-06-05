@@ -26,6 +26,7 @@ let g:coc_global_extensions = [
     \ 'coc-clangd',
     \ 'coc-pairs',
     \ 'coc-highlight',
+    \ 'coc-cmake',
     \ ]
 
 source ~/.vimrc.coc
