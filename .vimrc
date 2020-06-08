@@ -44,10 +44,9 @@ let g:airline_powerline_fonts=1
 
 map <C-n> :NERDTreeToggle<CR>
 
-"if (has("termguicolors"))
-"    set termguicolors
-"endif
-
+if(has("termguicolors"))
+    set termguicolors
+endif
 " -----------------------------
 "  Basic stuff
 " -----------------------------
