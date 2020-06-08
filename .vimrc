@@ -32,6 +32,8 @@ let g:coc_global_extensions = [
 
 source ~/.vimrc.coc
 
+autocmd FileType c,cpp,py,js let b:coc_pairs_disabled = ['<']
+
 " -----------------------------
 "  Make Pretty
 " -----------------------------
