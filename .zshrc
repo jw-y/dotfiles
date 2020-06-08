@@ -15,6 +15,7 @@ export LS_COLORS='ow=01;34'
 ZSH_THEME="robbyrussell-mod"
 #ZSH_THEME="avit"
 #ZSH_THEME="agnoster"
+source "~/myconfig/jungwoo.zsh-theme"
 
 # Set list of themes to pick from when loading at random
 # Setting this variable when ZSH_THEME=random will cause zsh to load
