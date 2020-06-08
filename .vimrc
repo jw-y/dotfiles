@@ -71,6 +71,16 @@ set title " Change title name
 set ruler " Show file stats
 set visualbell " Blink cursor on error instead of beeping (grr)
 set cursorline
+set scrolloff=2
+set autoread
+
+:set number relativenumber
+
+:augroup numbertoggle
+:  autocmd!
+:  autocmd BufEnter,FocusGained,InsertLeave * set relativenumber
+:  autocmd BufLeave,FocusLost,InsertEnter   * set norelativenumber
+:augroup END
 
 " inoremap " ""<left>
 " inoremap ' ''<left>
