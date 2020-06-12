@@ -28,6 +28,7 @@ let g:coc_global_extensions = [
     \ 'coc-highlight',
     \ 'coc-cmake',
     \ 'coc-python',
+    \ 'coc-tsserver',
     \ ]
 
 source ~/.vimrc.coc
