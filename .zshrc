@@ -108,6 +108,6 @@ source $ZSH/oh-my-zsh.sh
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
-alias ll='ls -alF --color'
-alias diff="diff --color"
+alias ll='ls -alF'
+alias diff="diff --color=tty"
 alias mv="mv -i"
