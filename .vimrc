@@ -103,6 +103,8 @@ set expandtab
 " Status bar
 set laststatus=2
 
+set wildmenu
+
 " Return to last edit position when opening files (You want this!)
 autocmd BufReadPost *
      \ if line("'\"") > 0 && line("'\"") <= line("$") |
