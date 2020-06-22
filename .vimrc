@@ -35,6 +35,9 @@ source ~/.vimrc.coc
 
 autocmd FileType c,cpp,py,js let b:coc_pairs_disabled = ['<']
 
+inoremap <silent><expr> <cr> pumvisible() ? coc#_select_confirm() 
+                                        \: "\<C-g>u\<CR>\<c-r>=coc#on_enter()\<CR>"
+
 " -----------------------------
 "  Make Pretty
 " -----------------------------
@@ -91,7 +94,6 @@ set autoread
 " inoremap { {}<left>
 " inoremap {<CR> {<CR>}<ESC>O
 " inoremap {;<CR> {<CR>};<ESC>O
-
 nnoremap <CR> :noh<CR><CR>
 
 set tabstop=4
