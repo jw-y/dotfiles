@@ -109,4 +109,6 @@ source $ZSH/oh-my-zsh.sh
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
 alias ll='ls -alF'
+alias diff="diff --color=tty"
 alias mv="mv -i"
+alias cp="cp -i"
