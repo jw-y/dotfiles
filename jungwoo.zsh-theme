@@ -1,4 +1,13 @@
-PROMPT='%{$fg[blue]%}%3~%{$reset_color%} $(git_prompt_info)'
+local hostname="%F{245}%m%f"
+PROMPT=""
+
+if [[ -n $SSH_CONNECTION ]]; then
+    PROMPT+="${hostname} "
+else
+    PROMPT+=""
+fi
+
+PROMPT+='%{$fg[blue]%}%3~%{$reset_color%} $(git_prompt_info)'
 PROMPT+="%(?.%B%F{magenta}» .%F{yellow}» )%f%b"
 RPROMPT='%F{245}%t %w%f'
 
