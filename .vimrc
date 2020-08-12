@@ -78,6 +78,8 @@ set visualbell " Blink cursor on error instead of beeping (grr)
 set cursorline
 set scrolloff=2
 set autoread
+set foldmethod=syntax
+set foldnestmax=1
 
 :set number relativenumber
 
@@ -95,6 +97,7 @@ set autoread
 " inoremap {<CR> {<CR>}<ESC>O
 " inoremap {;<CR> {<CR>};<ESC>O
 nnoremap <CR> :noh<CR><CR>
+nnoremap <space> za
 
 set tabstop=4
 set shiftwidth=4
