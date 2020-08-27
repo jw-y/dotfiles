@@ -60,10 +60,9 @@ endif
 syntax on
 
 " syntax highlighting
-highlight Normal guibg=#060a0e
-highlight CursorLine guibg=#161a1e
-hi LineNr guibg=#161a1e
-
+hi Normal guibg=#101016
+hi CursorLine guibg=#26262c
+hi LineNr guibg=#202026
 
 set hidden
 set autoindent
