@@ -62,8 +62,8 @@ syntax on
 " syntax highlighting
 hi Normal guibg=#101016
 hi CursorLine guibg=#26262c
-hi CursorLineNr guibg=#2c2c32
-hi LineNr guibg=#18181f
+hi CursorLineNr guibg=#2e2e34
+hi LineNr guibg=#1a1a22
 
 set hidden
 set autoindent
