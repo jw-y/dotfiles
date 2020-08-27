@@ -65,6 +65,10 @@ hi CursorLine guibg=#26262c
 hi CursorLineNr guibg=#2e2e34
 hi LineNr guibg=#1a1a22
 
+" Cursor Shape
+let &t_SI .= "\<Esc>[5 q"
+let &t_EI .= "\<Esc>[1 q"
+
 set hidden
 set autoindent
 set smartindent
