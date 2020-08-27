@@ -53,10 +53,13 @@ map <C-n> :NERDTreeToggle<CR>
 if(has("termguicolors"))
     set termguicolors
 endif
+
 " -----------------------------
 "  Basic stuff
 " -----------------------------
 syntax on
+
+highlight Normal guibg=#030408
 
 set hidden
 set autoindent
@@ -115,3 +118,4 @@ autocmd BufReadPost *
      \ if line("'\"") > 0 && line("'\"") <= line("$") |
      \   exe "normal! g`\"" |
      \ endif
+
