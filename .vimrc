@@ -59,7 +59,11 @@ endif
 " -----------------------------
 syntax on
 
-highlight Normal guibg=#030408
+" syntax highlighting
+highlight Normal guibg=#060a0e
+highlight CursorLine guibg=#161a1e
+hi LineNr guibg=#161a1e
+
 
 set hidden
 set autoindent
