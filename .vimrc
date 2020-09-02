@@ -59,11 +59,8 @@ endif
 " -----------------------------
 syntax on
 
-" syntax highlighting
-hi Normal guibg=#101016
-hi CursorLine guibg=#26262c
-hi CursorLineNr guibg=#2e2e34
-hi LineNr guibg=#1a1a22
+" change highlighting
+source ~/jwcolors.vim
 
 " Cursor Shape
 let &t_SI .= "\<Esc>[5 q"
