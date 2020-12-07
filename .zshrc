@@ -108,7 +108,7 @@ source $ZSH/oh-my-zsh.sh
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
-alias ll='ls -alF'
+alias ll='ls -lF'
 alias diff="diff --color=tty"
 alias mv="mv -i"
 alias cp="cp -i"
