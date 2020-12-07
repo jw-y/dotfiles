@@ -2,7 +2,7 @@
 # export PATH=$HOME/bin:/usr/local/bin:$PATH
 
 # Path to your oh-my-zsh installation.
-export ZSH="/home/jungwoo/.oh-my-zsh"
+export ZSH="$HOME/.oh-my-zsh"
 
 DEFAULT_USER=`whoami`
 export LS_COLORS='ow=01;34'
