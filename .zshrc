@@ -6,6 +6,7 @@ export ZSH="$HOME/.oh-my-zsh"
 
 DEFAULT_USER=`whoami`
 export LS_COLORS='ow=01;34'
+export TERM="xterm-256color"
 
 # Set name of the theme to load --- if set to "random", it will
 # load a random theme each time oh-my-zsh is loaded, in which case,
