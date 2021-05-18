@@ -78,6 +78,7 @@ set smartcase " Do smart case matching
 set mouse=a " Enable mouse usage (all modes)
 set spelllang=en_us
 " set paste
+set pastetoggle=<F2>
 set modelines=0 " Turn off modelines
 set number " Show liine numbers
 set title " Change title name
