@@ -89,6 +89,7 @@ set scrolloff=2
 set autoread
 set foldmethod=syntax
 set foldnestmax=1
+set backspace=indent,eol,start
 
 :set number relativenumber
 
