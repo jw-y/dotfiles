@@ -115,6 +115,8 @@ set softtabstop=4
 set smarttab
 set expandtab
 
+set clipboard^=unnamed,unnamedplus
+
 " Status bar
 set laststatus=2
 
