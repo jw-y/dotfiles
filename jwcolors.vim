@@ -56,9 +56,18 @@ hi LineNr guibg=#1a1a22
 " User interface colors 
 call s:h("CursorLineNr", s:yellow, "", "")
 
+
 " Syntax colors
 
 
+" Python
+
+augroup python_syntax_extra
+  autocmd!
+  autocmd! Syntax python :syn keyword Identifier self cls mcs
+augroup END
+
+call s:h("pythonOperator", s:red, "", "")
 
 
 
