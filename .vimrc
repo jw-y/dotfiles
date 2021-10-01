@@ -27,10 +27,10 @@ let g:coc_global_extensions = [
     \ 'coc-pairs',
     \ 'coc-highlight',
     \ 'coc-cmake',
-    \ 'coc-pyright',
+    \ 'coc-python',
     \ 'coc-tsserver',
     \ ]
-" \ 'coc-python',
+"   \ 'coc-pyright',
 
 source ~/.vimrc.coc
 

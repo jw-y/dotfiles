@@ -1,0 +1,40 @@
+/* shrink headebars */
+headerbar {
+    /*min-height: 38px;*/
+    min-height: 30px;
+    padding-left: 2px; /* same as childrens vertical margins for nicer proportions */
+    padding-right: 2px;
+}
+
+headerbar entry,
+headerbar spinbutton,
+headerbar button,
+headerbar separator {
+    margin-top: 2px; /* same as headerbar side padding for nicer proportions */
+    margin-bottom: 2px;
+}
+
+headerbar button{
+    padding-bottom: 0px;
+    padding-left: 0px;
+    padding-right: 0px;
+    padding-top: 0px;
+    min-height: 30px;
+    min-width: 30px;
+}
+
+.nautilus-path-bar button{
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+/* shrink ssd titlebars */
+.default-decoration {
+    min-height: 0; /* let the entry and button drive the titlebar size */ 
+    padding: 2px
+}
+
+.default-decoration .titlebutton {
+    min-height: 22px; /* tweak these two props to reduce button size */
+    min-width: 22px;
+}
