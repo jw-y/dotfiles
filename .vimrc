@@ -81,7 +81,7 @@ set spelllang=en_us
 " set paste
 set pastetoggle=<F2>
 set modelines=0 " Turn off modelines
-set number " Show liine numbers
+set number " Show line numbers
 set title " Change title name
 set ruler " Show file stats
 set visualbell " Blink cursor on error instead of beeping (grr)

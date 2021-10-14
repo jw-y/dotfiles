@@ -23,9 +23,18 @@ headerbar button{
     min-width: 30px;
 }
 
+headerbar .text-button{
+	padding-left: 8px;
+	padding-right: 8px;
+}
+
 .nautilus-path-bar button{
   padding-left: 8px;
   padding-right: 8px;
+}
+
+.path-bar-box {
+  padding-left: 2px;
 }
 
 /* shrink ssd titlebars */
