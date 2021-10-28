@@ -113,6 +113,7 @@ alias ll='ls -lF'
 #alias diff="diff --color=tty"
 alias mv="mv -i"
 alias cp="cp -i"
+alias rm="rm -i"
 
 function pretty_csv {
     column -t -s, -n "$@" | less -F -S -X -K
