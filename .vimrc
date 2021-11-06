@@ -116,7 +116,7 @@ set softtabstop=4
 set smarttab
 set expandtab
 
-set clipboard^=unnamed,unnamedplus
+set clipboard=unnamed,unnamedplus
 set timeoutlen=1000 ttimeoutlen=5
 
 " Status bar
