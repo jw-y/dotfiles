@@ -29,6 +29,7 @@ let g:coc_global_extensions = [
     \ 'coc-cmake',
     \ 'coc-python',
     \ 'coc-tsserver',
+    \ 'coc-json',
     \ ]
 "   \ 'coc-pyright',
 
