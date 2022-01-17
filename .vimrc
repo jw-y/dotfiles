@@ -14,6 +14,10 @@ Plug 'sonph/onehalf', {'rtp': 'vim/'}
 Plug 'rakr/vim-one'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'airblade/vim-gitgutter'
+Plug 'junegunn/goyo.vim'
+
+" Plug 'prabirshrestha/vim-lsp'
+" Plug 'mattn/vim-lsp-settings'
 
 call plug#end()
 
