@@ -12,9 +12,10 @@
     "python.linting.enabled": true,
     "python.linting.flake8Enabled": true,
     "python.linting.flake8Path": "~/.local/bin/flake8",
-    "python.linting.pylintEnabled": false,
+    "python.linting.flake8Args": ["--max-line-length=88"],
+    "python.linting.pylintEnabled": true,
     "python.linting.pylintPath": "~/.local/bin/pylint",
-    "python.linting.pylintArgs": ["--generated-members=numpy.* ,torch.*,cv2.*,cv.*"],
+    "python.linting.pylintArgs": ["--generated-members=numpy.*,torch.*,cv2.*,cv.*"],
 
     "pyright.disableDiagnostics": false
 }
