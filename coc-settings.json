@@ -1,4 +1,12 @@
 {
+    "coc.preferences.extensionUpdateCheck": "daily",
+    "suggest.noselect": true,
+    "diagnostic.errorSign": "✖",
+    "diagnostic.warningSign": "⚠",
+    "diagnostic.infoSign": "ℹ",
+    "diagnostic.hintSign": "➤",
+    "diagnostic.checkCurrentLine": true,
+
     // coc-pyright
     "python.formatting.provider": "black",
     "python.formatting.blackPath": "~/.local/bin/black",
@@ -9,7 +17,5 @@
     "python.linting.pylintPath": "~/.local/bin/pylint",
     "python.linting.pylintArgs": ["--generated-members=numpy.* ,torch.*,cv2.*,cv.*"],
 
-    "pyright.disableDiagnostics": false,
-
-    "diagnostic.checkCurrentLine": true
+    "pyright.disableDiagnostics": false
 }
