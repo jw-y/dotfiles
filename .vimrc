@@ -15,7 +15,7 @@ Plug 'rakr/vim-one'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'airblade/vim-gitgutter'
 Plug 'junegunn/goyo.vim'
-
+" Plug 'psf/black', {'branch': 'stable'}
 " Plug 'prabirshrestha/vim-lsp'
 " Plug 'mattn/vim-lsp-settings'
 
