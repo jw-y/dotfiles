@@ -97,6 +97,7 @@ set autoread
 set foldmethod=syntax
 set foldnestmax=1
 set backspace=indent,eol,start
+set signcolumn=auto
 
 :set number relativenumber
 

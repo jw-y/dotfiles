@@ -5,7 +5,7 @@
     "diagnostic.warningSign": "⚠",
     "diagnostic.infoSign": "ℹ",
     "diagnostic.hintSign": "➤",
-    "diagnostic.checkCurrentLine": true,
+    "diagnostic.checkCurrentLine": false,
 
     // coc-pyright
     "python.formatting.provider": "black",
