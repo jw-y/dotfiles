@@ -1,11 +1,10 @@
 {
     "coc.preferences.extensionUpdateCheck": "daily",
-    "suggest.noselect": true,
-    "diagnostic.errorSign": "✖",
-    "diagnostic.warningSign": "⚠",
+    "suggest.noselect": false,
+    "diagnostic.errorSign": "✖", // "✘"
     "diagnostic.infoSign": "ℹ",
     "diagnostic.hintSign": "➤",
-    "diagnostic.checkCurrentLine": false,
+    "diagnostic.enableHighlightLineNumber": true,
 
     // coc-pyright
     "python.formatting.provider": "black",
@@ -13,7 +12,7 @@
     "python.linting.enabled": true,
     "python.linting.flake8Enabled": true,
     "python.linting.flake8Path": "~/.local/bin/flake8",
-    "python.linting.pylintEnabled": true,
+    "python.linting.pylintEnabled": false,
     "python.linting.pylintPath": "~/.local/bin/pylint",
     "python.linting.pylintArgs": ["--generated-members=numpy.* ,torch.*,cv2.*,cv.*"],
 
