@@ -11,3 +11,5 @@ alias interacti IPython.embed(config=cfg)
 
 #aliases
 alias q ""
+
+alias rethrow import sys, traceback; traceback.print_exception(*sys.exc_info())
