@@ -57,6 +57,9 @@ let g:airline_theme = 'fruit_punch'
 let g:airline_powerline_fonts=1
 
 "let NERDTreeWinSize=50
+"autocmd FileType nerdtree set norelativenumber
+" autocmd BufEnter NERD_* setlocal norelativenumber
+let g:NERDTreeShowLineNumbers=0
 map <C-n> :NERDTreeToggle<CR>
 " Exit Vim if NERDTree is the only window remaining in the only tab.
 autocmd BufEnter * if tabpagenr('$') == 1 && winnr('$') == 1 && exists('b:NERDTree') && b:NERDTree.isTabTree() | quit | endif
@@ -112,13 +115,17 @@ set signcolumn=auto
 set updatetime=250
 set encoding=UTF-8
 
-:set number relativenumber
+set number relativenumber
 
 :augroup numbertoggle
 :  autocmd!
 :  autocmd BufEnter,FocusGained,InsertLeave * set relativenumber
 :  autocmd BufLeave,FocusLost,InsertEnter   * set norelativenumber
 :augroup END
+
+" no relativenumber for nerdtree
+autocmd FileType nerdtree set norelativenumber
+autocmd BufEnter NERD_* setlocal norelativenumber
 
 " inoremap " ""<left>
 " inoremap ' ''<left>
