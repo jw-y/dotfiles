@@ -10,6 +10,7 @@ Plug 'vim-airline/vim-airline'
 Plug 'vim-airline/vim-airline-themes'
 Plug 'tpope/vim-fugitive'
 Plug 'preservim/nerdtree'
+"Plug 'ryanoasis/vim-devicons'
 Plug 'sonph/onehalf', {'rtp': 'vim/'}
 Plug 'rakr/vim-one'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
@@ -106,6 +107,7 @@ set foldnestmax=1
 set backspace=indent,eol,start
 set signcolumn=auto
 set updatetime=250
+set encoding=UTF-8
 
 :set number relativenumber
 
