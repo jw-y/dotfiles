@@ -61,6 +61,13 @@ if(has("termguicolors"))
     set termguicolors
 endif
 
+"let g:gitgutter_sign_added = 'xx'
+"let g:gitgutter_sign_modified = 'yy'
+"let g:gitgutter_sign_removed = 'zz'
+let g:gitgutter_sign_removed_first_line = '^'
+let g:gitgutter_sign_removed_above_and_below = '='
+let g:gitgutter_sign_modified_removed = 'M'
+
 " -----------------------------
 "  Basic stuff
 " -----------------------------
@@ -98,6 +105,7 @@ set foldmethod=syntax
 set foldnestmax=1
 set backspace=indent,eol,start
 set signcolumn=auto
+set updatetime=250
 
 :set number relativenumber
 
