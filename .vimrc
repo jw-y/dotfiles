@@ -16,6 +16,7 @@ Plug 'rakr/vim-one'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'airblade/vim-gitgutter'
 Plug 'junegunn/goyo.vim'
+Plug 'iamcco/markdown-preview.nvim', {'do': 'cd app && yarn install'}
 " Plug 'psf/black', {'branch': 'stable'}
 " Plug 'prabirshrestha/vim-lsp'
 " Plug 'mattn/vim-lsp-settings'
@@ -36,6 +37,7 @@ let g:coc_global_extensions = [
     \ 'coc-tsserver',
     \ 'coc-json',
     \ ]
+"   \ 'coc-markdownlint',
 "   \ 'coc-pyright',
 "   \ 'coc-python',
 
