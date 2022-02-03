@@ -17,6 +17,7 @@ Plug 'neoclide/coc.nvim', {'branch': 'release'}
 Plug 'airblade/vim-gitgutter'
 Plug 'junegunn/goyo.vim'
 Plug 'iamcco/markdown-preview.nvim', {'do': 'cd app && yarn install'}
+Plug 'vim-python/python-syntax'
 " Plug 'psf/black', {'branch': 'stable'}
 " Plug 'prabirshrestha/vim-lsp'
 " Plug 'mattn/vim-lsp-settings'
@@ -69,6 +70,9 @@ autocmd BufEnter * if tabpagenr('$') == 1 && winnr('$') == 1 && exists('b:NERDTr
 if(has("termguicolors"))
     set termguicolors
 endif
+
+" python-syntax
+let g:python_highlight_all = 1
 
 "let g:gitgutter_sign_added = 'xx'
 "let g:gitgutter_sign_modified = 'yy'
