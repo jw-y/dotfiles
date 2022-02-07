@@ -37,6 +37,7 @@ let g:coc_global_extensions = [
     \ 'coc-pyright',
     \ 'coc-tsserver',
     \ 'coc-json',
+    \ 'coc-html',
     \ ]
 "   \ 'coc-markdownlint',
 "   \ 'coc-pyright',
