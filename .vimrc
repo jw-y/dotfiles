@@ -124,11 +124,17 @@ set encoding=UTF-8
 
 set number relativenumber
 
-:augroup numbertoggle
-:  autocmd!
-:  autocmd BufEnter,FocusGained,InsertLeave * set relativenumber
-:  autocmd BufLeave,FocusLost,InsertEnter   * set norelativenumber
-:augroup END
+augroup numbertoggle
+  autocmd!
+  autocmd BufEnter,FocusGained,InsertLeave,WinEnter * set relativenumber
+  autocmd BufLeave,FocusLost,InsertEnter,WinLeave   * set norelativenumber
+augroup END
+
+":augroup numbertoggle
+":  autocmd!
+":  autocmd BufEnter,FocusGained,InsertLeave,WinEnter * if &nu && mode() != "i" | set rnu   | endif
+":  autocmd BufLeave,FocusLost,InsertEnter,WinLeave   * if &nu                  | set nornu | endif
+":augroup END
 
 " no relativenumber for nerdtree
 autocmd FileType nerdtree set norelativenumber
