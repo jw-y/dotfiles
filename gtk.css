@@ -23,7 +23,7 @@ headerbar button{
     min-width: 30px;
 }
 
-headerbar .text-button{
+headerbar label{
 	padding-left: 8px;
 	padding-right: 8px;
 }
