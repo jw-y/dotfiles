@@ -3,6 +3,8 @@ set -e
 #set -x
 
 TARGET=$HOME
+VIM_PATH=$HOME/.vim/
+THEME_PATH=$HOME/.oh-my-zsh/themes/
 
 FileArray=( 
     ".vimrc"
@@ -24,7 +26,7 @@ echo "installing ohmyzsh..."
 sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 
 echo "copying jungwoo zsh theme"
-cp jungwoo.zsh-theme ~/.oh-my-zsh/themes/
+cp jungwoo.zsh-theme $THEME_PATH
 
 echo "installing zsh-autosuggestions..."
 git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
@@ -39,7 +41,7 @@ echo "installing coc-vim plugins..."
 vim +'CocUpdateSync' +qa
 
 echo "copying coc-settings..."
-cp ./coc-settings.json ~/.vim/
+cp ./coc-settings.json $VIM_PATH
 
 echo "installing tmux plugins..."
 ~/.tmux/plugins/tpm/bin/install_plugins
