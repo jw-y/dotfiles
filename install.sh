@@ -2,7 +2,6 @@
 set -e
 #set -x
 
-PREFIX=$HOME
 TARGET=$HOME
 
 FileArray=( 
