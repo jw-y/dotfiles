@@ -10,6 +10,6 @@ cfg.InteractiveShellEmbed.confirm_exit = False
 alias interacti IPython.embed(config=cfg)
 
 #aliases
-alias q ""
+alias q None
 
 alias rethrow import sys, traceback; traceback.print_exception(*sys.exc_info())
