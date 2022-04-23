@@ -2,8 +2,8 @@
 set -e
 
 TARGET=$HOME
-VIM_PATH=$HOME/.vim/
-THEME_PATH=$HOME/.oh-my-zsh/themes/
+VIM_PATH=$HOME/.vim
+THEME_PATH=$HOME/.oh-my-zsh/themes
 
 FileArray=( 
     ".vimrc"

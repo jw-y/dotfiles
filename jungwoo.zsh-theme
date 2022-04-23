@@ -7,11 +7,11 @@ else
     PROMPT+=""
 fi
 
-PROMPT+='%{$fg[blue]%}%3~%{$reset_color%} $(git_prompt_info)'
-PROMPT+="%(?.%B%F{magenta}» .%F{yellow}» )%f%b"
+PROMPT+='%F{63}%3~%f $(git_prompt_info)'
+PROMPT+="%(?.%B%F{201}» .%F{yellow}» )%f%b"
 RPROMPT='%F{245}%t %w%f'
 
-ZSH_THEME_GIT_PROMPT_PREFIX="%F{cyan}|%f%F{1}"
-ZSH_THEME_GIT_PROMPT_SUFFIX="%F{cyan}|%f "
+ZSH_THEME_GIT_PROMPT_PREFIX="%F{39}|%f%F{9}"
+ZSH_THEME_GIT_PROMPT_SUFFIX="%F{39}|%f "
 ZSH_THEME_GIT_PROMPT_DIRTY="%f%F{yellow}✗%f"
 ZSH_THEME_GIT_PROMPT_CLEAN="%f"
