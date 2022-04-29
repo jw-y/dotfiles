@@ -32,5 +32,5 @@ fi
 f=coc-settings.json
 if ! cmp $f $VIM_PATH/$f; then
     echo "updating $f"
-    cp -u $f $TARGET
+    cp -u $f $VIM_PATH
 fi
