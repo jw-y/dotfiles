@@ -19,18 +19,18 @@ for f in "${FileArray[@]}"
 do
     if ! cmp $f $TARGET/$f ; then
         echo "updating $f"
-        cp -u $f $TARGET
+        rsync -u $f $TARGET
     fi
 done
 
 f=jungwoo.zsh-theme
 if ! cmp $f $THEME_PATH/$f; then
     echo "updating $f"
-    cp -u $f $TARGET
+    rsync -u $f $TARGET
 fi
 
 f=coc-settings.json
 if ! cmp $f $VIM_PATH/$f; then
     echo "updating $f"
-    cp -u $f $VIM_PATH
+    rsync -u $f $VIM_PATH
 fi
