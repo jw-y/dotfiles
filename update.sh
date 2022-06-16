@@ -26,7 +26,7 @@ done
 f=jungwoo.zsh-theme
 if ! cmp $f $THEME_PATH/$f; then
     echo "updating $f"
-    rsync -u $f $TARGET
+    rsync -u $f $THEME_PATH
 fi
 
 f=coc-settings.json
