@@ -155,6 +155,7 @@ set shiftwidth=4
 set softtabstop=4
 set smarttab
 set expandtab
+autocmd Filetype cpp setlocal expandtab tabstop=2 shiftwidth=2 softtabstop=2
 
 set clipboard=unnamed,unnamedplus
 set timeoutlen=1000 ttimeoutlen=5
