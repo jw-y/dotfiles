@@ -47,9 +47,6 @@ source ~/.vimrc.coc
 
 autocmd FileType c,cpp,python,javascript let b:coc_pairs_disabled = ['<']
 
-inoremap <silent><expr> <cr> pumvisible() ? coc#_select_confirm()
-                    \: "\<C-g>u\<CR>\<c-r>=coc#on_enter()\<CR>"
-
 " -----------------------------
 "  Make Pretty
 " -----------------------------
