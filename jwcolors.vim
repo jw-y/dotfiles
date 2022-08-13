@@ -53,6 +53,9 @@ hi CursorLine guibg=#26262c
 "hi CursorLineNr guibg=#2e2e34
 hi LineNr guibg=#1a1a22
 
+call s:h("CocFloating", "", s:gutter_bg, "")
+call s:h("CocMenuSel", "", s:selection, "")
+
 " User interface colors 
 call s:h("CursorLineNr", s:yellow, "", "")
 
