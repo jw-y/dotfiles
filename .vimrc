@@ -38,6 +38,7 @@ let g:coc_global_extensions = [
     \ 'coc-tsserver',
     \ 'coc-json',
     \ 'coc-html',
+    \ 'coc-prettier',
     \ ]
 "   \ 'coc-markdownlint',
 "   \ 'coc-pyright',
@@ -78,6 +79,7 @@ let g:python_highlight_all = 1
 "let g:gitgutter_sign_removed_first_line = '^'
 "let g:gitgutter_sign_removed_above_and_below = '='
 "let g:gitgutter_sign_modified_removed = 'M'
+command! -nargs=0 Prettier :CocCommand prettier.forceFormatDocument
 
 " -----------------------------
 "  Basic stuff
