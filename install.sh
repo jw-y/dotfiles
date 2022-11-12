@@ -39,7 +39,11 @@ echo "installing tmux-plugin-manager..."
 git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
 
 echo "installing tmux plugins..."
-~/.tmux/plugins/tpm/bin/install_plugins
+tmux start-server && \
+    tmux new-session -d && \
+    sleep 1 && \
+    ~/.tmux/plugins/tpm/scripts/install_plugins.sh && \
+    tmux kill-server
 
 echo "installing ohmyzsh..."
 sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" &
