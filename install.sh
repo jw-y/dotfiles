@@ -16,6 +16,12 @@ FileArray=(
     ".ipdb"
 ) 
 
+if ! command -v zsh &> /dev/null
+then
+    echo "'zsh' is not found! Try 'sudo apt install zsh'."
+    exit
+fi
+
 for f in "${FileArray[@]}"
 do
     echo "copying $f to $TARGET"
