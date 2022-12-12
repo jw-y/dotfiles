@@ -18,6 +18,7 @@ Plug 'airblade/vim-gitgutter'
 Plug 'junegunn/goyo.vim'
 Plug 'iamcco/markdown-preview.nvim', {'do': 'cd app && yarn install'}
 Plug 'vim-python/python-syntax'
+Plug 'ojroques/vim-oscyank', {'branch': 'main'}
 " Plug 'psf/black', {'branch': 'stable'}
 " Plug 'prabirshrestha/vim-lsp'
 " Plug 'mattn/vim-lsp-settings'
@@ -158,6 +159,9 @@ autocmd Filetype cpp setlocal expandtab tabstop=2 shiftwidth=2 softtabstop=2
 
 set clipboard=unnamed,unnamedplus
 set timeoutlen=1000 ttimeoutlen=5
+
+" osc yank
+autocmd TextYankPost * if v:event.operator is 'y' && v:event.regname is '' | OSCYankReg " | endif"
 
 " Status bar
 set laststatus=2
