@@ -1,21 +1,26 @@
 {
-    "coc.preferences.extensionUpdateCheck": "daily",
-    "suggest.noselect": false,
-    "diagnostic.errorSign": "✖", // "✘"
-    "diagnostic.infoSign": "ℹ",
-    "diagnostic.hintSign": "➤",
-    "diagnostic.enableHighlightLineNumber": true,
+  "coc.preferences.extensionUpdateCheck": "daily",
+  "suggest.noselect": false,
+  "diagnostic.errorSign": "✖", // "✘"
+  "diagnostic.infoSign": "ℹ",
+  "diagnostic.hintSign": "➤",
+  "diagnostic.enableHighlightLineNumber": true,
 
-    // coc-pyright
-    "python.formatting.provider": "black",
-    "python.formatting.blackPath": "~/.local/bin/black",
-    "python.linting.enabled": true,
-    "python.linting.flake8Enabled": true,
-    "python.linting.flake8Path": "~/.local/bin/flake8",
-    "python.linting.flake8Args": ["--max-line-length=88"],
-    "python.linting.pylintEnabled": true,
-    "python.linting.pylintPath": "~/.local/bin/pylint",
-    "python.linting.pylintArgs": ["--generated-members=numpy.*,torch.*,cv2.*,cv.*"],
+  // coc-pyright
+  "python.formatting.provider": "black",
+  "python.formatting.blackPath": "~/.local/bin/black",
+  "python.linting.enabled": true,
+  "python.linting.flake8Enabled": true,
+  "python.linting.flake8Path": "~/.local/bin/flake8",
+  "python.linting.flake8Args": ["--max-line-length=88"],
+  "python.linting.pylintEnabled": true,
+  "python.linting.pylintPath": "~/.local/bin/pylint",
+  "python.linting.pylintArgs": [
+    "--generated-members=numpy.*,torch.*,cv2.*,cv.*"
+  ],
 
-    "pyright.disableDiagnostics": false
+  "pyright.disableDiagnostics": false,
+
+  // coc-clangd
+  "clangd.fallbackFlags": ["-std=c++17"]
 }
