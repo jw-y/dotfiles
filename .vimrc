@@ -157,11 +157,12 @@ set smarttab
 set expandtab
 autocmd Filetype cpp setlocal expandtab tabstop=2 shiftwidth=2 softtabstop=2
 
-set clipboard=unnamed,unnamedplus
+" set clipboard=unnamed,unnamedplus
 set timeoutlen=1000 ttimeoutlen=5
 
 " osc yank
 autocmd TextYankPost * if v:event.operator is 'y' && v:event.regname is '' | OSCYankReg " | endif"
+set clipboard& clipboard^=unnamed,unnamedplus
 
 " Status bar
 set laststatus=2
