@@ -11,7 +11,7 @@ FileArray=(
     ".vimrc.coc"
     ".zshrc"
     ".tmux.conf"
-    "jwcolors.vim"
+    ".jwcolors.vim"
     ".pdbrc"
     ".ipdb"
 ) 
