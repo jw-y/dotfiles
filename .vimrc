@@ -88,7 +88,7 @@ command! -nargs=0 Prettier :CocCommand prettier.forceFormatDocument
 syntax on
 
 " change highlighting
-source ~/jwcolors.vim
+source ~/.jwcolors.vim
 
 " Cursor Shape
 let &t_SI .= "\<Esc>[5 q"
