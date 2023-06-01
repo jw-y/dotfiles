@@ -161,7 +161,10 @@ autocmd Filetype cpp setlocal expandtab tabstop=2 shiftwidth=2 softtabstop=2
 set timeoutlen=1000 ttimeoutlen=5
 
 " osc yank
-autocmd TextYankPost * if v:event.operator is 'y' && v:event.regname is '' | OSCYankReg " | endif"
+autocmd TextYankPost *
+    \ if v:event.operator is 'y' && v:event.regname is '+' |
+    \ execute 'OSCYankRegister +' |
+    \ endif
 set clipboard& clipboard^=unnamed,unnamedplus
 
 " Status bar
