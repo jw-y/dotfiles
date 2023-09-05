@@ -161,6 +161,9 @@ autocmd Filetype cpp setlocal expandtab tabstop=2 shiftwidth=2 softtabstop=2
 set timeoutlen=1000 ttimeoutlen=5
 
 " osc yank
+nmap <leader>c <Plug>OSCYankOperator
+nmap <leader>cc <leader>c_
+vmap <leader>c <Plug>OSCYankVisual
 autocmd TextYankPost *
     \ if v:event.operator is 'y' && v:event.regname is '+' |
     \ execute 'OSCYankRegister +' |
