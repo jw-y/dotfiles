@@ -123,3 +123,5 @@ function pretty_csv {
 }
 
 export PYTHONBREAKPOINT=ipdb.set_trace
+
+alias nvim="~/dotfiles/nvim.appimage"
