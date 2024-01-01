@@ -8,6 +8,9 @@ vim.opt.shiftwidth = 4
 vim.opt.expandtab = true
 vim.opt.smartindent = true
 
+vim.o.ignorecase = true
+vim.o.smartcase = true
+
 vim.opt.termguicolors = true
 
 vim.api.nvim_create_autocmd("FocusGained", {

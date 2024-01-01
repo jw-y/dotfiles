@@ -23,3 +23,7 @@ require("config.keymaps")
 require("lsp_config")
 
 vim.cmd.colorscheme "catppuccin-mocha"
+
+-- highlight cursor number
+vim.opt.cursorline = true
+vim.opt.cursorlineopt = "number"
