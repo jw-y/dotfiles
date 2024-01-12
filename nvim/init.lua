@@ -20,9 +20,9 @@ require("lazy").setup("plugins")
 require("config.options")
 require("config.keymaps")
 
-require("lsp_config")
+-- require("lsp_config")
 
-vim.cmd.colorscheme "catppuccin-mocha"
+vim.cmd.colorscheme "catppuccin"
 
 -- highlight cursor number
 vim.opt.cursorline = true
