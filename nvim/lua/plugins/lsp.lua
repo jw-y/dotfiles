@@ -196,7 +196,7 @@ return {
 
             configs.setup({
                 ensure_installed = {
-                    "python", "lua", "yaml"
+                    "python", "lua", "yaml", "bash", "rust"
                     --"c", "lua", "vim", "vimdoc", "query",
                     --"python", "javascript",
                     --"html", "markdown", "toml", "yaml",

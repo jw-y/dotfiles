@@ -13,6 +13,8 @@ vim.o.smartcase = true
 
 vim.opt.termguicolors = true
 
+vim.opt.clipboard = "unnamedplus"
+
 vim.api.nvim_create_autocmd("FocusGained", {
     pattern = "*",
     callback = function()
