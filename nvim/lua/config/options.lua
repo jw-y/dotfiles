@@ -15,6 +15,24 @@ vim.opt.termguicolors = true
 
 vim.opt.clipboard = "unnamedplus"
 
+-- change indent behaviors
+vim.api.nvim_create_augroup("filetype_indent", { clear = true })
+vim.api.nvim_create_autocmd("FileType", {
+    pattern = { "c", "cpp" },
+    group = "filetype_indent",
+    command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
+})
+vim.api.nvim_create_autocmd("FileType", {
+    pattern = { "javascript", "typescript", "typescriptreact", "html", "css"},
+    group = "filetype_indent",
+    command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
+})
+vim.api.nvim_create_autocmd("FileType", {
+    pattern = { "yaml"},
+    group = "filetype_indent",
+    command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
+})
+
 vim.api.nvim_create_autocmd("FocusGained", {
     pattern = "*",
     callback = function()
