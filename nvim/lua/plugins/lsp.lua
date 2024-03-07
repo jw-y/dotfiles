@@ -196,7 +196,8 @@ return {
 
             configs.setup({
                 ensure_installed = {
-                    "python", "lua", "yaml", "bash", "rust"
+                    "python", "lua", "yaml", "bash", "rust",
+                    "pkl"
                     --"c", "lua", "vim", "vimdoc", "query",
                     --"python", "javascript",
                     --"html", "markdown", "toml", "yaml",
@@ -206,5 +207,16 @@ return {
                 indent = { enable = true },
             })
         end
+    },
+    {
+        "https://github.com/apple/pkl-neovim",
+        lazy = true,
+        event = "BufReadPre *.pkl",
+        dependencies = {
+            "nvim-treesitter/nvim-treesitter",
+        },
+        build = function()
+            vim.cmd("TSInstall! pkl")
+        end,
     }
 }
