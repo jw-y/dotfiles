@@ -28,7 +28,7 @@ vim.api.nvim_create_autocmd("FileType", {
     command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
 })
 vim.api.nvim_create_autocmd("FileType", {
-    pattern = { "yaml"},
+    pattern = { "yaml", "pkl" },
     group = "filetype_indent",
     command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
 })
