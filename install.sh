@@ -1,66 +1,117 @@
 #!/bin/bash
 set -e
-#set -x
+[ "$DEBUG" == 'true' ] && set -x
 
-TARGET=$HOME
-VIM_PATH=$HOME/.vim/
+INSTALL_PATH=$HOME
+THEME_FILE=jungwoo.zsh-theme
 THEME_PATH=$HOME/.oh-my-zsh/themes/
+TPM_PATH="$HOME/.tmux/plugins/tpm" 
 
-FileArray=( 
-    ".vimrc"
-    ".vimrc.coc"
+FILES=( 
     ".zshrc"
     ".tmux.conf"
-    ".jwcolors.vim"
     ".pdbrc"
     ".ipdb"
 ) 
 
-if ! command -v zsh &> /dev/null
-then
+if ! command -v zsh &> /dev/null; then
     echo "'zsh' is not found! Try 'sudo apt install zsh'."
     exit
 fi
 
-for f in "${FileArray[@]}"
-do
-    echo "copying $f to $TARGET"
-    cp $f $TARGET
-done
+# Function to log file updates
+log_file_update() {
+    local file_name="$1"
+    local rsync_output="$2"
 
-echo "installing vim-plug..."
-curl -fLo ~/.vim/autoload/plug.vim --create-dirs \
-    https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+    if [[ "$rsync_output" =~ ">" ]]; then
+        echo "  $file_name was updated or copied."
+    else
+        echo "  $file_name is latest"
+    fi
+}
 
-echo "installing vim plugins..."
-vim +'PlugInstall --sync' +qa
+install_file() {
+    local SRC="$1"
+    local DEST="$2"
 
-echo "installing coc-vim plugins..."
-vim +'CocUpdateSync' +qa
+    local output=$(rsync -ahu --itemize-changes "$SRC" "$DEST")
+    log_file_update "$SRC" "$output"
+}
 
-echo "copying coc-settings..."
-cp ./coc-settings.json $VIM_PATH
+# Function to install files
+install_files_to_home() {
+    echo "Installing files..."
+    for f in "${FILES[@]}"; do
+        install_file "$f" "$INSTALL_PATH/$f"
+    done
+}
 
-echo "installing tmux-plugin-manager..."
-git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
+# Function to install Tmux plugins
+install_tmux_plugins() {
+    echo "Installing Tmux plugins..."
+    if [ ! -d "$TPM_PATH" ]; then
+        git clone https://github.com/tmux-plugins/tpm $TPM_PATH
+    else
+        echo "  TPM already installed, skipping..."
+    fi
 
-echo "installing tmux plugins..."
-tmux start-server && \
-    tmux new-session -d && \
-    sleep 1 && \
-    ~/.tmux/plugins/tpm/scripts/install_plugins.sh && \
-    tmux kill-server
+    # Start a new Tmux session to install plugins
+    if [ ! -f "$TPM_PATH/scripts/install_plugins.sh" ]; then
+        tmux start-server && \
+            tmux new-session -d && \
+            sleep 1 && \
+            $TPM_PATH/scripts/install_plugins.sh && \
+            tmux kill-server
+    else
+        echo "  Tmux plugins already installed, skipping..."
+    fi
+}
 
-echo "installing ohmyzsh..."
-sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" &
-wait $!
+# Function to install Oh My Zsh
+install_oh_my_zsh() {
+    echo "Installing Oh My Zsh..."
+    if [ ! -d "$HOME/.oh-my-zsh" ]; then
+        sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" &
+        wait $!
+    else
+        echo "  Oh My Zsh already installed, skipping..."
+    fi
+}
 
-echo "copying jungwoo zsh theme"
-cp jungwoo.zsh-theme $THEME_PATH
+# Function to install Zsh plugins
+install_zsh_plugins() {
+    echo "Installing zsh plugins..."
 
-echo "installing zsh-autosuggestions..."
-git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
+    # Install zsh-autosuggestions
+    TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
+    if [ ! -d $TARGET ]; then
+        git clone https://github.com/zsh-users/zsh-autosuggestions $TARGET
+    else
+        echo "  Zsh autosuggestions plugin already installed, skipping..."
+    fi
 
-echo "installing zsh-syntax-highlighting..."
-git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+    # Install zsh-syntax-highlighting
+    TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
+    if [ ! -d $TARGET ]; then
+        git clone https://github.com/zsh-users/zsh-syntax-highlighting.git $TARGET
+    else
+        echo "  Zsh syntax highlighting plugin already installed, skipping..."
+    fi
+}
 
+# install theme, must go after oh-my-zsh
+install_theme() {
+    echo "Installing jungwoo theme..."
+    install_file $THEME_FILE $THEME_PATH
+}
+
+install() {
+    install_files_to_home
+    install_tmux_plugins
+    install_oh_my_zsh
+    install_zsh_plugins
+    install_theme
+}
+
+install
