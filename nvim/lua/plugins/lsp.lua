@@ -40,29 +40,29 @@ local function nvim_cmp_config()
 
     -- Set configuration for specific filetype.
     cmp.setup.filetype('gitcommit', {
-    sources = cmp.config.sources({
-      { name = 'git' }, -- You can specify the `git` source if [you were installed it](https://github.com/petertriho/cmp-git).
-    }, {
-      { name = 'buffer' },
-    })
+      sources = cmp.config.sources({
+        { name = 'git' }, -- You can specify the `git` source if [you were installed it](https://github.com/petertriho/cmp-git).
+      }, {
+        { name = 'buffer' },
+      })
     })
 
     -- Use buffer source for `/` and `?` (if you enabled `native_menu`, this won't work anymore).
     cmp.setup.cmdline({ '/', '?' }, {
-    mapping = cmp.mapping.preset.cmdline(),
-    sources = {
-      { name = 'buffer' }
-    }
+      mapping = cmp.mapping.preset.cmdline(),
+      sources = {
+        { name = 'buffer' }
+      }
     })
 
     -- Use cmdline & path source for ':' (if you enabled `native_menu`, this won't work anymore).
     cmp.setup.cmdline(':', {
-    mapping = cmp.mapping.preset.cmdline(),
-    sources = cmp.config.sources({
-      { name = 'path' }
-    }, {
-      { name = 'cmdline' }
-    })
+      mapping = cmp.mapping.preset.cmdline(),
+      sources = cmp.config.sources({
+        { name = 'path' }
+      }, {
+        { name = 'cmdline' }
+      })
     })
 
     -- Set up lspconfig.
@@ -75,35 +75,35 @@ local function nvim_cmp_config()
     local lspconfig = require('lspconfig')
     lspconfig.pyright.setup {capabilities=capabilities}
     lspconfig.lua_ls.setup {
-        capabilities = capabilities,
-        on_init = function(client)
-            local path = client.workspace_folders[1].name
-            if not vim.loop.fs_stat(path..'/.luarc.json') and not vim.loop.fs_stat(path..'/.luarc.jsonc') then
-              client.config.settings = vim.tbl_deep_extend('force', client.config.settings, {
-                Lua = {
-                  runtime = {
-                    -- Tell the language server which version of Lua you're using
-                    -- (most likely LuaJIT in the case of Neovim)
-                    version = 'LuaJIT'
-                  },
-                  -- Make the server aware of Neovim runtime files
-                  workspace = {
-                    checkThirdParty = false,
-                    library = {
-                      vim.env.VIMRUNTIME
-                      -- "${3rd}/luv/library"
-                      -- "${3rd}/busted/library",
-                    }
-                    -- or pull in all of 'runtimepath'. NOTE: this is a lot slower
-                    -- library = vim.api.nvim_get_runtime_file("", true)
-                  }
+      capabilities = capabilities,
+      on_init = function(client)
+        local path = client.workspace_folders[1].name
+        if not vim.loop.fs_stat(path..'/.luarc.json') and not vim.loop.fs_stat(path..'/.luarc.jsonc') then
+          client.config.settings = vim.tbl_deep_extend('force', client.config.settings, {
+            Lua = {
+              runtime = {
+                -- Tell the language server which version of Lua you're using
+                -- (most likely LuaJIT in the case of Neovim)
+                version = 'LuaJIT'
+              },
+              -- Make the server aware of Neovim runtime files
+              workspace = {
+                checkThirdParty = false,
+                library = {
+                  vim.env.VIMRUNTIME
+                  -- "${3rd}/luv/library"
+                  -- "${3rd}/busted/library",
                 }
-              })
+                -- or pull in all of 'runtimepath'. NOTE: this is a lot slower
+                -- library = vim.api.nvim_get_runtime_file("", true)
+              }
+            }
+          })
 
-              client.notify("workspace/didChangeConfiguration", { settings = client.config.settings })
-            end
-            return true
+          client.notify("workspace/didChangeConfiguration", { settings = client.config.settings })
         end
+        return true
+      end
     }
     lspconfig.tsserver.setup {capabilities=capabilities}
     lspconfig.rust_analyzer.setup {
@@ -113,6 +113,7 @@ local function nvim_cmp_config()
         ['rust-analyzer'] = {},
       },
     }
+    lspconfig.mojo.setup {capabilities=capabilities}
 end
 
 return {

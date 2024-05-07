@@ -23,7 +23,7 @@ vim.api.nvim_create_autocmd("FileType", {
     command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
 })
 vim.api.nvim_create_autocmd("FileType", {
-    pattern = { "javascript", "typescript", "typescriptreact", "html", "css"},
+    pattern = { "javascript", "typescript", "typescriptreact", "html", "css", "lua"},
     group = "filetype_indent",
     command = "setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab",
 })
@@ -55,4 +55,12 @@ vim.api.nvim_create_autocmd("BufReadPost", {
             vim.api.nvim_exec("normal! g'\"",false)
         end
     end
+})
+
+-- temporary for mojo detection
+vim.api.nvim_create_autocmd({"BufRead", "BufNewFile"}, {
+    pattern = "*.mojo",
+    callback = function()
+        vim.bo.filetype = "mojo"
+    end,
 })
