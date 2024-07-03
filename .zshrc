@@ -124,4 +124,8 @@ function pretty_csv {
 
 export PYTHONBREAKPOINT=ipdb.set_trace
 
-alias nvim="~/dotfiles/bin/nvim.appimage"
+if [[ "$(uname)" == "Linux" ]]; then
+    alias nvim="~/dotfiles/bin/nvim.appimage"
+elif [[ "$(uname)" == "Darwin" ]]; then
+    alias nvim="~/dotfiles/bin/nvim.mac"  # Replace this with the actual path for macOS
+fi
