@@ -126,6 +126,4 @@ export PYTHONBREAKPOINT=ipdb.set_trace
 
 if [[ "$(uname)" == "Linux" ]]; then
     alias nvim="~/dotfiles/bin/nvim.appimage"
-elif [[ "$(uname)" == "Darwin" ]]; then
-    alias nvim="~/dotfiles/bin/nvim.mac"  # Replace this with the actual path for macOS
 fi
