@@ -1,4 +1,4 @@
-vim.cmd("language en_US")
+vim.cmd("language en_US.UTF-8")
 
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 if not vim.loop.fs_stat(lazypath) then
