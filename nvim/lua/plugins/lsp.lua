@@ -129,7 +129,7 @@ local function nvim_cmp_config()
       return true
     end
   }
-  lspconfig.tsserver.setup { capabilities = capabilities }
+  lspconfig.ts_ls.setup { capabilities = capabilities }
   lspconfig.rust_analyzer.setup {
     -- Server-specific settings. See `:help lspconfig-setup`
     capabilities = capabilities,
