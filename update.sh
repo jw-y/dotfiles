@@ -2,18 +2,22 @@
 set -e
 
 TARGET=$HOME
-VIM_PATH=$HOME/.vim
+#VIM_PATH=$HOME/.vim
+NVIM_PATH=$HOME/.config
 THEME_PATH=$HOME/.oh-my-zsh/themes
 
 FileArray=( 
-    ".vimrc"
-    ".vimrc.coc"
+    #".vimrc"
+    #".vimrc.coc"
     ".zshrc"
     ".tmux.conf"
-    ".jwcolors.vim"
+    #".jwcolors.vim"
     ".pdbrc"
     ".ipdb"
 ) 
+
+# link nvim config
+ln -s ~/dotfiles/nvim ~/.config/nvim
 
 for f in "${FileArray[@]}"
 do
@@ -29,8 +33,8 @@ if ! cmp $f $THEME_PATH/$f; then
     rsync -vu $f $THEME_PATH
 fi
 
-f=coc-settings.json
-if ! cmp $f $VIM_PATH/$f; then
-    echo "updating $f"
-    rsync -vu $f $VIM_PATH
-fi
+#f=coc-settings.json
+#if ! cmp $f $VIM_PATH/$f; then
+#    echo "updating $f"
+#    rsync -vu $f $VIM_PATH
+#fi
