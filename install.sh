@@ -106,12 +106,21 @@ install_theme() {
     install_file $THEME_FILE $THEME_PATH
 }
 
+install_nvm() {
+    latest=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash
+    export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
+    nvm install --lts
+}
+
 install() {
     install_files_to_home
     install_tmux_plugins
     install_oh_my_zsh
     install_zsh_plugins
     install_theme
+    install_nvm
 }
 
 install
