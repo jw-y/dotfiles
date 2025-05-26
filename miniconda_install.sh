@@ -10,11 +10,12 @@ echo "Detected Architecture: $ARCH"
 # Set installer URL based on OS and architecture
 if [ "$OS" = "Linux" ]; then
     case "$ARCH" in
+        
         x86_64)
-            CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-py39_24.1.2-0-Linux-x86_64.sh"
+            CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
             ;;
         aarch64|arm64)
-            CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-py39_24.1.2-0-Linux-aarch64.sh"
+            CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"
             ;;
         *)
             echo "Unsupported Linux architecture: $ARCH"
