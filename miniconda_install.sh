@@ -10,7 +10,6 @@ echo "Detected Architecture: $ARCH"
 # Set installer URL based on OS and architecture
 if [ "$OS" = "Linux" ]; then
     case "$ARCH" in
-        
         x86_64)
             CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
             ;;
