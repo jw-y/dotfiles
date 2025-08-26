@@ -17,21 +17,21 @@ FileArray=(
 ) 
 
 # link nvim config
-ln -s ~/dotfiles/nvim ~/.config/nvim
+if [ ! -L ~/.config/nvim ]; then
+    ln -s ~/dotfiles/nvim ~/.config/nvim
+    echo "Created nvim symlink"
+else
+    echo "nvim symlink already exists"
+fi
 
 for f in "${FileArray[@]}"
 do
-    if ! cmp $f $TARGET/$f ; then
-        echo "updating $f"
-        rsync -vu $f $TARGET
-    fi
+    echo "checking $f"
+    rsync -aui $f $TARGET/
 done
 
-f=jungwoo.zsh-theme
-if ! cmp $f $THEME_PATH/$f; then
-    echo "updating $f"
-    rsync -vu $f $THEME_PATH
-fi
+echo "checking jungwoo.zsh-theme"
+rsync -aui jungwoo.zsh-theme $THEME_PATH/
 
 #f=coc-settings.json
 #if ! cmp $f $VIM_PATH/$f; then
