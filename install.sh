@@ -2,6 +2,9 @@
 set -e
 [ "$DEBUG" == 'true' ] && set -x
 
+# Add dry-run mode
+DRY_RUN=${DRY_RUN:-false}
+
 INSTALL_PATH=$HOME
 THEME_FILE=jungwoo.zsh-theme
 THEME_PATH=$HOME/.oh-my-zsh/themes/
@@ -35,6 +38,11 @@ install_file() {
     local SRC="$1"
     local DEST="$2"
 
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install $SRC -> $DEST"
+        return 0
+    fi
+
     local output=$(rsync -ahu --itemize-changes "$SRC" "$DEST")
     log_file_update "$SRC" "$output"
 }
@@ -50,19 +58,31 @@ install_files_to_home() {
 # Function to install Tmux plugins
 install_tmux_plugins() {
     echo "Installing Tmux plugins..."
+    
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install TPM and plugins"
+        return 0
+    fi
+    
     if [ ! -d "$TPM_PATH" ]; then
-        git clone https://github.com/tmux-plugins/tpm $TPM_PATH
+        if ! git clone https://github.com/tmux-plugins/tpm $TPM_PATH; then
+            echo "  ERROR: Failed to clone TPM"
+            return 1
+        fi
     else
         echo "  TPM already installed, skipping..."
     fi
 
     # Start a new Tmux session to install plugins
     if [ ! -f "$TPM_PATH/scripts/install_plugins.sh" ]; then
-        tmux start-server && \
+        if ! (tmux start-server && \
             tmux new-session -d && \
             sleep 1 && \
             $TPM_PATH/scripts/install_plugins.sh && \
-            tmux kill-server
+            tmux kill-server); then
+            echo "  ERROR: Failed to install Tmux plugins"
+            return 1
+        fi
     else
         echo "  Tmux plugins already installed, skipping..."
     fi
@@ -71,9 +91,17 @@ install_tmux_plugins() {
 # Function to install Oh My Zsh
 install_oh_my_zsh() {
     echo "Installing Oh My Zsh..."
+    
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install Oh My Zsh"
+        return 0
+    fi
+    
     if [ ! -d "$HOME/.oh-my-zsh" ]; then
-        sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" &
-        wait $!
+        if ! sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"; then
+            echo "  ERROR: Failed to install Oh My Zsh"
+            return 1
+        fi
     else
         echo "  Oh My Zsh already installed, skipping..."
     fi
@@ -83,10 +111,18 @@ install_oh_my_zsh() {
 install_zsh_plugins() {
     echo "Installing zsh plugins..."
 
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install zsh plugins"
+        return 0
+    fi
+
     # Install zsh-autosuggestions
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
     if [ ! -d $TARGET ]; then
-        git clone https://github.com/zsh-users/zsh-autosuggestions $TARGET
+        if ! git clone https://github.com/zsh-users/zsh-autosuggestions $TARGET; then
+            echo "  ERROR: Failed to install zsh-autosuggestions"
+            return 1
+        fi
     else
         echo "  Zsh autosuggestions plugin already installed, skipping..."
     fi
@@ -94,7 +130,10 @@ install_zsh_plugins() {
     # Install zsh-syntax-highlighting
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
     if [ ! -d $TARGET ]; then
-        git clone https://github.com/zsh-users/zsh-syntax-highlighting.git $TARGET
+        if ! git clone https://github.com/zsh-users/zsh-syntax-highlighting.git $TARGET; then
+            echo "  ERROR: Failed to install zsh-syntax-highlighting"
+            return 1
+        fi
     else
         echo "  Zsh syntax highlighting plugin already installed, skipping..."
     fi
@@ -103,16 +142,44 @@ install_zsh_plugins() {
 # install theme, must go after oh-my-zsh
 install_theme() {
     echo "Installing jungwoo theme..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install theme to $THEME_PATH"
+        return 0
+    fi
     install_file $THEME_FILE $THEME_PATH
 }
 
 install_nvm() {
     echo "Installing NVM..."
+    
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install NVM and Node.js LTS"
+        return 0
+    fi
+    
+    if [ -d "$HOME/.nvm" ]; then
+        echo "  NVM already installed, skipping..."
+        return 0
+    fi
+    
     latest=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash
+    if [ -z "$latest" ]; then
+        echo "  ERROR: Failed to fetch NVM version"
+        return 1
+    fi
+    
+    if ! curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash; then
+        echo "  ERROR: Failed to install NVM"
+        return 1
+    fi
+    
     export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
-    nvm install --lts
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
+    
+    if ! nvm install --lts; then
+        echo "  WARNING: Failed to install Node.js LTS"
+        return 1
+    fi
 }
 
 install_conda() {
@@ -159,13 +226,25 @@ install_conda() {
     
     echo "Using installer URL: $CONDA_URL"
     
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would download and install Miniconda from $CONDA_URL"
+        return 0
+    fi
+    
     # Download the installer
-    curl -O "$CONDA_URL"
+    if ! curl -O "$CONDA_URL"; then
+        echo "  ERROR: Failed to download Miniconda installer"
+        return 1
+    fi
     
     # Extract the installer filename
     INSTALLER=$(basename "$CONDA_URL")
     
-    bash "$INSTALLER"
+    if ! bash "$INSTALLER"; then
+        echo "  ERROR: Failed to install Miniconda"
+        rm -f "$INSTALLER"
+        return 1
+    fi
     
     # Remove the installer file after installation
     rm -f "$INSTALLER"
@@ -176,10 +255,17 @@ install_conda() {
 install_ubuntu_tools() {
     echo "Installing Ubuntu-specific tools..."
     
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install Ubuntu-specific tools (tldr, xsel)"
+        return 0
+    fi
+    
     # Install tldr (command examples)
     if command -v npm &> /dev/null; then
         echo "Installing tldr..."
-        npm install -g tldr
+        if ! npm install -g tldr; then
+            echo "  WARNING: Failed to install tldr"
+        fi
     else
         echo "  npm not found, skipping tldr installation"
     fi
@@ -187,21 +273,33 @@ install_ubuntu_tools() {
     # Install xsel (clipboard support)
     if command -v apt-get &> /dev/null; then
         echo "Installing xsel..."
-        sudo apt-get install -y xsel
+        if ! sudo apt-get install -y xsel; then
+            echo "  WARNING: Failed to install xsel"
+        fi
     else
         echo "  apt-get not found, skipping xsel installation"
     fi
 }
 
 install() {
-    install_files_to_home
-    install_tmux_plugins
-    install_oh_my_zsh
-    install_zsh_plugins
-    install_theme
-    install_nvm
-    install_conda
-    install_ubuntu_tools
+    local errors=0
+    
+    install_files_to_home || ((errors++))
+    install_tmux_plugins || ((errors++))
+    install_oh_my_zsh || ((errors++))
+    install_zsh_plugins || ((errors++))
+    install_theme || ((errors++))
+    install_nvm || ((errors++))
+    install_conda || ((errors++))
+    install_ubuntu_tools || ((errors++))
+    
+    if [ $errors -gt 0 ]; then
+        echo "Installation completed with $errors error(s)."
+        return 1
+    else
+        echo "Installation completed successfully!"
+        return 0
+    fi
 }
 
 install

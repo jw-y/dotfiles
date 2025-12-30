@@ -1,40 +1,46 @@
 #!/bin/bash
 set -e
 
+# Add dry-run mode
+DRY_RUN=${DRY_RUN:-false}
+
 TARGET=$HOME
-#VIM_PATH=$HOME/.vim
 NVIM_PATH=$HOME/.config
 THEME_PATH=$HOME/.oh-my-zsh/themes
 
-FileArray=( 
-    #".vimrc"
-    #".vimrc.coc"
+# Standardize naming to match install.sh
+FILES=( 
     ".zshrc"
     ".tmux.conf"
-    #".jwcolors.vim"
     ".pdbrc"
     ".ipdb"
 ) 
 
 # link nvim config
-if [ ! -L ~/.config/nvim ]; then
-    ln -s ~/dotfiles/nvim ~/.config/nvim
-    echo "Created nvim symlink"
+if [ "$DRY_RUN" = "true" ]; then
+    echo "[DRY RUN] Would create nvim symlink"
 else
-    echo "nvim symlink already exists"
+    if [ ! -L ~/.config/nvim ]; then
+        ln -s ~/dotfiles/nvim ~/.config/nvim
+        echo "Created nvim symlink"
+    else
+        echo "nvim symlink already exists"
+    fi
 fi
 
-for f in "${FileArray[@]}"
+for f in "${FILES[@]}"
 do
     echo "checking $f"
-    rsync -aui $f $TARGET/
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would sync $f"
+    else
+        rsync -aui $f $TARGET/
+    fi
 done
 
 echo "checking jungwoo.zsh-theme"
-rsync -aui jungwoo.zsh-theme $THEME_PATH/
-
-#f=coc-settings.json
-#if ! cmp $f $VIM_PATH/$f; then
-#    echo "updating $f"
-#    rsync -vu $f $VIM_PATH
-#fi
+if [ "$DRY_RUN" = "true" ]; then
+    echo "  [DRY RUN] Would sync jungwoo.zsh-theme"
+else
+    rsync -aui jungwoo.zsh-theme $THEME_PATH/
+fi

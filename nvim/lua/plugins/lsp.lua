@@ -96,9 +96,11 @@ local function nvim_cmp_config()
   --      capabilities = capabilities
   -- }
   -- Setup language servers.
-  local lspconfig = require('lspconfig')
-  lspconfig.pyright.setup { capabilities = capabilities }
-  lspconfig.lua_ls.setup {
+  -- Using the new vim.lsp.config API (replaces deprecated require('lspconfig'))
+  vim.lsp.config('pyright', { capabilities = capabilities })
+  vim.lsp.enable('pyright')
+
+  vim.lsp.config('lua_ls', {
     capabilities = capabilities,
     on_init = function(client)
       local path = client.workspace_folders[1].name
@@ -128,16 +130,23 @@ local function nvim_cmp_config()
       end
       return true
     end
-  }
-  lspconfig.ts_ls.setup { capabilities = capabilities }
-  lspconfig.rust_analyzer.setup {
+  })
+  vim.lsp.enable('lua_ls')
+
+  vim.lsp.config('ts_ls', { capabilities = capabilities })
+  vim.lsp.enable('ts_ls')
+
+  vim.lsp.config('rust_analyzer', {
     -- Server-specific settings. See `:help lspconfig-setup`
     capabilities = capabilities,
     settings = {
       ['rust-analyzer'] = {},
     },
-  }
-  lspconfig.mojo.setup { capabilities = capabilities }
+  })
+  vim.lsp.enable('rust_analyzer')
+
+  vim.lsp.config('mojo', { capabilities = capabilities })
+  vim.lsp.enable('mojo')
 end
 
 return {
@@ -214,21 +223,22 @@ return {
   {
     "nvim-treesitter/nvim-treesitter",
     enabled = true,
+    lazy = false,  -- Required: plugin does not support lazy-loading
     build = ":TSUpdate",
     config = function()
-      local configs = require("nvim-treesitter.configs")
-
-      configs.setup({
-        ensure_installed = {
-          "python", "lua", "yaml", "bash", "rust",
-          --"pkl"
-          --"c", "lua", "vim", "vimdoc", "query",
-          --"python", "javascript",
-          --"html", "markdown", "toml", "yaml",
-        },
-        sync_install = false,
-        highlight = { enable = true },
-        indent = { enable = true },
+      require('nvim-treesitter').setup()
+      
+      -- Install parsers automatically
+      require('nvim-treesitter').install({
+        'python', 'lua', 'yaml', 'bash', 'rust'
+      })
+      
+      -- Enable highlighting (not enabled by default)
+      vim.api.nvim_create_autocmd('FileType', {
+        pattern = { 'python', 'lua', 'yaml', 'bash', 'rust' },
+        callback = function()
+          vim.treesitter.start()
+        end,
       })
     end
   },

@@ -1,3 +1,26 @@
+# Editor files
 *.swp
-nvim/lazy-lock.json
+*.swo
+*~
 .DS_Store
+.vscode/
+
+# Neovim
+nvim/lazy-lock.json
+nvim/.luarc.json
+nvim/.luarc.jsonc
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# OS files
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Install artifacts
+*.sh.download
+Miniconda*.sh

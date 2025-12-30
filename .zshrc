@@ -114,7 +114,7 @@ alias rm="rm -i"
 export PYTHONBREAKPOINT=ipdb.set_trace
 
 if [[ "$(uname)" == "Linux" ]]; then
-    alias nvim="~/dotfiles/bin/nvim.appimage"
+    alias nvim="~/dotfiles/bin/nvim-linux-x86_64.appimage"
 fi
 alias vim="nvim"
 export EDITOR="nvim"
