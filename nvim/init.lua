@@ -1,5 +1,10 @@
 vim.cmd("language en_US.UTF-8")
 
+-- Performance optimizations
+vim.loader.enable()  -- Enable bytecode cache (Neovim 0.9+)
+vim.opt.updatetime = 300  -- Reduce update time for faster UI
+vim.opt.timeoutlen = 200  -- Faster key sequence timeout
+
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 if not vim.loop.fs_stat(lazypath) then
   vim.fn.system({

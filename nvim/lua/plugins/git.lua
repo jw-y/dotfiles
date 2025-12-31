@@ -1,3 +1,8 @@
 return {
-  { "lewis6991/gitsigns.nvim", config = true }
+  {
+    "lewis6991/gitsigns.nvim",
+    lazy = true,
+    event = { "BufReadPre", "BufNewFile" },
+    config = true
+  }
 }
