@@ -8,7 +8,7 @@ Personal dotfiles configuration.
 - **Shell**: Zsh + Oh My Zsh + custom theme + plugins
 - **Terminal**: Tmux with TPM
 - **Editor**: Neovim (LSP, Treesitter, Telescope, Mason)
-- **Languages**: Python (conda), Node.js (nvm), Lua, Rust, TypeScript, YAML
+- **Languages**: Python (uv), Node.js (nvm), Lua, Rust, TypeScript, YAML
 
 ### Development
 - **Python**: pylint, pdb/ipdb config

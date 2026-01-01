@@ -182,76 +182,6 @@ install_nvm() {
     fi
 }
 
-install_conda() {
-    echo "Installing Miniconda..."
-    
-    # Determine the operating system
-    OS=$(uname)
-    ARCH=$(uname -m)
-    
-    echo "Detected OS: $OS"
-    echo "Detected Architecture: $ARCH"
-    
-    # Set installer URL based on OS and architecture
-    if [ "$OS" = "Linux" ]; then
-        case "$ARCH" in
-            x86_64)
-                CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-                ;;
-            aarch64|arm64)
-                CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"
-                ;;
-            *)
-                echo "Unsupported Linux architecture: $ARCH"
-                return 1
-                ;;
-        esac
-    elif [ "$OS" = "Darwin" ]; then
-        case "$ARCH" in
-            x86_64)
-                CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
-                ;;
-            arm64)
-                CONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh"
-                ;;
-            *)
-                echo "Unsupported macOS architecture: $ARCH"
-                return 1
-                ;;
-        esac
-    else
-        echo "Unsupported operating system: $OS"
-        return 1
-    fi
-    
-    echo "Using installer URL: $CONDA_URL"
-    
-    if [ "$DRY_RUN" = "true" ]; then
-        echo "  [DRY RUN] Would download and install Miniconda from $CONDA_URL"
-        return 0
-    fi
-    
-    # Download the installer
-    if ! curl -O "$CONDA_URL"; then
-        echo "  ERROR: Failed to download Miniconda installer"
-        return 1
-    fi
-    
-    # Extract the installer filename
-    INSTALLER=$(basename "$CONDA_URL")
-    
-    if ! bash "$INSTALLER"; then
-        echo "  ERROR: Failed to install Miniconda"
-        rm -f "$INSTALLER"
-        return 1
-    fi
-    
-    # Remove the installer file after installation
-    rm -f "$INSTALLER"
-    
-    echo "Miniconda installation completed successfully."
-}
-
 install_ubuntu_tools() {
     echo "Installing Ubuntu-specific tools..."
     
@@ -290,7 +220,6 @@ install() {
     install_zsh_plugins || ((errors++))
     install_theme || ((errors++))
     install_nvm || ((errors++))
-    install_conda || ((errors++))
     install_ubuntu_tools || ((errors++))
     
     if [ $errors -gt 0 ]; then
