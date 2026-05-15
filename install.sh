@@ -186,7 +186,7 @@ install_ubuntu_tools() {
     echo "Installing Ubuntu-specific tools..."
     
     if [ "$DRY_RUN" = "true" ]; then
-        echo "  [DRY RUN] Would install Ubuntu-specific tools (tldr, xsel)"
+        echo "  [DRY RUN] Would install Ubuntu-specific tools (tldr)"
         return 0
     fi
     
@@ -198,16 +198,6 @@ install_ubuntu_tools() {
         fi
     else
         echo "  npm not found, skipping tldr installation"
-    fi
-    
-    # Install xsel (clipboard support)
-    if command -v apt-get &> /dev/null; then
-        echo "Installing xsel..."
-        if ! sudo apt-get install -y xsel; then
-            echo "  WARNING: Failed to install xsel"
-        fi
-    else
-        echo "  apt-get not found, skipping xsel installation"
     fi
 }
 

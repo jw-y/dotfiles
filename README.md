@@ -13,7 +13,7 @@ Personal dotfiles configuration.
 ### Development
 - **Python**: pylint, pdb/ipdb config
 - **Git**: Configuration and tools
-- **System**: tldr, xsel (Linux clipboard)
+- **System**: tldr (command examples via npm)
 
 ## Quick Start
 
