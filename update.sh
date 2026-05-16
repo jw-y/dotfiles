@@ -28,6 +28,20 @@ else
     fi
 fi
 
+# link ghostty config
+if [ "$DRY_RUN" = "true" ]; then
+    echo "[DRY RUN] Would link ghostty config"
+elif [ -L ~/.config/ghostty ]; then
+    echo "ghostty symlink already exists"
+elif [ -d ~/.config/ghostty ]; then
+    ln -sf ~/dotfiles/ghostty/config.ghostty ~/.config/ghostty/config.ghostty
+    echo "Linked ghostty config.ghostty"
+else
+    mkdir -p ~/.config
+    ln -s ~/dotfiles/ghostty ~/.config/ghostty
+    echo "Created ghostty symlink"
+fi
+
 for f in "${FILES[@]}"
 do
     echo "checking $f"
