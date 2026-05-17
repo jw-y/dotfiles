@@ -1,0 +1,10 @@
+{
+  "syntaxHighlightingDisabled": false,
+  "effortLevel": "medium",
+  "tui": "fullscreen",
+  "theme": "dark",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/jwyang/.claude/statusline-command.sh"
+  }
+}
