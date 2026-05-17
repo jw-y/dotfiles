@@ -24,12 +24,12 @@ hostname_seg="%F{$OVERLAY0}%m%f"
 function _git_info() {
   local branch
   branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
-  [[ -z "$branch" ]] && return
+  [[ -z "$branch" ]] && echo " " && return
 
   if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-    echo " %F{$ROSEWATER}${branch}%f "
+    echo " %F{$FLAMINGO}${branch}%f "
   else
-    echo " %F{$TEXT}${branch}%f "
+    echo " %F{$SUBTEXT0}${branch}%f "
   fi
 }
 
