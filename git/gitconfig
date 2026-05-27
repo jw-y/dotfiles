@@ -1,0 +1,23 @@
+# Shareable git settings. Identity (user.name/user.email) is intentionally
+# omitted so this same file works on personal and shared accounts.
+#
+# Wire up on a new machine by adding to ~/.gitconfig:
+#   [include]
+#       path = ~/dotfiles/git/gitconfig
+
+[init]
+    defaultBranch = main
+
+[pull]
+    rebase = true
+
+[push]
+    autoSetupRemote = true
+
+[diff]
+    colorMoved = zebra
+
+[alias]
+    co = checkout
+    st = status -sb
+    lg = log --oneline --graph --decorate

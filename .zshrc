@@ -121,3 +121,6 @@ fi
 alias vim="nvim"
 export EDITOR="nvim"
 export LANG=en_US.UTF-8
+
+# fzf: Ctrl-R fuzzy history, Ctrl-T file picker, Alt-C cd picker
+command -v fzf >/dev/null && source <(fzf --zsh)

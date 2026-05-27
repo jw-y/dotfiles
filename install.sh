@@ -2,68 +2,26 @@
 set -e
 [ "$DEBUG" == 'true' ] && set -x
 
-# Add dry-run mode
+cd "$(dirname "$0")"
+
 DRY_RUN=${DRY_RUN:-false}
+WITH_GITCONFIG=${WITH_GITCONFIG:-false}
 
-INSTALL_PATH=$HOME
-THEME_FILE=jungwoo.zsh-theme
-THEME_PATH=$HOME/.oh-my-zsh/themes/
-TPM_PATH="$HOME/.tmux/plugins/tpm" 
-
-FILES=( 
-    ".zshrc"
-    ".tmux.conf"
-    ".pdbrc"
-    ".ipdb"
-) 
+TPM_PATH="$HOME/.tmux/plugins/tpm"
 
 if ! command -v zsh &> /dev/null; then
     echo "'zsh' is not found! Try 'sudo apt install zsh'."
     exit
 fi
 
-# Function to log file updates
-log_file_update() {
-    local file_name="$1"
-    local rsync_output="$2"
-
-    if [[ "$rsync_output" =~ ">" ]]; then
-        echo "  $file_name was updated or copied."
-    else
-        echo "  $file_name is latest"
-    fi
-}
-
-install_file() {
-    local SRC="$1"
-    local DEST="$2"
-
-    if [ "$DRY_RUN" = "true" ]; then
-        echo "  [DRY RUN] Would install $SRC -> $DEST"
-        return 0
-    fi
-
-    local output=$(rsync -ahu --itemize-changes "$SRC" "$DEST")
-    log_file_update "$SRC" "$output"
-}
-
-# Function to install files
-install_files_to_home() {
-    echo "Installing files..."
-    for f in "${FILES[@]}"; do
-        install_file "$f" "$INSTALL_PATH/$f"
-    done
-}
-
-# Function to install Tmux plugins
 install_tmux_plugins() {
     echo "Installing Tmux plugins..."
-    
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install TPM and plugins"
         return 0
     fi
-    
+
     if [ ! -d "$TPM_PATH" ]; then
         if ! git clone https://github.com/tmux-plugins/tpm $TPM_PATH; then
             echo "  ERROR: Failed to clone TPM"
@@ -73,7 +31,6 @@ install_tmux_plugins() {
         echo "  TPM already installed, skipping..."
     fi
 
-    # Start a new Tmux session to install plugins
     if [ ! -f "$TPM_PATH/scripts/install_plugins.sh" ]; then
         if ! (tmux start-server && \
             tmux new-session -d && \
@@ -88,17 +45,16 @@ install_tmux_plugins() {
     fi
 }
 
-# Function to install Oh My Zsh
 install_oh_my_zsh() {
     echo "Installing Oh My Zsh..."
-    
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install Oh My Zsh"
         return 0
     fi
-    
+
     if [ ! -d "$HOME/.oh-my-zsh" ]; then
-        if ! sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"; then
+        if ! sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended; then
             echo "  ERROR: Failed to install Oh My Zsh"
             return 1
         fi
@@ -107,7 +63,6 @@ install_oh_my_zsh() {
     fi
 }
 
-# Function to install Zsh plugins
 install_zsh_plugins() {
     echo "Installing zsh plugins..."
 
@@ -116,7 +71,6 @@ install_zsh_plugins() {
         return 0
     fi
 
-    # Install zsh-autosuggestions
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
     if [ ! -d $TARGET ]; then
         if ! git clone https://github.com/zsh-users/zsh-autosuggestions $TARGET; then
@@ -127,7 +81,6 @@ install_zsh_plugins() {
         echo "  Zsh autosuggestions plugin already installed, skipping..."
     fi
 
-    # Install zsh-syntax-highlighting
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
     if [ ! -d $TARGET ]; then
         if ! git clone https://github.com/zsh-users/zsh-syntax-highlighting.git $TARGET; then
@@ -139,58 +92,47 @@ install_zsh_plugins() {
     fi
 }
 
-# install theme, must go after oh-my-zsh
-install_theme() {
-    echo "Installing jungwoo theme..."
-    if [ "$DRY_RUN" = "true" ]; then
-        echo "  [DRY RUN] Would install theme to $THEME_PATH"
-        return 0
-    fi
-    install_file $THEME_FILE $THEME_PATH
-}
-
 install_nvm() {
     echo "Installing NVM..."
-    
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install NVM and Node.js LTS"
         return 0
     fi
-    
+
     if [ -d "$HOME/.nvm" ]; then
         echo "  NVM already installed, skipping..."
         return 0
     fi
-    
+
     latest=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$latest" ]; then
         echo "  ERROR: Failed to fetch NVM version"
         return 1
     fi
-    
+
     if ! curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash; then
         echo "  ERROR: Failed to install NVM"
         return 1
     fi
-    
+
     export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
-    
+    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
     if ! nvm install --lts; then
         echo "  WARNING: Failed to install Node.js LTS"
         return 1
     fi
 }
 
-install_ubuntu_tools() {
-    echo "Installing Ubuntu-specific tools..."
-    
+install_extra_tools() {
+    echo "Installing extra tools..."
+
     if [ "$DRY_RUN" = "true" ]; then
-        echo "  [DRY RUN] Would install Ubuntu-specific tools (tldr)"
+        echo "  [DRY RUN] Would install extra tools (tldr)"
         return 0
     fi
-    
-    # Install tldr (command examples)
+
     if command -v npm &> /dev/null; then
         echo "Installing tldr..."
         if ! npm install -g tldr; then
@@ -201,17 +143,50 @@ install_ubuntu_tools() {
     fi
 }
 
+sync_configs() {
+    echo "Syncing configs via update.sh..."
+    if ! DRY_RUN="$DRY_RUN" ./update.sh; then
+        echo "  ERROR: update.sh failed"
+        return 1
+    fi
+}
+
+bootstrap_gitconfig() {
+    echo "Bootstrapping git include..."
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would add include.path to ~/.gitconfig"
+        return 0
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo "  git not found, skipping"
+        return 0
+    fi
+
+    local target="$(pwd)/git/gitconfig"
+    if git config --global --get-all include.path 2>/dev/null | grep -Fxq "$target"; then
+        echo "  include.path already points to $target"
+    else
+        git config --global --add include.path "$target"
+        echo "  Added include.path = $target"
+    fi
+}
+
 install() {
     local errors=0
-    
-    install_files_to_home || ((errors++))
-    install_tmux_plugins || ((errors++))
-    install_oh_my_zsh || ((errors++))
-    install_zsh_plugins || ((errors++))
-    install_theme || ((errors++))
-    install_nvm || ((errors++))
-    install_ubuntu_tools || ((errors++))
-    
+
+    install_oh_my_zsh    || (( ++errors ))
+    install_zsh_plugins  || (( ++errors ))
+    sync_configs         || (( ++errors ))
+    install_tmux_plugins || (( ++errors ))
+    install_nvm          || (( ++errors ))
+    install_extra_tools  || (( ++errors ))
+
+    if [ "$WITH_GITCONFIG" = "true" ]; then
+        bootstrap_gitconfig || (( ++errors ))
+    fi
+
     if [ $errors -gt 0 ]; then
         echo "Installation completed with $errors error(s)."
         return 1
