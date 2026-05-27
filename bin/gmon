@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
 
+import atexit
+import os
+import shutil
 import subprocess
+import tempfile
 import time
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_FILE = Path("~/.config/gpu_monitor/hosts").expanduser()
+CONFIG_FILE = Path("~/.config/gmon/hosts").expanduser()
 REFRESH_SECONDS = 3
 SSH_TIMEOUT = 15
 FREE_MEM_MIB = 1024  # a GPU with no users and less VRAM used than this counts as "free"
@@ -93,8 +97,26 @@ def load_config():
     return hosts, jump
 
 
-def build_ssh_opts(jump):
-    return ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", *jump]
+def build_ssh_opts(jump, reuse=True):
+    opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+    if reuse:
+        # Reuse one connection per host: the first poll opens a master socket,
+        # later polls piggyback on it (no repeat TCP+auth handshake every refresh).
+        # ControlPersist keeps the master alive briefly after we exit; the temp
+        # dir is removed on exit, tearing the sockets down with it.
+        ctl_dir = tempfile.mkdtemp(prefix="gmon-ssh-")
+        atexit.register(_cleanup_ssh, ctl_dir)
+        opts += [
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={ctl_dir}/%C",
+            "-o", "ControlPersist=30s",
+        ]
+    return [*opts, *jump]
+
+
+def _cleanup_ssh(ctl_dir):
+    """Remove the socket dir on exit; ControlPersist reaps any orphaned master."""
+    shutil.rmtree(ctl_dir, ignore_errors=True)
 
 
 def query_host(host, ssh_opts):
@@ -185,10 +207,11 @@ def is_free(gpu):
     return not gpu["users"] and (gpu["mem_used"] or 0) < FREE_MEM_MIB
 
 
-def render(results):
+def render(results, live=True):
     now = datetime.now().strftime("%H:%M:%S")
     lines = []
-    lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}  (refresh every {REFRESH_SECONDS}s)  Ctrl-C to quit"))
+    hint = f"  (refresh every {REFRESH_SECONDS}s)  Ctrl-C to quit" if live else ""
+    lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}{hint}"))
 
     free = {}  # host -> [idx, ...], in host-sorted order
     for host, gpus, _ in sorted(results, key=lambda r: r[0]):
@@ -282,30 +305,40 @@ def leave_screen():
     sys.stdout.flush()
 
 
-def main():
-    config_hosts, jump = load_config()
-    ssh_opts = build_ssh_opts(jump)
+def edit_config():
+    """Open the hosts file in $EDITOR, seeding a template if it doesn't exist."""
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(
+            "# GPU monitor hosts — one SSH host per line\n"
+            "# jump=thor       # optional jump host\n"
+            "# baram\n"
+            "# namu\n"
+        )
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(CONFIG_FILE)])
 
-    # CLI args override config file hosts (jump host from config still applies)
-    hosts = sys.argv[1:] or config_hosts
 
-    if not hosts:
-        print(f"No hosts found. Add them to {CONFIG_FILE} or pass as arguments.")
-        print(f"\nConfig file format (~/.config/gpu_monitor/hosts):")
-        print(f"  jump=thor       # optional jump host")
-        print(f"  baram")
-        print(f"  namu")
-        sys.exit(1)
+def poll(hosts, ssh_opts):
+    results = []
+    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        futures = {ex.submit(query_host, h, ssh_opts): h for h in hosts}
+        for f in as_completed(futures):
+            results.append(f.result())
+    return results
 
+
+def run_once(hosts, ssh_opts):
+    """One snapshot, plain to stdout — for scripting or non-interactive output."""
+    sys.stdout.write(render(poll(hosts, ssh_opts), live=False))
+    sys.stdout.flush()
+
+
+def run_loop(hosts, ssh_opts):
     clear()
     print(c("sapphire", "Connecting..."))
     while True:
-        results = []
-        with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-            futures = {ex.submit(query_host, h, ssh_opts): h for h in hosts}
-            for f in as_completed(futures):
-                results.append(f.result())
-
+        results = poll(hosts, ssh_opts)
         # Home cursor and overwrite in place; clear-below wipes any rows
         # left over from a taller previous frame
         sys.stdout.write("\033[H" + render(results) + "\033[J")
@@ -314,9 +347,52 @@ def main():
 
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
+
+    if args and args[0] in ("-e", "--edit"):
+        edit_config()
+        sys.exit(0)
+
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: gmon [HOST ...]      monitor the given hosts (or those in the config)")
+        print("       gmon -1, --once      print a single snapshot and exit")
+        print("       gmon -e, --edit      edit the hosts config in $EDITOR")
+        print("       gmon -h, --help      show this help")
+        print(f"\nConfig file: {CONFIG_FILE}")
+        sys.exit(0)
+
+    # One-shot if asked, or whenever stdout isn't a terminal (piped/redirected) —
+    # a live refresh loop only makes sense on an interactive screen.
+    once = False
+    if args and args[0] in ("-1", "--once"):
+        once = True
+        args = args[1:]
+    once = once or not sys.stdout.isatty()
+
+    config_hosts, jump = load_config()
+    ssh_opts = build_ssh_opts(jump, reuse=not once)
+
+    # CLI args override config file hosts (jump host from config still applies)
+    hosts = args or config_hosts
+
+    # Validate before entering the alternate screen, otherwise leave_screen()
+    # wipes this message before the user can read it.
+    if not hosts:
+        print(f"No hosts found. Add them to {CONFIG_FILE} or pass as arguments.")
+        print(f"Run 'gmon --edit' to create and edit the config file.")
+        print(f"\nConfig file format (~/.config/gmon/hosts):")
+        print(f"  jump=thor       # optional jump host")
+        print(f"  baram")
+        print(f"  namu")
+        sys.exit(1)
+
+    if once:
+        run_once(hosts, ssh_opts)
+        sys.exit(0)
+
     enter_screen()
     try:
-        main()
+        run_loop(hosts, ssh_opts)
     except KeyboardInterrupt:
         pass
     finally:
