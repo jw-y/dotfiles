@@ -17,21 +17,13 @@ return {
   },
   {
     "nvim-lualine/lualine.nvim",
-    enabled = true,
     dependencies = { "catppuccin/nvim" },
-    after = "catppuccin",
     config = function()
       require("lualine").setup({
         options = {
-          --theme = "catppuccin-macchiato",
-          --theme = "catppuccin",
-          --theme = "catppuccin-mocha",
-          theme = "palenight",
-          --theme = "material",
+          theme = "catppuccin-mocha",
           component_separators = "",
           section_separators = { left = '', right = '' }, -- slanted separators
-          --section_separators = { left = "", right = "" }, -- round separators
-          --component_separators = { left = '', right = ''},
         },
       })
     end

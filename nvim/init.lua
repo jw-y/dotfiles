@@ -6,7 +6,7 @@ vim.opt.updatetime = 300  -- Reduce update time for faster UI
 vim.opt.timeoutlen = 200  -- Faster key sequence timeout
 
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
-if not vim.loop.fs_stat(lazypath) then
+if not vim.uv.fs_stat(lazypath) then
   vim.fn.system({
     "git",
     "clone",
@@ -25,9 +25,6 @@ vim.g.mapleader = " " -- Make sure to set `mapleader` before lazy so your mappin
 require("lazy").setup("plugins")
 
 require("config.options")
-require("config.keymaps")
-
--- require("lsp_config")
 
 vim.cmd.colorscheme "catppuccin"
 

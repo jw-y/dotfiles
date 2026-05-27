@@ -15,6 +15,8 @@ vim.opt.termguicolors = true
 
 vim.opt.clipboard = "unnamedplus"
 
+vim.opt.undofile = true
+
 -- change indent behaviors
 vim.api.nvim_create_augroup("filetype_indent", { clear = true })
 vim.api.nvim_create_autocmd("FileType", {
@@ -52,15 +54,7 @@ vim.api.nvim_create_autocmd("BufReadPost", {
   pattern = { "*" },
   callback = function()
     if vim.fn.line("'\"") > 1 and vim.fn.line("'\"") <= vim.fn.line("$") then
-      vim.api.nvim_exec("normal! g'\"", false)
+      vim.cmd("normal! g'\"")
     end
   end
-})
-
--- temporary for mojo detection
-vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, {
-  pattern = "*.mojo",
-  callback = function()
-    vim.bo.filetype = "mojo"
-  end,
 })

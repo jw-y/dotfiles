@@ -10,4 +10,17 @@ return {
       vim.keymap.set('n', '<leader>fh', builtin.help_tags, {})
     end,
   },
+  {
+    'folke/which-key.nvim',
+    event = 'VeryLazy',
+    opts = {},
+  },
+  {
+    'echasnovski/mini.nvim',
+    version = '*',
+    config = function()
+      require('mini.comment').setup()
+      require('mini.surround').setup()
+    end,
+  },
 }
