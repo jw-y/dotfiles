@@ -1,25 +1,34 @@
-.PHONY: install update dry-run help
+.PHONY: install update upgrade-nvim gitconfig dry-run help
 
 help:
-	@echo "Available targets:"
-	@echo "  make install    - Run full installation"
-	@echo "  make update     - Update existing configs"
-	@echo "  make dry-run    - Show what would be installed/updated"
-	@echo "  make help       - Show this help message"
+	@echo "Targets:"
+	@echo "  make install        Full setup (brew bundle on Mac, apt + nvim download on Linux)"
+	@echo "  make update         Sync configs to \$$HOME"
+	@echo "  make upgrade-nvim   Force re-download latest nvim (Linux only)"
+	@echo "  make gitconfig      Add include.path to ~/.gitconfig (opt-in)"
+	@echo "  make dry-run        Preview install + update without changing anything"
+	@echo ""
+	@echo "Env vars:"
+	@echo "  DRY_RUN=true        Preview mode for any target"
+	@echo "  WITH_GITCONFIG=true Also wire up gitconfig during install"
+	@echo "  UPGRADE_NVIM=true   Force nvim re-download during install"
 
 install:
-	@echo "Running installation..."
 	@./install.sh
 
 update:
-	@echo "Updating configurations..."
 	@./update.sh
 
+upgrade-nvim:
+	@UPGRADE_NVIM=true ./install.sh
+
+gitconfig:
+	@WITH_GITCONFIG=true ./install.sh
+
 dry-run:
-	@echo "=== DRY RUN MODE ==="
-	@echo "Install script:"
+	@echo "=== DRY RUN ==="
+	@echo "--- install.sh ---"
 	@DRY_RUN=true ./install.sh || true
 	@echo ""
-	@echo "Update script:"
+	@echo "--- update.sh ---"
 	@DRY_RUN=true ./update.sh || true
-

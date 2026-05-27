@@ -6,8 +6,13 @@ cd "$(dirname "$0")"
 
 DRY_RUN=${DRY_RUN:-false}
 WITH_GITCONFIG=${WITH_GITCONFIG:-false}
+UPGRADE_NVIM=${UPGRADE_NVIM:-false}
 
 TPM_PATH="$HOME/.tmux/plugins/tpm"
+
+is_linux() { [ "$(uname)" = "Linux" ]; }
+is_mac()   { [ "$(uname)" = "Darwin" ]; }
+has_sudo() { command -v sudo >/dev/null && sudo -n true 2>/dev/null; }
 
 if ! command -v zsh &> /dev/null; then
     echo "'zsh' is not found! Try 'sudo apt install zsh'."
@@ -125,6 +130,58 @@ install_nvm() {
     fi
 }
 
+install_mac_tools() {
+    is_mac || return 0
+    echo "Installing Mac tools via Brewfile..."
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would run: brew bundle --file=Brewfile"
+        return 0
+    fi
+
+    if ! command -v brew >/dev/null; then
+        echo "  WARNING: brew not found. Install Homebrew first, then re-run."
+        return 0
+    fi
+
+    brew bundle --file=Brewfile
+}
+
+install_linux_tools() {
+    is_linux || return 0
+    echo "Installing Linux tools..."
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would download nvim, apt-install tmux + fzf (if sudo)"
+        return 0
+    fi
+
+    if [ "$UPGRADE_NVIM" = "true" ] || ! command -v nvim >/dev/null; then
+        echo "  Downloading nvim (latest release)..."
+        mkdir -p "$HOME/.local"
+        if curl -fsSL "https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz" \
+            | tar xz --strip-components=1 -C "$HOME/.local"; then
+            echo "  nvim installed to ~/.local/bin/nvim"
+        else
+            echo "  WARNING: failed to download nvim"
+        fi
+    else
+        echo "  nvim already installed: $(command -v nvim)"
+    fi
+
+    for pkg in tmux fzf; do
+        if command -v "$pkg" >/dev/null; then
+            echo "  $pkg already installed"
+            continue
+        fi
+        if has_sudo && command -v apt-get >/dev/null; then
+            sudo apt-get install -y "$pkg"
+        else
+            echo "  WARNING: $pkg not installed. Run 'sudo apt install $pkg' when you have sudo."
+        fi
+    done
+}
+
 install_extra_tools() {
     echo "Installing extra tools..."
 
@@ -176,6 +233,8 @@ bootstrap_gitconfig() {
 install() {
     local errors=0
 
+    install_mac_tools    || (( ++errors ))
+    install_linux_tools  || (( ++errors ))
     install_oh_my_zsh    || (( ++errors ))
     install_zsh_plugins  || (( ++errors ))
     sync_configs         || (( ++errors ))
