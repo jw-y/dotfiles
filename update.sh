@@ -60,3 +60,14 @@ if [ "$DRY_RUN" = "true" ]; then
 else
     rsync -ai jungwoo.zsh-theme "$THEME_PATH/"
 fi
+
+# link gmon to ~/.local/bin
+mkdir -p "$HOME/.local/bin"
+if [ "$DRY_RUN" = "true" ]; then
+    echo "  [DRY RUN] Would link gmon to ~/.local/bin/"
+elif [ ! -L "$HOME/.local/bin/gmon" ]; then
+    ln -s "$DOTFILES_DIR/bin/gmon" "$HOME/.local/bin/gmon"
+    echo "Linked gmon to ~/.local/bin/"
+else
+    echo "gmon symlink already exists"
+fi

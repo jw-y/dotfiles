@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
+
+import subprocess
+import time
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_FILE = Path("~/.config/gpu_monitor/hosts").expanduser()
+REFRESH_SECONDS = 3
+SSH_TIMEOUT = 15
+FREE_MEM_MIB = 1024  # a GPU with no users and less VRAM used than this counts as "free"
+# ─────────────────────────────────────────────────────────────────────────────
+
+QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed"
+# Fetches GPU stats then process→user mapping in one SSH round-trip
+# Uses gpu_uuid to correlate apps→GPU index (gpu_index not supported on all drivers)
+CMD = (
+    f"nvidia-smi --query-gpu={QUERY} --format=csv,noheader,nounits 2>/dev/null; "
+    "echo '---'; "
+    "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits 2>/dev/null "
+    "| while IFS=, read uuid pid; do "
+    "  uuid=$(echo $uuid | tr -d ' '); pid=$(echo $pid | tr -d ' '); "
+    "  user=$(ps -o user= -p $pid 2>/dev/null | tr -d ' '); "
+    "  [ -n \"$user\" ] && echo \"$uuid,$user\"; "
+    "done"
+)
+
+def _fg(r, g, b):
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+# Catppuccin Mocha palette (24-bit truecolor)
+COLORS = {
+    "reset":    "\033[0m",
+    "bold":     "\033[1m",
+    "red":      _fg(243, 139, 168),  # Red
+    "maroon":   _fg(235, 160, 172),  # Maroon
+    "peach":    _fg(250, 179, 135),  # Peach
+    "yellow":   _fg(249, 226, 175),  # Yellow
+    "green":    _fg(166, 227, 161),  # Green
+    "teal":     _fg(148, 226, 213),  # Teal
+    "sapphire": _fg(116, 199, 236),  # Sapphire
+    "lavender": _fg(180, 190, 254),  # Lavender
+    "mauve":    _fg(203, 166, 247),  # Mauve
+    "text":     _fg(205, 214, 244),  # Text
+    "subtext1": _fg(186, 194, 222),  # Subtext1
+    "subtext0": _fg(166, 173, 200),  # Subtext0
+    "overlay1": _fg(127, 132, 156),  # Overlay1
+    "overlay0": _fg(108, 112, 134),  # Overlay0
+    "surface2": _fg(88, 91, 112),    # Surface2
+}
+
+
+def c(color, text):
+    return f"{COLORS[color]}{text}{COLORS['reset']}"
+
+
+def cb(color, text):
+    return f"{COLORS['bold']}{COLORS[color]}{text}{COLORS['reset']}"
+
+
+def load_config():
+    """Read hosts and optional jump host from CONFIG_FILE.
+
+    Format:
+        jump=<host>     # optional jump host
+        host1
+        host2           # inline comments ignored
+    """
+    if not CONFIG_FILE.exists():
+        return [], []
+
+    jump = []
+    hosts = []
+    for raw in CONFIG_FILE.read_text().splitlines():
+        line = raw.split("#")[0].strip()
+        if not line:
+            continue
+        if line.startswith("jump="):
+            jump = ["-J", line[5:].strip()]
+        else:
+            hosts.append(line)
+    return hosts, jump
+
+
+def build_ssh_opts(jump):
+    return ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", *jump]
+
+
+def query_host(host, ssh_opts):
+    try:
+        result = subprocess.run(
+            ["ssh", *ssh_opts, host, CMD],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT
+        )
+        if not result.stdout.strip():
+            return host, None, "no output"
+
+        sections = result.stdout.strip().split("---\n", 1)
+        gpu_lines = sections[0].strip().splitlines()
+        proc_lines = sections[1].strip().splitlines() if len(sections) > 1 else []
+
+        uuid_users: dict[str, list[str]] = {}
+        for line in proc_lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                uuid, user = parts
+                uuid_users.setdefault(uuid, [])
+                if user and user not in uuid_users[uuid]:
+                    uuid_users[uuid].append(user)
+
+        gpus = []
+        for line in gpu_lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 8:
+                continue
+            name, uuid, idx, util, mem_used, mem_total, temp, fan = parts[:8]
+            gpus.append({
+                "name":      name.removeprefix("NVIDIA ").strip(),
+                "idx":       idx,
+                "util":      _int(util),
+                "mem_used":  _int(mem_used),
+                "mem_total": _int(mem_total),
+                "temp":      _int(temp),
+                "fan":       _int(fan),
+                "users":     uuid_users.get(uuid, []),
+            })
+        return host, gpus, None
+    except subprocess.TimeoutExpired:
+        return host, None, "timeout"
+    except Exception as e:
+        return host, None, str(e)
+
+
+def _int(val):
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None  # handles [N/A], empty, etc.
+
+
+def util_color(val):
+    # Idle = available = green (pops); load uses warm tones, not alarm-red
+    if val is None:
+        return "overlay1"
+    if val < 10:
+        return "green"
+    if val < 70:
+        return "peach"
+    return "maroon"
+
+
+def temp_color(val):
+    # Normal temps recede (dim); only genuinely hot cards get warm/red
+    if val is None:
+        return "overlay1"
+    if val < 75:
+        return "subtext0"
+    if val < 88:
+        return "peach"
+    return "red"
+
+
+def mem_bar(used, total, width=10):
+    if used is None or total is None or total == 0:
+        return c("surface2", "░" * width)
+    ratio = used / total
+    filled = int(ratio * width)
+    color = "green" if ratio < 0.6 else "yellow" if ratio < 0.85 else "maroon"
+    return c(color, "█" * filled) + c("surface2", "░" * (width - filled))
+
+
+def is_free(gpu):
+    """A GPU with no compute processes and near-empty VRAM is grabbable."""
+    return not gpu["users"] and (gpu["mem_used"] or 0) < FREE_MEM_MIB
+
+
+def render(results):
+    now = datetime.now().strftime("%H:%M:%S")
+    lines = []
+    lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}  (refresh every {REFRESH_SECONDS}s)  Ctrl-C to quit"))
+
+    free = {}  # host -> [idx, ...], in host-sorted order
+    for host, gpus, _ in sorted(results, key=lambda r: r[0]):
+        for gpu in gpus or []:
+            if is_free(gpu):
+                free.setdefault(host, []).append(gpu["idx"])
+    n_free = sum(len(v) for v in free.values())
+    if n_free:
+        detail = ", ".join(f"{h}:{','.join(idxs)}" for h, idxs in free.items())
+        lines.append(cb("green", f"  {n_free} GPU{'s' if n_free != 1 else ''} free") + c("subtext0", f"  ({detail})"))
+    else:
+        lines.append(c("overlay1", "  no free GPUs"))
+    lines.append("")
+
+    # host/gpu/users size to the widest value present (floored at the header label)
+    host_w = max([len("HOST")] + [len(h) for h, _, _ in results])
+    gpu_w = max([len("GPU")] + [len(g["name"]) for _, gpus, _ in results if gpus for g in gpus])
+    users_w = max([len("USERS")] + [
+        len(", ".join(g["users"]) if g["users"] else "idle")
+        for _, gpus, _ in results if gpus for g in gpus
+    ])
+    # mem cell = 10-wide bar + space + 13-wide "used/total" (fits H200's 143771/143771)
+    col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 6, "mem": 24, "temp": 6, "fan": 5, "users": users_w}
+    header = (
+        f"  {'HOST':<{col_w['host']}}  {'GPU':<{col_w['gpu']}}  "
+        f"{'#':>{col_w['idx']}}  {'UTIL%':>{col_w['util']}}  "
+        f"{'MEMORY (MiB)':<{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  {'FAN%':>{col_w['fan']}}  "
+        f"{'USERS':<{col_w['users']}}"
+    )
+    rule = "  " + "─" * (len(header) - 2)
+    lines.append(c("subtext0", header))
+    lines.append(c("surface2", rule))
+
+    for i, (host, gpus, err) in enumerate(sorted(results, key=lambda r: r[0])):
+        if i:
+            lines.append("")  # blank line between servers
+        host_cell = cb("lavender", f"{host:<{col_w['host']}}")  # blanked after first row
+        if err or gpus is None:
+            lines.append(f"  {host_cell}  " + c("red", f"error: {err}"))
+            continue
+        if not gpus:
+            lines.append(f"  {host_cell}  " + c("yellow", "no GPUs / nvidia-smi not found"))
+            continue
+        for gpu in gpus:
+            util = gpu["util"]
+            temp = gpu["temp"]
+            mu, mt = gpu["mem_used"], gpu["mem_total"]
+            mem_str = f"{mu if mu is not None else '?'}/{mt if mt is not None else '?'}"
+            bar = mem_bar(mu, mt)
+            users = gpu.get("users", [])
+
+            name_cell  = c("subtext0", f"{gpu['name']:<{col_w['gpu']}}")
+            idx_cell   = c("overlay1", f"{gpu['idx']:>{col_w['idx']}}")
+            util_cell  = c(util_color(util), f"{util:>5}%") if util is not None else c("overlay1", "    ?%")
+            mem_cell   = c("subtext1", f"{mem_str:>13}")
+            temp_cell  = c(temp_color(temp), f"{temp:>4}°C") if temp is not None else c("overlay1", "   ?°C")
+            fan_cell   = c("overlay1", f"{gpu['fan']:>4}%") if gpu["fan"] is not None else c("overlay1", f"{'—':>5}")
+            users_cell = c("subtext1", ", ".join(users)) if users else c("overlay0", "idle")
+
+            line = (
+                f"  {host_cell}  "
+                f"{name_cell}  "
+                f"{idx_cell}  "
+                f"{util_cell}  "
+                f"{bar} {mem_cell}  "
+                f"{temp_cell}  "
+                f"{fan_cell}  "
+                f"{users_cell}"
+            )
+            lines.append(line)
+            host_cell = " " * col_w["host"]  # only show hostname on first GPU row
+
+    lines.append("")
+    # Clear-to-EOL on every line so shorter rows don't leave stale chars behind
+    return "".join(f"{line}\033[K\n" for line in lines)
+
+
+def clear():
+    sys.stdout.write("\033[2J\033[H")  # full clear + home, once at startup
+    sys.stdout.flush()
+
+
+def enter_screen():
+    sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen + hide cursor
+    sys.stdout.flush()
+
+
+def leave_screen():
+    sys.stdout.write("\033[?25h\033[?1049l")  # show cursor + restore screen
+    sys.stdout.flush()
+
+
+def main():
+    config_hosts, jump = load_config()
+    ssh_opts = build_ssh_opts(jump)
+
+    # CLI args override config file hosts (jump host from config still applies)
+    hosts = sys.argv[1:] or config_hosts
+
+    if not hosts:
+        print(f"No hosts found. Add them to {CONFIG_FILE} or pass as arguments.")
+        print(f"\nConfig file format (~/.config/gpu_monitor/hosts):")
+        print(f"  jump=thor       # optional jump host")
+        print(f"  baram")
+        print(f"  namu")
+        sys.exit(1)
+
+    clear()
+    print(c("sapphire", "Connecting..."))
+    while True:
+        results = []
+        with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+            futures = {ex.submit(query_host, h, ssh_opts): h for h in hosts}
+            for f in as_completed(futures):
+                results.append(f.result())
+
+        # Home cursor and overwrite in place; clear-below wipes any rows
+        # left over from a taller previous frame
+        sys.stdout.write("\033[H" + render(results) + "\033[J")
+        sys.stdout.flush()
+        time.sleep(REFRESH_SECONDS)
+
+
+if __name__ == "__main__":
+    enter_screen()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        leave_screen()
+    print("Bye.")
