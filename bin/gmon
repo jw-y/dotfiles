@@ -44,8 +44,10 @@ COLORS = {
     "green":    _fg(166, 227, 161),  # Green
     "teal":     _fg(148, 226, 213),  # Teal
     "sapphire": _fg(116, 199, 236),  # Sapphire
+    "blue":     _fg(137, 180, 250),  # Blue
     "lavender": _fg(180, 190, 254),  # Lavender
     "mauve":    _fg(203, 166, 247),  # Mauve
+    "pink":     _fg(245, 194, 231),  # Pink
     "text":     _fg(205, 214, 244),  # Text
     "subtext1": _fg(186, 194, 222),  # Subtext1
     "subtext0": _fg(166, 173, 200),  # Subtext0
@@ -61,6 +63,10 @@ def c(color, text):
 
 def cb(color, text):
     return f"{COLORS['bold']}{COLORS[color]}{text}{COLORS['reset']}"
+
+
+# Rotated per server so adjacent hostnames read as distinct colors
+ACCENTS = ["mauve", "blue", "teal", "pink", "lavender", "sapphire"]
 
 
 def load_config():
@@ -219,7 +225,8 @@ def render(results):
     for i, (host, gpus, err) in enumerate(sorted(results, key=lambda r: r[0])):
         if i:
             lines.append("")  # blank line between servers
-        host_cell = cb("lavender", f"{host:<{col_w['host']}}")  # blanked after first row
+        accent = ACCENTS[i % len(ACCENTS)]  # rotate hostname color per server
+        host_cell = cb(accent, f"{host:<{col_w['host']}}")  # blanked after first row
         if err or gpus is None:
             lines.append(f"  {host_cell}  " + c("red", f"error: {err}"))
             continue
