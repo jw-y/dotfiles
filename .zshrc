@@ -115,9 +115,6 @@ export PYTHONBREAKPOINT=ipdb.set_trace
 export VIRTUAL_ENV_DISABLE_PROMPT=1
 alias claude-lab='CLAUDE_CONFIG_DIR=$HOME/.claude-lab command claude'
 
-if [[ "$(uname)" == "Linux" ]]; then
-    alias nvim="~/dotfiles/bin/nvim-linux-x86_64.appimage"
-fi
 alias vim="nvim"
 export EDITOR="nvim"
 export LANG=en_US.UTF-8
