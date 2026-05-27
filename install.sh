@@ -14,13 +14,28 @@ is_linux() { [ "$(uname)" = "Linux" ]; }
 is_mac()   { [ "$(uname)" = "Darwin" ]; }
 has_sudo() { command -v sudo >/dev/null && sudo -n true 2>/dev/null; }
 
+if [ -t 1 ]; then
+    C_HDR='\033[1;34m'
+    C_OK='\033[0;32m'
+    C_WARN='\033[0;33m'
+    C_RESET='\033[0m'
+else
+    C_HDR='' C_OK='' C_WARN='' C_RESET=''
+fi
+
+STEP_NUM=0
+step() {
+    STEP_NUM=$((STEP_NUM + 1))
+    printf "\n${C_HDR}==> [%d] %s${C_RESET}\n" "$STEP_NUM" "$*"
+}
+
 if ! command -v zsh &> /dev/null; then
     echo "'zsh' is not found! Try 'sudo apt install zsh'."
     exit
 fi
 
 install_tmux_plugins() {
-    echo "Installing Tmux plugins..."
+    step "tmux plugins (TPM)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install TPM and plugins"
@@ -51,7 +66,7 @@ install_tmux_plugins() {
 }
 
 install_oh_my_zsh() {
-    echo "Installing Oh My Zsh..."
+    step "Oh My Zsh"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install Oh My Zsh"
@@ -69,7 +84,7 @@ install_oh_my_zsh() {
 }
 
 install_zsh_plugins() {
-    echo "Installing zsh plugins..."
+    step "zsh plugins (autosuggestions, syntax-highlighting)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install zsh plugins"
@@ -98,7 +113,7 @@ install_zsh_plugins() {
 }
 
 install_nvm() {
-    echo "Installing NVM + Node LTS..."
+    step "NVM + Node LTS"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install NVM and Node.js LTS"
@@ -129,7 +144,7 @@ install_nvm() {
 
 install_mac_tools() {
     is_mac || return 0
-    echo "Installing Mac tools via Brewfile..."
+    step "Mac tools (Brewfile)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would run: brew bundle --file=Brewfile"
@@ -146,7 +161,7 @@ install_mac_tools() {
 
 install_linux_tools() {
     is_linux || return 0
-    echo "Installing Linux tools..."
+    step "Linux tools (nvim, tmux, fzf)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would download nvim, apt-install tmux + fzf (if sudo)"
@@ -191,7 +206,7 @@ install_linux_tools() {
 }
 
 install_extra_tools() {
-    echo "Installing extra tools..."
+    step "Extra tools (tldr via npm)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install extra tools (tldr)"
@@ -209,7 +224,7 @@ install_extra_tools() {
 }
 
 sync_configs() {
-    echo "Syncing configs via update.sh..."
+    step "Syncing configs to \$HOME (via update.sh)"
     if ! DRY_RUN="$DRY_RUN" ./update.sh; then
         echo "  ERROR: update.sh failed"
         return 1
@@ -217,7 +232,7 @@ sync_configs() {
 }
 
 bootstrap_gitconfig() {
-    echo "Bootstrapping git include..."
+    step "Git include bootstrap (~/.gitconfig)"
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would add include.path to ~/.gitconfig"
