@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
 
-import atexit
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -102,21 +100,21 @@ def build_ssh_opts(jump, reuse=True):
     if reuse:
         # Reuse one connection per host: the first poll opens a master socket,
         # later polls piggyback on it (no repeat TCP+auth handshake every refresh).
-        # ControlPersist keeps the master alive briefly after we exit; the temp
-        # dir is removed on exit, tearing the sockets down with it.
-        ctl_dir = tempfile.mkdtemp(prefix="gmon-ssh-")
-        atexit.register(_cleanup_ssh, ctl_dir)
+        # ControlPersist keeps masters alive ~30s idle, so they're shared across
+        # gmon runs too (faster restarts) and self-reap when unused.
+        #
+        # The socket path must stay under the ~104-byte sun_path limit. macOS's
+        # $TMPDIR is ~49 chars and "%C" adds a 40-char hash, which overflows — so
+        # anchor at a short, stable per-user dir under /tmp instead.
+        ctl_base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+        ctl_dir = os.path.join(ctl_base, f"gmon-ssh-{os.getuid()}")
+        os.makedirs(ctl_dir, mode=0o700, exist_ok=True)
         opts += [
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={ctl_dir}/%C",
             "-o", "ControlPersist=30s",
         ]
     return [*opts, *jump]
-
-
-def _cleanup_ssh(ctl_dir):
-    """Remove the socket dir on exit; ControlPersist reaps any orphaned master."""
-    shutil.rmtree(ctl_dir, ignore_errors=True)
 
 
 def query_host(host, ssh_opts):
