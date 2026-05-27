@@ -98,35 +98,32 @@ install_zsh_plugins() {
 }
 
 install_nvm() {
-    echo "Installing NVM..."
+    echo "Installing NVM + Node LTS..."
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "  [DRY RUN] Would install NVM and Node.js LTS"
         return 0
     fi
 
-    if [ -d "$HOME/.nvm" ]; then
-        echo "  NVM already installed, skipping..."
-        return 0
-    fi
-
-    latest=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$latest" ]; then
-        echo "  ERROR: Failed to fetch NVM version"
-        return 1
-    fi
-
-    if ! curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash; then
-        echo "  ERROR: Failed to install NVM"
-        return 1
+    if [ ! -d "$HOME/.nvm" ]; then
+        latest=$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$latest" ]; then
+            echo "  ERROR: Failed to fetch NVM version"
+            return 1
+        fi
+        if ! curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$latest/install.sh | bash; then
+            echo "  ERROR: Failed to install NVM"
+            return 1
+        fi
+    else
+        echo "  NVM already present"
     fi
 
     export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-    if ! nvm install --lts; then
-        echo "  WARNING: Failed to install Node.js LTS"
-        return 1
+    if [ -s "$NVM_DIR/nvm.sh" ]; then
+        \. "$NVM_DIR/nvm.sh"
+        nvm install --lts >/dev/null 2>&1 || echo "  WARNING: nvm install --lts failed"
+        nvm alias default 'lts/*' >/dev/null 2>&1
     fi
 }
 
@@ -169,17 +166,28 @@ install_linux_tools() {
         echo "  nvim already installed: $(command -v nvim)"
     fi
 
-    for pkg in tmux fzf; do
-        if command -v "$pkg" >/dev/null; then
-            echo "  $pkg already installed"
-            continue
-        fi
+    if ! command -v tmux >/dev/null; then
         if has_sudo && command -v apt-get >/dev/null; then
-            sudo apt-get install -y "$pkg"
+            sudo apt-get install -y tmux
         else
-            echo "  WARNING: $pkg not installed. Run 'sudo apt install $pkg' when you have sudo."
+            echo "  WARNING: tmux not installed. Run 'sudo apt install tmux' when you have sudo."
         fi
-    done
+    else
+        echo "  tmux already installed"
+    fi
+
+    if ! command -v fzf >/dev/null; then
+        echo "  Installing fzf via git clone (apt's fzf is too old for 'fzf --zsh')..."
+        if [ ! -d "$HOME/.fzf" ]; then
+            git clone --depth 1 https://github.com/junegunn/fzf.git "$HOME/.fzf"
+        fi
+        "$HOME/.fzf/install" --bin
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$HOME/.fzf/bin/fzf" "$HOME/.local/bin/fzf"
+        echo "  fzf installed to ~/.local/bin/fzf"
+    else
+        echo "  fzf already installed"
+    fi
 }
 
 install_extra_tools() {
