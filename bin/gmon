@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
 
+import argparse
 import os
 import subprocess
-import tempfile
-import time
 import sys
+import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config (defaults; overridable via CLI flags) ──────────────────────────────
 CONFIG_FILE = Path("~/.config/gmon/hosts").expanduser()
-REFRESH_SECONDS = 3
+REFRESH_SECONDS = 3.0
 SSH_TIMEOUT = 15
 FREE_MEM_MIB = 1024  # a GPU with no users and less VRAM used than this counts as "free"
+STALE_FACTOR = 3     # rows dim out if their last good poll is older than STALE_FACTOR × REFRESH_SECONDS
 # ─────────────────────────────────────────────────────────────────────────────
 
 QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed"
@@ -41,6 +44,7 @@ COLORS = {
     "bold":     "\033[1m",
     "red":      _fg(243, 139, 168),  # Red
     "maroon":   _fg(235, 160, 172),  # Maroon
+    "rosewater":_fg(245, 224, 220),  # Rosewater
     "peach":    _fg(250, 179, 135),  # Peach
     "yellow":   _fg(249, 226, 175),  # Yellow
     "green":    _fg(166, 227, 161),  # Green
@@ -95,26 +99,27 @@ def load_config():
     return hosts, jump
 
 
-def build_ssh_opts(jump, reuse=True):
-    opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
-    if reuse:
-        # Reuse one connection per host: the first poll opens a master socket,
-        # later polls piggyback on it (no repeat TCP+auth handshake every refresh).
-        # ControlPersist keeps masters alive ~30s idle, so they're shared across
-        # gmon runs too (faster restarts) and self-reap when unused.
-        #
-        # The socket path must stay under the ~104-byte sun_path limit. macOS's
-        # $TMPDIR is ~49 chars and "%C" adds a 40-char hash, which overflows — so
-        # anchor at a short, stable per-user dir under /tmp instead.
-        ctl_base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
-        ctl_dir = os.path.join(ctl_base, f"gmon-ssh-{os.getuid()}")
-        os.makedirs(ctl_dir, mode=0o700, exist_ok=True)
-        opts += [
-            "-o", "ControlMaster=auto",
-            "-o", f"ControlPath={ctl_dir}/%C",
-            "-o", "ControlPersist=30s",
-        ]
-    return [*opts, *jump]
+def build_ssh_opts(jump):
+    # Reuse one connection per host: the first poll opens a master socket,
+    # later polls (and back-to-back gmon runs within ControlPersist) piggyback
+    # on it — no repeat TCP+auth handshake. The master self-reaps 30s after
+    # the last client disconnects.
+    #
+    # The socket path must stay under the ~104-byte sun_path limit. macOS's
+    # $TMPDIR is ~49 chars and "%C" adds a 40-char hash, which overflows — so
+    # anchor at a short, stable per-user dir under /tmp instead.
+    ctl_base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+    ctl_dir = os.path.join(ctl_base, f"gmon-ssh-{os.getuid()}")
+    os.makedirs(ctl_dir, mode=0o700, exist_ok=True)
+    return [
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={ctl_dir}/%C",
+        "-o", "ControlPersist=30s",
+        *jump,
+    ]
 
 
 def query_host(host, ssh_opts):
@@ -170,14 +175,14 @@ def _int(val):
 
 
 def util_color(val):
-    # Idle = available = green (pops); load uses warm tones, not alarm-red
+    # Two tiers: neutral subtext for normal load (blends into the table's
+    # gray family), rosewater once a GPU is clearly loaded — soft pink as
+    # a gentle highlight rather than an alarm.
     if val is None:
         return "overlay1"
-    if val < 10:
-        return "green"
     if val < 70:
-        return "peach"
-    return "maroon"
+        return "subtext0"
+    return "rosewater"
 
 
 def temp_color(val):
@@ -191,13 +196,47 @@ def temp_color(val):
     return "red"
 
 
-def mem_bar(used, total, width=10):
-    if used is None or total is None or total == 0:
+# Eighth-block partial fills, so the bar resolves to ~1% precision at width=10
+# instead of snapping to the nearest 10% mark
+SUB_BLOCKS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
+
+# Background painted only behind the partial-block character so its empty
+# right half blends into the dotted ░ track instead of showing raw terminal
+# bg through. Tuned to Catppuccin surface0, which roughly matches the visual
+# average of ░ (surface2 fg) over the typical dark terminal background.
+BG_PARTIAL = "\033[48;2;49;50;68m"
+
+
+def _bar(ratio, color, width, dim):
+    """Filled-block bar. ratio=None → empty dim track; otherwise clamped to [0, 1]."""
+    if ratio is None:
         return c("surface2", "░" * width)
+    eighths = int(max(0.0, min(1.0, ratio)) * width * 8)
+    full, rem = divmod(eighths, 8)
+    fill = "overlay0" if dim else color
+    parts = []
+    if full:
+        parts.append(c(fill, "█" * full))
+    if rem:
+        parts.append(f"{COLORS[fill]}{BG_PARTIAL}{SUB_BLOCKS[rem]}{COLORS['reset']}")
+    pad = width - full - (1 if rem else 0)
+    if pad:
+        parts.append(c("surface2", "░" * pad))
+    return "".join(parts)
+
+
+def mem_bar(used, total, width=10, dim=False):
+    if used is None or total is None or total == 0:
+        return _bar(None, "", width, dim)
     ratio = used / total
-    filled = int(ratio * width)
-    color = "green" if ratio < 0.6 else "yellow" if ratio < 0.85 else "maroon"
-    return c(color, "█" * filled) + c("surface2", "░" * (width - filled))
+    color = "subtext0" if ratio < 0.85 else "rosewater"
+    return _bar(ratio, color, width, dim)
+
+
+def util_bar(util, width=10, dim=False):
+    if util is None:
+        return _bar(None, "", width, dim)
+    return _bar(util / 100, util_color(util), width, dim)
 
 
 def is_free(gpu):
@@ -206,13 +245,20 @@ def is_free(gpu):
 
 
 def render(results, live=True):
+    """Render a frame. `results` is a list of (host, gpus, err, age_seconds).
+
+    age_seconds is None for one-shot mode or hosts that have never returned;
+    otherwise it's seconds since the last *successful* poll for that host.
+    """
     now = datetime.now().strftime("%H:%M:%S")
     lines = []
-    hint = f"  (refresh every {REFRESH_SECONDS}s)  Ctrl-C to quit" if live else ""
+    hint = f"  (refresh every {REFRESH_SECONDS:g}s)  Ctrl-C to quit" if live else ""
     lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}{hint}"))
 
+    srt = sorted(results, key=lambda r: r[0])
+
     free = {}  # host -> [idx, ...], in host-sorted order
-    for host, gpus, _ in sorted(results, key=lambda r: r[0]):
+    for host, gpus, *_ in srt:
         for gpu in gpus or []:
             if is_free(gpu):
                 free.setdefault(host, []).append(gpu["idx"])
@@ -225,63 +271,87 @@ def render(results, live=True):
     lines.append("")
 
     # host/gpu/users size to the widest value present (floored at the header label)
-    host_w = max([len("HOST")] + [len(h) for h, _, _ in results])
-    gpu_w = max([len("GPU")] + [len(g["name"]) for _, gpus, _ in results if gpus for g in gpus])
+    host_w = max([len("HOST")] + [len(h) for h, _, _, _ in results])
+    gpu_w = max([len("GPU")] + [len(g["name"]) for _, gpus, _, _ in results if gpus for g in gpus])
     users_w = max([len("USERS")] + [
         len(", ".join(g["users"]) if g["users"] else "idle")
-        for _, gpus, _ in results if gpus for g in gpus
+        for _, gpus, _, _ in results if gpus for g in gpus
     ])
-    # mem cell = 10-wide bar + space + 13-wide "used/total" (fits H200's 143771/143771)
-    col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 6, "mem": 24, "temp": 6, "fan": 5, "users": users_w}
+    # util cell = 10-wide bar + space + 6-wide " 100%"  (each block = 10%, matches mem)
+    # mem cell  = 10-wide bar + space + 13-wide "used/total" (fits H200's 143771/143771)
+    col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 17, "mem": 24, "temp": 6, "fan": 5, "users": users_w}
     header = (
         f"  {'HOST':<{col_w['host']}}  {'GPU':<{col_w['gpu']}}  "
-        f"{'#':>{col_w['idx']}}  {'UTIL%':>{col_w['util']}}  "
-        f"{'MEMORY (MiB)':<{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  {'FAN%':>{col_w['fan']}}  "
+        f"{'#':>{col_w['idx']}}  {'UTIL%':^{col_w['util']}}  "
+        f"{'MEMORY (MiB)':^{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  {'FAN%':>{col_w['fan']}}  "
         f"{'USERS':<{col_w['users']}}"
     )
     rule = "  " + "─" * (len(header) - 2)
     lines.append(c("subtext0", header))
     lines.append(c("surface2", rule))
 
-    for i, (host, gpus, err) in enumerate(sorted(results, key=lambda r: r[0])):
+    for i, (host, gpus, err, age) in enumerate(srt):
         if i:
             lines.append("")  # blank line between servers
         accent = ACCENTS[i % len(ACCENTS)]  # rotate hostname color per server
         host_cell = cb(accent, f"{host:<{col_w['host']}}")  # blanked after first row
-        if err or gpus is None:
-            lines.append(f"  {host_cell}  " + c("red", f"error: {err}"))
+
+        # No data yet — show connecting/error placeholder
+        if gpus is None:
+            if err == "connecting":
+                msg = c("overlay1", "connecting…")
+            elif err:
+                msg = c("red", f"error: {err}")
+            else:
+                msg = c("overlay1", "no data")
+            lines.append(f"  {host_cell}  {msg}")
             continue
         if not gpus:
             lines.append(f"  {host_cell}  " + c("yellow", "no GPUs / nvidia-smi not found"))
             continue
+
+        # We have data, but the latest poll(s) may have failed → dim the row
+        stale = age is not None and age > REFRESH_SECONDS * STALE_FACTOR
+        # Stale rows render uniformly dim; otherwise each cell picks its own color
+        dim = lambda vivid: "overlay0" if stale else vivid
+
         for gpu in gpus:
             util = gpu["util"]
             temp = gpu["temp"]
             mu, mt = gpu["mem_used"], gpu["mem_total"]
             mem_str = f"{mu if mu is not None else '?'}/{mt if mt is not None else '?'}"
-            bar = mem_bar(mu, mt)
             users = gpu.get("users", [])
 
-            name_cell  = c("subtext0", f"{gpu['name']:<{col_w['gpu']}}")
-            idx_cell   = c("overlay1", f"{gpu['idx']:>{col_w['idx']}}")
-            util_cell  = c(util_color(util), f"{util:>5}%") if util is not None else c("overlay1", "    ?%")
-            mem_cell   = c("subtext1", f"{mem_str:>13}")
-            temp_cell  = c(temp_color(temp), f"{temp:>4}°C") if temp is not None else c("overlay1", "   ?°C")
-            fan_cell   = c("overlay1", f"{gpu['fan']:>4}%") if gpu["fan"] is not None else c("overlay1", f"{'—':>5}")
-            users_cell = c("subtext1", ", ".join(users)) if users else c("overlay0", "idle")
+            name_cell  = c(dim("subtext0"), f"{gpu['name']:<{col_w['gpu']}}")
+            idx_cell   = c(dim("overlay1"), f"{gpu['idx']:>{col_w['idx']}}")
+            util_text  = (c(dim(util_color(util)), f"{util:>5}%") if util is not None
+                          else c(dim("overlay1"), "    ?%"))
+            mem_cell   = c(dim("subtext1"), f"{mem_str:>13}")
+            temp_cell  = (c(dim(temp_color(temp)), f"{temp:>4}°C") if temp is not None
+                          else c(dim("overlay1"), "   ?°C"))
+            fan_cell   = (c(dim("overlay1"), f"{gpu['fan']:>4}%") if gpu["fan"] is not None
+                          else c(dim("overlay1"), f"{'—':>5}"))
+            users_cell = (c(dim("subtext1"), ", ".join(users)) if users
+                          else c(dim("overlay0"), "idle"))
+            ubar = util_bar(util, dim=stale)
+            mbar = mem_bar(mu, mt, dim=stale)
 
             line = (
                 f"  {host_cell}  "
                 f"{name_cell}  "
                 f"{idx_cell}  "
-                f"{util_cell}  "
-                f"{bar} {mem_cell}  "
+                f"{ubar} {util_text}  "
+                f"{mbar} {mem_cell}  "
                 f"{temp_cell}  "
                 f"{fan_cell}  "
                 f"{users_cell}"
             )
             lines.append(line)
             host_cell = " " * col_w["host"]  # only show hostname on first GPU row
+
+        if stale:
+            why = f" ({err})" if err else ""
+            lines.append("  " + " " * col_w["host"] + "  " + c("overlay1", f"⚠ stale {int(age)}s{why}"))
 
     lines.append("")
     # Clear-to-EOL on every line so shorter rows don't leave stale chars behind
@@ -328,65 +398,133 @@ def poll(hosts, ssh_opts):
 
 def run_once(hosts, ssh_opts):
     """One snapshot, plain to stdout — for scripting or non-interactive output."""
-    sys.stdout.write(render(poll(hosts, ssh_opts), live=False))
+    results = [(h, g, e, None) for h, g, e in poll(hosts, ssh_opts)]
+    sys.stdout.write(render(results, live=False))
     sys.stdout.flush()
 
 
 def run_loop(hosts, ssh_opts):
+    """Live refresh loop with independent per-host pollers.
+
+    Each host runs its own poll thread and writes into a shared state dict.
+    The render loop reads that dict on its own cadence — so one stuck SSH
+    can never block the rest of the table; that host's row just dims out
+    as "stale" while the others keep refreshing.
+
+    On a failed poll we keep the last-known data (so the user still sees
+    the table) but stash the failure reason in `err`, which the render
+    surfaces inline as "stale Ns (timeout)" etc.
+    """
+    # host -> (gpus_or_None, err_or_None, last_successful_ts_or_None)
+    state = {h: (None, "connecting", None) for h in hosts}
+    stop = threading.Event()
+
+    def poller(host):
+        while not stop.is_set():
+            _, gpus, err = query_host(host, ssh_opts)
+            if gpus is not None:
+                state[host] = (gpus, None, time.monotonic())
+            else:
+                # Keep last-good data (if any) so the table stays useful;
+                # record the latest failure so it can be shown inline.
+                prev_gpus, _, prev_ts = state[host]
+                state[host] = (prev_gpus, err, prev_ts)
+            if stop.wait(REFRESH_SECONDS):
+                return
+
     clear()
-    print(c("sapphire", "Connecting..."))
-    while True:
-        results = poll(hosts, ssh_opts)
-        # Home cursor and overwrite in place; clear-below wipes any rows
-        # left over from a taller previous frame
-        sys.stdout.write("\033[H" + render(results) + "\033[J")
-        sys.stdout.flush()
-        time.sleep(REFRESH_SECONDS)
+    for h in hosts:
+        threading.Thread(target=poller, args=(h,), daemon=True).start()
+
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
+            results = []
+            for h in hosts:
+                gpus, err, ts = state[h]
+                age = (now - ts) if ts is not None else None
+                results.append((h, gpus, err, age))
+            # Home cursor and overwrite in place; clear-below wipes any rows
+            # left over from a taller previous frame
+            sys.stdout.write("\033[H" + render(results) + "\033[J")
+            sys.stdout.flush()
+            if stop.wait(REFRESH_SECONDS):
+                break
+    finally:
+        stop.set()
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="gmon",
+        description="GPU monitor — polls nvidia-smi across SSH hosts and renders a live table.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            f"Config file: {CONFIG_FILE}\n"
+            "  jump=thor       # optional jump host\n"
+            "  baram\n"
+            "  namu\n"
+        ),
+    )
+    p.add_argument("hosts", nargs="*", metavar="HOST",
+                   help="hosts to monitor (overrides config file)")
+    p.add_argument("-1", "--once", action="store_true",
+                   help="print a single snapshot and exit")
+    p.add_argument("-e", "--edit", action="store_true",
+                   help="edit the hosts config in $EDITOR")
+    p.add_argument("-r", "--refresh", type=float, default=REFRESH_SECONDS, metavar="SEC",
+                   help=f"refresh interval in seconds (default: {REFRESH_SECONDS:g})")
+    p.add_argument("-t", "--timeout", type=int, default=SSH_TIMEOUT, metavar="SEC",
+                   help=f"per-host SSH timeout in seconds (default: {SSH_TIMEOUT})")
+    p.add_argument("-f", "--free-mem", type=int, default=FREE_MEM_MIB, metavar="MIB",
+                   help=f"MiB used below which an idle GPU counts as free (default: {FREE_MEM_MIB})")
+    jg = p.add_mutually_exclusive_group()
+    jg.add_argument("-j", "--jump", metavar="HOST",
+                    help="override the jump host from config")
+    jg.add_argument("--no-jump", action="store_true",
+                    help="ignore the jump host from config")
+    return p.parse_args(argv)
 
-    if args and args[0] in ("-e", "--edit"):
+
+def main():
+    global REFRESH_SECONDS, SSH_TIMEOUT, FREE_MEM_MIB
+    args = parse_args(sys.argv[1:])
+
+    if args.edit:
         edit_config()
-        sys.exit(0)
+        return
 
-    if args and args[0] in ("-h", "--help"):
-        print("Usage: gmon [HOST ...]      monitor the given hosts (or those in the config)")
-        print("       gmon -1, --once      print a single snapshot and exit")
-        print("       gmon -e, --edit      edit the hosts config in $EDITOR")
-        print("       gmon -h, --help      show this help")
-        print(f"\nConfig file: {CONFIG_FILE}")
-        sys.exit(0)
+    REFRESH_SECONDS = args.refresh
+    SSH_TIMEOUT = args.timeout
+    FREE_MEM_MIB = args.free_mem
 
     # One-shot if asked, or whenever stdout isn't a terminal (piped/redirected) —
     # a live refresh loop only makes sense on an interactive screen.
-    once = False
-    if args and args[0] in ("-1", "--once"):
-        once = True
-        args = args[1:]
-    once = once or not sys.stdout.isatty()
+    once = args.once or not sys.stdout.isatty()
 
-    config_hosts, jump = load_config()
-    ssh_opts = build_ssh_opts(jump, reuse=not once)
+    config_hosts, config_jump = load_config()
+    if args.jump:
+        jump = ["-J", args.jump]
+    elif args.no_jump:
+        jump = []
+    else:
+        jump = config_jump
 
-    # CLI args override config file hosts (jump host from config still applies)
-    hosts = args or config_hosts
+    ssh_opts = build_ssh_opts(jump)
+
+    # CLI args override config file hosts (jump flags above apply either way)
+    hosts = args.hosts or config_hosts
 
     # Validate before entering the alternate screen, otherwise leave_screen()
     # wipes this message before the user can read it.
     if not hosts:
         print(f"No hosts found. Add them to {CONFIG_FILE} or pass as arguments.")
-        print(f"Run 'gmon --edit' to create and edit the config file.")
-        print(f"\nConfig file format (~/.config/gmon/hosts):")
-        print(f"  jump=thor       # optional jump host")
-        print(f"  baram")
-        print(f"  namu")
+        print("Run 'gmon --edit' to create and edit the config file.")
         sys.exit(1)
 
     if once:
         run_once(hosts, ssh_opts)
-        sys.exit(0)
+        return
 
     enter_screen()
     try:
@@ -396,3 +534,7 @@ if __name__ == "__main__":
     finally:
         leave_screen()
     print("Bye.")
+
+
+if __name__ == "__main__":
+    main()
