@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 DRY_RUN=${DRY_RUN:-false}
 WITH_GITCONFIG=${WITH_GITCONFIG:-false}
 UPGRADE_NVIM=${UPGRADE_NVIM:-false}
+MINIMAL=${MINIMAL:-false}
 
 TPM_PATH="$HOME/.tmux/plugins/tpm"
 
@@ -152,8 +153,16 @@ install_mac_tools() {
     fi
 
     if ! command -v brew >/dev/null; then
-        echo "  WARNING: brew not found. Install Homebrew first, then re-run."
-        return 0
+        echo "  Homebrew not found, installing..."
+        if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+            echo "  ERROR: Failed to install Homebrew"
+            return 1
+        fi
+        if [ -x /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [ -x /usr/local/bin/brew ]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+        fi
     fi
 
     brew bundle --file=Brewfile
@@ -223,6 +232,63 @@ install_extra_tools() {
     fi
 }
 
+install_uv() {
+    step "uv (Python package manager)"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install uv via astral.sh installer"
+        return 0
+    fi
+
+    if command -v uv >/dev/null 2>&1; then
+        echo "  uv already installed: $(command -v uv)"
+        return 0
+    fi
+
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+        echo "  ERROR: Failed to install uv"
+        return 1
+    fi
+}
+
+install_hf_cli() {
+    step "HuggingFace CLI"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install HuggingFace CLI"
+        return 0
+    fi
+
+    if command -v hf >/dev/null 2>&1; then
+        echo "  HuggingFace CLI already installed: $(command -v hf)"
+        return 0
+    fi
+
+    if ! curl -LsSf https://hf.co/cli/install.sh | bash; then
+        echo "  ERROR: Failed to install HuggingFace CLI"
+        return 1
+    fi
+}
+
+install_claude_code() {
+    step "Claude Code CLI"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install Claude Code CLI"
+        return 0
+    fi
+
+    if command -v claude >/dev/null 2>&1; then
+        echo "  Claude Code already installed: $(command -v claude)"
+        return 0
+    fi
+
+    if ! curl -fsSL https://claude.ai/install.sh | bash; then
+        echo "  ERROR: Failed to install Claude Code"
+        return 1
+    fi
+}
+
 sync_configs() {
     step "Syncing configs to \$HOME (via update.sh)"
     if ! DRY_RUN="$DRY_RUN" ./update.sh; then
@@ -253,17 +319,41 @@ bootstrap_gitconfig() {
     fi
 }
 
-install() {
+install_minimal() {
     local errors=0
 
-    install_mac_tools    || (( ++errors ))
-    install_linux_tools  || (( ++errors ))
     install_oh_my_zsh    || (( ++errors ))
     install_zsh_plugins  || (( ++errors ))
     sync_configs         || (( ++errors ))
     install_tmux_plugins || (( ++errors ))
+
+    return $errors
+}
+
+install_full() {
+    local errors=0
+
+    install_mac_tools    || (( ++errors ))
+    install_linux_tools  || (( ++errors ))
+    install_minimal      || (( errors += $? ))
     install_nvm          || (( ++errors ))
     install_extra_tools  || (( ++errors ))
+    install_uv           || (( ++errors ))
+    install_hf_cli       || (( ++errors ))
+    install_claude_code  || (( ++errors ))
+
+    return $errors
+}
+
+install() {
+    local errors=0
+
+    if [ "$MINIMAL" = "true" ]; then
+        echo "Running minimal install (shell config only)..."
+        install_minimal || (( errors += $? ))
+    else
+        install_full || (( errors += $? ))
+    fi
 
     if [ "$WITH_GITCONFIG" = "true" ]; then
         bootstrap_gitconfig || (( ++errors ))

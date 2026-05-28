@@ -1,3 +1,8 @@
 brew "neovim"
 brew "tmux"
 brew "fzf"
+brew "ripgrep"
+brew "fd"
+brew "gh"
+brew "jq"
+brew "bat"
