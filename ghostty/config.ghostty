@@ -1,8 +1,10 @@
 theme = Catppuccin Mocha
 shell-integration-features = ssh-terminfo,ssh-env,sudo
 
-window-width = 120
-window-height = 36
+#window-width = 120
+#window-height = 36
+window-width = 100
+window-height = 30
 
 #font-family = "JetBrainsMono Nerd Font"
 font-family = "JetBrainsMono Nerd Font Mono"
