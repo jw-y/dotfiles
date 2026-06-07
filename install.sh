@@ -138,7 +138,8 @@ install_nvm() {
     export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
     if [ -s "$NVM_DIR/nvm.sh" ]; then
         \. "$NVM_DIR/nvm.sh"
-        nvm install --lts >/dev/null 2>&1 || echo "  WARNING: nvm install --lts failed"
+        #nvm install --lts >/dev/null 2>&1 || echo "  WARNING: nvm install --lts failed"
+        nvm install --lts || echo "  WARNING: nvm install --lts failed"
         nvm alias default 'lts/*' >/dev/null 2>&1
     fi
 }
