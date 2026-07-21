@@ -121,3 +121,8 @@ export LANG=en_US.UTF-8
 
 # fzf: Ctrl-R fuzzy history, Ctrl-T file picker, Alt-C cd picker
 command -v fzf >/dev/null && source <(fzf --zsh)
+
+# truecolor for Rich-based TUIs (agt top) inside tmux — terminfo RGB
+# is set via tmux terminal-overrides, but Rich reads COLORTERM, not terminfo.
+export COLORTERM=truecolor
+
