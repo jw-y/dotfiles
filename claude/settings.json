@@ -5,6 +5,6 @@
   "theme": "dark",
   "statusLine": {
     "type": "command",
-    "command": "bash /home/jwyang/.claude/statusline-command.sh"
+    "command": "bash \"$HOME/.claude/statusline-command.sh\""
   }
 }

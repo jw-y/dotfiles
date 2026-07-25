@@ -49,6 +49,9 @@ local function setup_lsp()
     settings = { ['rust-analyzer'] = {} },
   })
   vim.lsp.enable('rust_analyzer')
+
+  vim.lsp.config('yamlls', { capabilities = capabilities })
+  vim.lsp.enable('yamlls')
 end
 
 return {
@@ -71,7 +74,10 @@ return {
         "yamlls",
       }
     },
-    config = setup_lsp
+    config = function(_, opts)
+      require("mason-lspconfig").setup(opts)
+      setup_lsp()
+    end
   },
   {
     'saghen/blink.cmp',

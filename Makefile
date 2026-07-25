@@ -2,7 +2,7 @@
 
 help:
 	@echo "Targets:"
-	@echo "  make install        Full setup (shell + brew/apt tools + nvm + uv + hf + claude)"
+	@echo "  make install        Full setup (shell + tools + nvm + uv + hf + Claude + Codex)"
 	@echo "  make minimal        Shell config only (oh-my-zsh, plugins, tmux, dotfiles)"
 	@echo "  make update         Sync configs to \$$HOME"
 	@echo "  make upgrade-nvim   Force re-download latest nvim (Linux only)"
@@ -33,7 +33,7 @@ gitconfig:
 dry-run:
 	@echo "=== DRY RUN ==="
 	@echo "--- install.sh ---"
-	@DRY_RUN=true ./install.sh || true
+	@DRY_RUN=true ./install.sh
 	@echo ""
 	@echo "--- update.sh ---"
-	@DRY_RUN=true ./update.sh || true
+	@DRY_RUN=true ./update.sh

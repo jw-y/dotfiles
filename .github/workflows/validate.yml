@@ -1,0 +1,32 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell scripts
+        run: |
+          bash -n install.sh update.sh claude/statusline-command.sh
+          shellcheck --severity=warning install.sh update.sh claude/statusline-command.sh
+      - name: Check Python syntax
+        run: python3 -c "compile(open('bin/gmon').read(), 'bin/gmon', 'exec')"
+      - name: Check JSON
+        run: |
+          python3 -m json.tool claude/settings.json >/dev/null
+          python3 -m json.tool nvim/lazy-lock.json >/dev/null
+      - name: Check dry-run safety
+        run: |
+          HOME="$RUNNER_TEMP/dotfiles-dry-home" DRY_RUN=true ./update.sh
+          test ! -e "$RUNNER_TEMP/dotfiles-dry-home"
+      - name: Check whitespace
+        run: git diff-tree --check --root HEAD

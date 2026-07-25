@@ -18,8 +18,6 @@ thinking=$(echo "$input" | jq -r '.thinking.enabled // false')
 # Catppuccin Mocha
 SAPPHIRE="\033[38;2;116;199;236m"
 MAUVE="\033[38;2;203;166;247m"
-PEACH="\033[38;2;250;179;135m"
-TEAL="\033[38;2;148;226;213m"
 SUBTEXT0="\033[38;2;166;173;200m"
 OVERLAY0="\033[38;2;108;112;134m"
 RESET="\033[0m"

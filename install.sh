@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 [ "$DEBUG" == 'true' ] && set -x
 
 cd "$(dirname "$0")"
@@ -17,11 +17,9 @@ has_sudo() { command -v sudo >/dev/null && sudo -n true 2>/dev/null; }
 
 if [ -t 1 ]; then
     C_HDR='\033[1;34m'
-    C_OK='\033[0;32m'
-    C_WARN='\033[0;33m'
     C_RESET='\033[0m'
 else
-    C_HDR='' C_OK='' C_WARN='' C_RESET=''
+    C_HDR='' C_RESET=''
 fi
 
 STEP_NUM=0
@@ -30,10 +28,36 @@ step() {
     printf "\n${C_HDR}==> [%d] %s${C_RESET}\n" "$STEP_NUM" "$*"
 }
 
-if ! command -v zsh &> /dev/null; then
-    echo "'zsh' is not found! Try 'sudo apt install zsh'."
-    exit
-fi
+ensure_prerequisites() {
+    step "Prerequisites (zsh, git, curl, rsync)"
+
+    local missing=()
+    local command_name
+    for command_name in zsh git curl rsync; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        echo "  Prerequisites already installed"
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install/check: ${missing[*]}"
+        return 0
+    fi
+
+    if is_linux && command -v apt-get >/dev/null 2>&1 && has_sudo; then
+        echo "  Installing missing prerequisites: ${missing[*]}"
+        sudo apt-get update
+        sudo apt-get install -y "${missing[@]}"
+        return 0
+    fi
+
+    echo "  ERROR: Missing required commands: ${missing[*]}"
+    echo "  Install them with your system package manager, then run this script again."
+    return 1
+}
 
 install_tmux_plugins() {
     step "tmux plugins (TPM)"
@@ -44,7 +68,7 @@ install_tmux_plugins() {
     fi
 
     if [ ! -d "$TPM_PATH" ]; then
-        if ! git clone https://github.com/tmux-plugins/tpm $TPM_PATH; then
+        if ! git clone https://github.com/tmux-plugins/tpm "$TPM_PATH"; then
             echo "  ERROR: Failed to clone TPM"
             return 1
         fi
@@ -52,17 +76,26 @@ install_tmux_plugins() {
         echo "  TPM already installed, skipping..."
     fi
 
-    if [ ! -f "$TPM_PATH/scripts/install_plugins.sh" ]; then
-        if ! (tmux start-server && \
-            tmux new-session -d && \
-            sleep 1 && \
-            $TPM_PATH/scripts/install_plugins.sh && \
-            tmux kill-server); then
-            echo "  ERROR: Failed to install Tmux plugins"
-            return 1
-        fi
-    else
-        echo "  Tmux plugins already installed, skipping..."
+    if [ ! -x "$TPM_PATH/bin/install_plugins" ]; then
+        echo "  ERROR: TPM plugin installer is missing"
+        return 1
+    fi
+
+    local install_session="dotfiles-install-$$"
+    local install_failed=false
+
+    if ! tmux new-session -d -s "$install_session"; then
+        echo "  ERROR: Failed to start a temporary tmux session"
+        return 1
+    fi
+
+    tmux source-file "$HOME/.tmux.conf" || install_failed=true
+    "$TPM_PATH/bin/install_plugins" || install_failed=true
+    tmux kill-session -t "$install_session" 2>/dev/null || true
+
+    if [ "$install_failed" = "true" ]; then
+        echo "  ERROR: Failed to install Tmux plugins"
+        return 1
     fi
 }
 
@@ -93,8 +126,8 @@ install_zsh_plugins() {
     fi
 
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
-    if [ ! -d $TARGET ]; then
-        if ! git clone https://github.com/zsh-users/zsh-autosuggestions $TARGET; then
+    if [ ! -d "$TARGET" ]; then
+        if ! git clone https://github.com/zsh-users/zsh-autosuggestions "$TARGET"; then
             echo "  ERROR: Failed to install zsh-autosuggestions"
             return 1
         fi
@@ -103,8 +136,8 @@ install_zsh_plugins() {
     fi
 
     TARGET="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
-    if [ ! -d $TARGET ]; then
-        if ! git clone https://github.com/zsh-users/zsh-syntax-highlighting.git $TARGET; then
+    if [ ! -d "$TARGET" ]; then
+        if ! git clone https://github.com/zsh-users/zsh-syntax-highlighting.git "$TARGET"; then
             echo "  ERROR: Failed to install zsh-syntax-highlighting"
             return 1
         fi
@@ -135,7 +168,11 @@ install_nvm() {
         echo "  NVM already present"
     fi
 
-    export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
+    if [ -z "${XDG_CONFIG_HOME-}" ]; then
+        export NVM_DIR="${HOME}/.nvm"
+    else
+        export NVM_DIR="${XDG_CONFIG_HOME}/nvm"
+    fi
     if [ -s "$NVM_DIR/nvm.sh" ]; then
         \. "$NVM_DIR/nvm.sh"
         #nvm install --lts >/dev/null 2>&1 || echo "  WARNING: nvm install --lts failed"
@@ -290,6 +327,25 @@ install_claude_code() {
     fi
 }
 
+install_codex_cli() {
+    step "OpenAI Codex CLI"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "  [DRY RUN] Would install Codex CLI with the official standalone installer"
+        return 0
+    fi
+
+    if command -v codex >/dev/null 2>&1; then
+        echo "  Codex CLI already installed: $(command -v codex)"
+        return 0
+    fi
+
+    if ! curl -fsSL https://chatgpt.com/codex/install.sh | sh; then
+        echo "  ERROR: Failed to install Codex CLI"
+        return 1
+    fi
+}
+
 sync_configs() {
     step "Syncing configs to \$HOME (via update.sh)"
     if ! DRY_RUN="$DRY_RUN" ./update.sh; then
@@ -311,7 +367,8 @@ bootstrap_gitconfig() {
         return 0
     fi
 
-    local target="$(pwd)/git/gitconfig"
+    local target
+    target="$(pwd)/git/gitconfig"
     if git config --global --get-all include.path 2>/dev/null | grep -Fxq "$target"; then
         echo "  include.path already points to $target"
     else
@@ -342,12 +399,17 @@ install_full() {
     install_uv           || (( ++errors ))
     install_hf_cli       || (( ++errors ))
     install_claude_code  || (( ++errors ))
+    install_codex_cli    || (( ++errors ))
 
     return $errors
 }
 
 install() {
     local errors=0
+
+    if ! ensure_prerequisites; then
+        return 1
+    fi
 
     if [ "$MINIMAL" = "true" ]; then
         echo "Running minimal install (shell config only)..."

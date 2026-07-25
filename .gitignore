@@ -6,7 +6,6 @@
 .vscode/
 
 # Neovim
-nvim/lazy-lock.json
 nvim/.luarc.json
 nvim/.luarc.jsonc
 
@@ -24,3 +23,4 @@ Thumbs.db
 # Install artifacts
 *.sh.download
 Miniconda*.sh
+/bin/nvim

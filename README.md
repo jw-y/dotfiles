@@ -1,62 +1,78 @@
 # Dotfiles
 
-Personal dotfiles configuration.
+Personal terminal and development configuration for macOS and Linux.
 
-## What's Included
+## What's included
 
-### Core Tools
-- **Shell**: Zsh + Oh My Zsh + custom theme + plugins
-- **Terminal**: Tmux with TPM
-- **Editor**: Neovim (LSP, Treesitter, Telescope, Mason)
-- **Languages**: Python (uv), Node.js (nvm), Lua, Rust, TypeScript, YAML
+- **Shell:** Zsh, Oh My Zsh, a custom theme, autosuggestions, and syntax highlighting
+- **Terminal:** Ghostty, tmux, TPM, and Catppuccin
+- **Editor:** Neovim with LSP, Treesitter, Telescope, Mason, and completion
+- **CLI tools:** `gmon`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
+- **Development:** Git, Python debugger/linter settings, and VS Code keybindings
 
-### Development
-- **Python**: pylint, pdb/ipdb config
-- **Git**: Configuration and tools
-- **System**: tldr (command examples via npm)
+## Quick start
 
-## Quick Start
-
-### First Time Setup
 ```bash
 git clone https://github.com/jw-y/dotfiles.git ~/dotfiles
 cd ~/dotfiles
-./install.sh
+make install
 ```
 
-### Update Existing Configs
+The full installer sets up platform tools, shell and editor configuration, CLI tools, Claude Code, and the OpenAI Codex CLI. Codex uses OpenAI's official standalone installer for macOS and Linux.
+
+For shell, tmux, and dotfile configuration without the language and AI tools:
+
 ```bash
-./update.sh
+make minimal
 ```
+
+To sync configuration changes later:
+
+```bash
+make update
+```
+
+Preview either workflow without changing your home directory:
+
+```bash
+make dry-run
+```
+
+Run `make help` for all targets and environment-variable overrides.
 
 ## Prerequisites
 
-- **zsh** (will be installed if missing)
-- **git** and **curl** for downloading tools
-- **sudo** access for system package installation
+The installer checks for `zsh`, `git`, `curl`, and `rsync`. On Linux, it installs missing prerequisites through `apt-get` when passwordless sudo is available; otherwise it prints the commands that still need to be installed. A minimal installation also expects tmux to be available. The full installer installs tmux through Homebrew or `apt-get` where supported.
 
-## File Structure
+## Safety and update behavior
 
-```
+- Neovim, Ghostty, and `gmon` are symlinked into the home directory.
+- An existing file, directory, or incorrect symlink is moved to a timestamped `*.dotfiles-backup-YYYYMMDD-HHMMSS` path before replacement.
+- Copied shell, theme, and Claude files use the same timestamped backup suffix when their contents change.
+- Dry-run mode performs no filesystem writes.
+- Git identity is deliberately excluded; `make gitconfig` opts into the shareable Git settings.
+
+## Repository layout
+
+```text
 dotfiles/
-├── install.sh          # Complete setup script
-├── update.sh           # Update existing configs
-├── .zshrc             # Zsh configuration
-├── .tmux.conf         # Tmux configuration
-├── nvim/              # Neovim configuration
-├── vscode/            # VSCode settings
-├── archive/           # Old configs for reference
-└── fonts/             # Font files
+├── install.sh          # Idempotent machine bootstrap
+├── update.sh           # Safe config sync and symlink management
+├── Makefile            # Friendly install/update targets
+├── .zshrc              # Zsh configuration
+├── .tmux.conf          # tmux configuration
+├── nvim/               # Neovim configuration and plugin lockfile
+├── ghostty/             # Ghostty configuration
+├── claude/              # Claude settings and status line
+├── git/                 # Shareable Git configuration
+├── bin/                 # Personal command-line tools
+├── vscode/              # VS Code keybindings
+├── archive/             # Older configurations kept for reference
+└── fonts/               # Font assets
 ```
 
 ## Customization
 
-- **Theme**: Edit `jungwoo.zsh-theme` for custom colors
-- **Neovim**: Modify `nvim/lua/config/` for editor preferences
-- **Zsh**: Add aliases and functions to `.zshrc`
-
-## Notes
-
-- Configs are automatically synced to your home directory
-- Neovim config is symlinked to `~/.config/nvim`
-- Old Vim configurations are preserved in `archive/` for reference
+- Edit `jungwoo.zsh-theme` for prompt colors and layout.
+- Edit `nvim/lua/config/` and `nvim/lua/plugins/` for Neovim behavior.
+- Edit `.zshrc`, `.tmux.conf`, or `ghostty/config.ghostty` for terminal behavior.
