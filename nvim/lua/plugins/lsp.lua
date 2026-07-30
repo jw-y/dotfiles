@@ -65,6 +65,9 @@ return {
     "williamboman/mason-lspconfig.nvim",
     lazy = true,
     event = "VeryLazy",
+    dependencies = {
+      "neovim/nvim-lspconfig",
+    },
     opts = {
       ensure_installed = {
         "pyright",
