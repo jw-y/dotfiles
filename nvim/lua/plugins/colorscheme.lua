@@ -14,7 +14,7 @@ return {
           treesitter = true,
           which_key = true,
           mini = { enabled = true },
-          nvim_tree = true,
+          nvimtree = true,
           blink_cmp = true,
           native_lsp = { enabled = true },
         },
