@@ -79,3 +79,4 @@ sync_file "claude/settings.json" "$HOME/.claude"
 sync_file "claude/statusline-command.sh" "$HOME/.claude"
 
 link_path "$DOTFILES_DIR/bin/gmon" "$HOME/.local/bin/gmon" "gmon"
+link_path "$DOTFILES_DIR/bin/cdx" "$HOME/.local/bin/cdx" "cdx"

@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# cdx — run Codex under a named account profile (separate CODEX_HOME per account).
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+PROFILES="${CODEX_PROFILES:-$HOME/.codex-profiles}"
+
+# Every Codex client — CLI, desktop app, VS Code, the app's remote bootstrap —
+# reads ~/.codex. Once that path is a symlink to a profile, "activating" an
+# account is just re-pointing it, and no client needs to know about CODEX_HOME.
+# Before migration it is still a real directory, which is the 'main' profile.
+CODEX_LINK="${CODEX_MAIN_HOME:-$HOME/.codex}"
+
+migrated() { [ -L "$CODEX_LINK" ]; }
+
+# Where the shared files actually live. After migration ~/.codex is a moving
+# pointer, so the shared originals must sit in a profile that never moves.
+shared_src() { migrated && echo "$PROFILES/main" || echo "$CODEX_LINK"; }
+
+# Config, shared so settings live in one place, not N copies. Safe to replace
+# with a link if a profile has its own: nothing here is unrecoverable.
+SHARED=(config.toml AGENTS.md AGENTS.override.md instructions.md
+        custom-instructions.md models_cache.json)
+
+# Same idea, but these hold irreplaceable history, so a real file is never
+# overwritten to make room for the link. state_5.sqlite is the index 'resume'
+# reads; without it, shared sessions/ transcripts exist but stay invisible.
+# Their -wal/-shm siblings need no linking: sqlite creates those next to the
+# resolved path, which is the shared original.
+SHARED_DATA=(state_5.sqlite memories_1.sqlite)
+
+# Version-keyed download caches, identical for every account: the Codex binary
+# (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
+# what keeps a profile a few hundred KB instead of ~660M. skills/ is shared so
+# what you install is available under every account; sessions/ so conversation
+# history follows you across accounts rather than splitting per login.
+SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions)
+
+usage() {
+    cat <<EOF
+cdx — switch between Codex accounts.
+
+Usage:
+  cdx                       list profiles ('*' marks the active one)
+  cdx init [-y]             one-time: make $CODEX_LINK a switchable link
+  cdx use <name>            make <name> the active account for every client
+  cdx <name> [args...]      run codex as <name> once, without changing active
+  cdx add <name>            create <name> and log in
+  cdx app <name> [dir]      launch the desktop app as <name> (macOS)
+  cdx ssh <host> [args...]  run cdx on <host> (no install needed there),
+                            e.g. 'cdx ssh baram use work'
+  cdx rm <name>             delete <name> and its credentials
+  cdx link                  re-link shared config into every profile
+  cdx -h                    this help
+
+'cdx use' points $CODEX_LINK at a profile, so the CLI, the desktop app, and
+the app's remote bootstrap all follow — none of them need CODEX_HOME.
+'cdx <name> ...' instead overrides CODEX_HOME for that one command, which is
+how two accounts run at once in different terminals.
+
+Profiles live in $PROFILES (override with CODEX_PROFILES).
+Symlinked from the main profile, so they are not duplicated:
+  ${SHARED[*]}
+  ${SHARED_DATA[*]}
+  ${SHARED_DIRS[*]}
+Per-profile: credentials and logs. Conversations and memories are shared, so
+'resume' shows your work whichever account is active.
+EOF
+}
+
+die() { echo "cdx: $*" >&2; exit 1; }
+
+home_of() {
+    if [ "$1" = "main" ] && ! migrated; then echo "$CODEX_LINK"; return; fi
+    echo "$PROFILES/$1"
+}
+
+# Name of the profile ~/.codex currently points at.
+active_profile() {
+    migrated || { echo main; return; }
+    basename "$(readlink "$CODEX_LINK")"
+}
+
+# Symlink shared config from the main home into a profile. Codex writes
+# config.toml atomically on some edits, which replaces the symlink with a
+# real file — 'cdx link' puts it back.
+link_shared() {
+    local home="${1%/}" f src
+    src="$(shared_src)"; src="${src%/}"
+    # Nothing to link when this profile IS the shared original. The trailing
+    # slash from "$PROFILES"/*/ has to go first or this compare silently fails.
+    [ "$home" != "$src" ] || return 0
+    for f in "${SHARED[@]}"; do
+        [ -e "$src/$f" ] || continue
+        [ -L "$home/$f" ] && continue
+        rm -f "$home/$f"
+        ln -s "$src/$f" "$home/$f"
+    done
+    # History: a real file here is this profile's own conversations or
+    # memories. Never delete one to make room for the link.
+    for f in "${SHARED_DATA[@]}"; do
+        [ -e "$src/$f" ] || continue
+        [ -L "$home/$f" ] && continue
+        if [ -e "$home/$f" ]; then
+            echo "cdx: $home/$f is this profile's own — not shared. Move or" >&2
+            echo "     delete it, then 'cdx link', to join the shared history." >&2
+            continue
+        fi
+        ln -s "$src/$f" "$home/$f"
+    done
+    # Directories: never rm -rf a real one, since that would be a profile's
+    # own data. Leave it alone and say so instead.
+    for f in "${SHARED_DIRS[@]}"; do
+        [ -d "$src/$f" ] || continue
+        [ -L "$home/$f" ] && continue
+        if [ -d "$home/$f" ]; then
+            echo "cdx: $home/$f is a real directory, not shared with main" >&2
+            continue
+        fi
+        ln -s "$src/$f" "$home/$f"
+    done
+}
+
+# account_id and last_refresh are non-secret; tokens are never printed.
+describe() {
+    local auth="$1/auth.json"
+    [ -f "$auth" ] || { echo "not logged in"; return; }
+    python3 - "$auth" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable auth.json"); sys.exit()
+t = d.get("tokens") or {}
+mode = d.get("auth_mode") or ("apikey" if d.get("OPENAI_API_KEY") else "?")
+acct = (t.get("account_id") or "")[:8]
+print(f"{mode:8} {acct:8} refreshed {(d.get('last_refresh') or '?')[:10]}")
+PY
+}
+
+list_profiles() {
+    local names=() n home active mark
+    # Pre-migration 'main' is ~/.codex and not under $PROFILES; afterwards it
+    # is an ordinary profile the glob finds, so only add it in the first case.
+    migrated || names=(main)
+    if [ -d "$PROFILES" ]; then
+        for home in "$PROFILES"/*/; do
+            [ -d "$home" ] || continue
+            names+=("$(basename "$home")")
+        done
+    fi
+    active="$(active_profile)"
+    printf '   %-12s %-8s %-8s %s\n' NAME MODE ACCOUNT ""
+    for n in "${names[@]}"; do
+        home="$(home_of "$n")"
+        # A variable, not $(... && echo ' *' || echo '  ') — command
+        # substitution strips the trailing space and misaligns the column.
+        if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
+        printf '%s %-12s %s\n' "$mark" "$n" "$(describe "$home")"
+    done
+    migrated || echo "
+($CODEX_LINK is a plain directory — run 'cdx init' to enable switching)"
+}
+
+# One-time: turn the real ~/.codex into profiles/main and leave a symlink in
+# its place. A rename on the same filesystem, so even 1.7G moves instantly.
+# Its own command rather than a step hidden inside 'use', because it is the
+# one operation here that restructures your home directory.
+cmd_init() {
+    local reply
+    migrated && {
+        echo "already set up: $CODEX_LINK -> $(readlink "$CODEX_LINK")"
+        return 0
+    }
+    [ -d "$CODEX_LINK" ] || die "$CODEX_LINK does not exist — nothing to set up"
+
+    if [ "${1:-}" != "-y" ]; then
+        # Without a terminal there is nobody to answer, and silently doing
+        # nothing is the worst outcome — say how to proceed instead.
+        [ -t 0 ] || die "not a terminal — rerun as 'cdx init -y' to confirm"
+        echo "cdx: one-time setup — $CODEX_LINK becomes a symlink so accounts can be"
+        echo "     switched by re-pointing it. Your current account moves to"
+        echo "     $PROFILES/main and stays the active one. Nothing is copied."
+        printf 'proceed? [y/N] '
+        read -r reply || reply=""
+        [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; return 1; }
+    fi
+
+    mkdir -p "$PROFILES"
+    mv "$CODEX_LINK" "$PROFILES/main"
+    ln -s "$PROFILES/main" "$CODEX_LINK"
+    echo "set up: $CODEX_LINK -> $PROFILES/main"
+}
+
+# Activate an account for every client on this machine at once.
+cmd_use() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "use needs a name (try 'cdx' to list)"
+    migrated || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
+    local home; home="$(home_of "$name")"
+    [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    link_shared "$home"
+    # -n is essential: without it ln (like mv) follows the existing symlink and
+    # drops the new link *inside* the profile directory, silently doing nothing.
+    ln -sfn "$home" "$CODEX_LINK"
+    echo "→ $name is now active ($CODEX_LINK -> $home)"
+    echo "  Already-running Codex processes keep their old account until restarted."
+}
+
+cmd_add() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "add needs a name"
+    [ "$name" != main ] || die "'main' is reserved for $CODEX_LINK"
+    local home; home="$(home_of "$name")"
+    [ -d "$home" ] && die "$name already exists ($home)"
+    mkdir -p "$home"
+    chmod 700 "$home"
+    link_shared "$home"
+    echo "→ logging in to '$name' (a browser window will open)"
+    CODEX_HOME="$home" codex login
+}
+
+cmd_rm() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "rm needs a name"
+    [ "$name" != main ] || die "refusing to delete $CODEX_LINK"
+    local home; home="$(home_of "$name")"
+    [ -d "$home" ] || die "no such profile: $name"
+    printf 'delete %s and its credentials? [y/N] ' "$home"
+    read -r reply
+    [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; exit 0; }
+    rm -rf "$home"
+    echo "removed $name"
+}
+
+cmd_link() {
+    local home
+    for home in "$PROFILES"/*/; do
+        [ -d "$home" ] || continue
+        link_shared "$home"
+        echo "linked $(basename "$home")"
+    done
+}
+
+# The desktop app defaults to ~/.codex and has no in-app switcher, but macOS
+# can hand it a different one at launch. Two knobs, because the integrated app
+# is two things: CODEX_HOME holds Codex-local state (auth.json), while the
+# ChatGPT login itself lives in the Electron session, hence --user-data-dir.
+cmd_app() {
+    local name="${1:-main}" workspace="${2:-$PWD}"
+    [ "$(uname)" = Darwin ] || die "app launching is macOS-only"
+    local home; home="$(home_of "$name")"
+    [ -d "$home" ] || die "no such profile: $name"
+
+    local app="${CHATGPT_APP:-}"
+    if [ -z "$app" ]; then
+        for candidate in /Applications/ChatGPT.app /Applications/Codex.app; do
+            [ -d "$candidate" ] && { app="$candidate"; break; }
+        done
+    fi
+    [ -n "$app" ] || die "desktop app not found — set CHATGPT_APP=/path/to/ChatGPT.app"
+
+    link_shared "$home"
+    echo "→ $app  (CODEX_HOME=$home)"
+    if [ "$name" = main ]; then
+        # Stock session: don't hand the default install a separate Electron profile.
+        open -n --env "CODEX_HOME=$home" -a "$app" "$workspace"
+    else
+        mkdir -p "$home/electron"
+        open -n --env "CODEX_HOME=$home" -a "$app" "$workspace" \
+            --args "--user-data-dir=$home/electron"
+    fi
+}
+
+# Run cdx on a remote host: 'cdx ssh baram use work' switches baram's account.
+# Each host keeps its own accounts and its own active one; this is just a way
+# to drive them without opening a shell.
+cmd_ssh() {
+    local host="${1:-}"
+    [ -n "$host" ] || die "usage: cdx ssh <host> [cdx args...]"
+    shift
+
+    # Reachability is ssh's business: jump hosts, ports, users and keys all come
+    # from ~/.ssh/config. Add 'ProxyJump' there if a host needs one — that fixes
+    # it for every tool at once, including the desktop app's remote connections.
+    local ssh_cmd=(ssh)
+    # A TTY is needed for the prompts in 'use' and 'add', but asking for one
+    # when stdin is a pipe just prints a warning, so only do it when useful.
+    [ -t 0 ] && ssh_cmd+=(-t)
+    [ -n "${CDX_SSH_OPTS:-}" ] && ssh_cmd+=($CDX_SSH_OPTS)
+
+    # Ship this script to the host and run it there, instead of requiring an
+    # install on every machine. base64 so no quoting survives contact with two
+    # shells; stdin stays free, which is what lets -t carry the prompts.
+    local enc args=""
+    enc="$(base64 < "$SELF" | tr -d '\n')"
+    local a
+    for a in "$@"; do args+=" $(printf '%q' "$a")"; done
+
+    # PATH: a non-interactive ssh shell has neither ~/.local/bin nor the codex
+    # install dir, and rc files are not sourced, so set it explicitly.
+    "${ssh_cmd[@]}" "$host" "f=\$(mktemp) && printf %s $enc | base64 -d > \$f &&
+        PATH=\"\$HOME/.local/bin:\$PATH\" bash \$f$args; r=\$?; rm -f \$f; exit \$r"
+}
+
+cmd_run() {
+    local name="$1"; shift
+    local home; home="$(home_of "$name")"
+    [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    link_shared "$home"
+    [ -f "$home/auth.json" ] || echo "cdx: '$name' is not logged in — Codex will prompt." >&2
+    exec env CODEX_HOME="$home" codex "$@"
+}
+
+command -v codex >/dev/null || die "codex is not on PATH"
+
+case "${1:-}" in
+    ""|list|ls) list_profiles ;;
+    -h|--help|help) usage ;;
+    add)    shift; cmd_add "$@" ;;
+    init)   shift; cmd_init "$@" ;;
+    use)    shift; cmd_use "$@" ;;
+    app)    shift; cmd_app "$@" ;;
+    ssh)    shift; cmd_ssh "$@" ;;
+    rm)     shift; cmd_rm "$@" ;;
+    link)   shift; cmd_link ;;
+    -*)     die "unknown option $1 (see cdx -h)" ;;
+    *)      cmd_run "$@" ;;
+esac
