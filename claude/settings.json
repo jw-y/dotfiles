@@ -2,9 +2,5 @@
   "syntaxHighlightingDisabled": false,
   "effortLevel": "medium",
   "tui": "fullscreen",
-  "theme": "dark",
-  "statusLine": {
-    "type": "command",
-    "command": "bash \"$HOME/.claude/statusline-command.sh\""
-  }
+  "theme": "dark"
 }
