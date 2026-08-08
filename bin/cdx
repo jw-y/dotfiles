@@ -36,6 +36,24 @@ SHARED_DATA=(state_5.sqlite memories_1.sqlite)
 # history follows you across accounts rather than splitting per login.
 SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions)
 
+
+# Color is interactive-only by default. NO_COLOR always wins; JSON never uses it.
+COLOR_MODE="${CDX_COLOR:-auto}"
+C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN=""
+if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
+    case "$COLOR_MODE" in
+        auto) [ -t 1 ] && COLOR_MODE=always || COLOR_MODE=never ;;
+        always|never) ;;
+        *) printf 'cdx: invalid CDX_COLOR=%s (use auto, always, or never)\n' "$COLOR_MODE" >&2; exit 1 ;;
+    esac
+fi
+if [ "$COLOR_MODE" = always ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
+    C_RESET=$'\033[0m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_CYAN=$'\033[36m'
+fi
 usage() {
     cat <<EOF
 cdx — switch between Codex accounts.
@@ -43,23 +61,27 @@ cdx — switch between Codex accounts.
 Usage:
   cdx                       list profiles ('*' marks the active one)
   cdx init [-y]             one-time: make $CODEX_LINK a switchable link
-  cdx use <name> [--restart]   make <name> the active account for every client
-                             ('--restart' kills already-running codex processes
-                             still bound to the old profile so they pick up the
-                             switch on next launch/reconnect)
+  cdx use <name> [--no-restart] [--dry-run]
+                               make <name> active; restart stale clients by default
+                               (including SSH remote proxies, so they reconnect)
+                               pass --no-restart to leave clients running
   cdx <name> [args...]      run codex as <name> once, without changing active
   cdx add <name>            create <name> and log in
   cdx app <name> [dir]      launch the desktop app as <name> (macOS)
   cdx ssh <host> [args...]  run cdx on <host> (no install needed there),
                             e.g. 'cdx ssh baram use work'
+  cdx status [--json]       verify selected account, app server, and remotes
   cdx rm <name>             delete <name> and its credentials
   cdx link                  re-link shared config into every profile
   cdx -h                    this help
 
-'cdx use' points $CODEX_LINK at a profile, so the CLI, the desktop app, and
-the app's remote bootstrap all follow — none of them need CODEX_HOME.
+'cdx use' points $CODEX_LINK at a profile, then restarts clients that cached the
+old account. SSH remote proxies are disconnected and should reconnect from the
+desktop app. Pass --no-restart only when you intentionally want existing clients
+to keep using their current account.
 'cdx <name> ...' instead overrides CODEX_HOME for that one command, which is
 how two accounts run at once in different terminals.
+Color: CDX_COLOR=auto|always|never (default: auto); NO_COLOR disables it.
 
 Profiles live in $PROFILES (override with CODEX_PROFILES).
 Symlinked from the main profile, so they are not duplicated:
@@ -71,7 +93,7 @@ Per-profile: credentials and logs. Conversations and memories are shared, so
 EOF
 }
 
-die() { echo "cdx: $*" >&2; exit 1; }
+die() { printf '%scdx: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 
 validate_name() {
     case "$1" in
@@ -94,6 +116,61 @@ resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
 active_profile() {
     migrated || { echo main; return; }
     basename "$(readlink "$CODEX_LINK")"
+}
+
+# Serialize account switches so symlink changes and process restarts cannot race.
+USE_LOCK="$PROFILES/.cdx-use.lock"
+LOCK_HELD=0
+
+release_use_lock() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    rm -f "$USE_LOCK/pid" 2>/dev/null || true
+    rmdir "$USE_LOCK" 2>/dev/null || true
+    LOCK_HELD=0
+}
+
+acquire_use_lock() {
+    local owner=""
+    mkdir -p "$PROFILES"
+    if mkdir -m 700 "$USE_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$USE_LOCK/pid"
+        LOCK_HELD=1
+        trap release_use_lock EXIT
+        return 0
+    fi
+    [ ! -L "$USE_LOCK" ] || die "unsafe switch lock is a symlink: $USE_LOCK"
+    [ -f "$USE_LOCK/pid" ] && read -r owner < "$USE_LOCK/pid" || true
+    case "$owner" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$owner" 2>/dev/null && die "another cdx use is running (PID $owner)" ;;
+    esac
+    rm -f "$USE_LOCK/pid" 2>/dev/null || true
+    rmdir "$USE_LOCK" 2>/dev/null || die "stale switch lock needs inspection: $USE_LOCK"
+    mkdir -m 700 "$USE_LOCK" || die "could not acquire switch lock: $USE_LOCK"
+    printf '%s\n' "$$" > "$USE_LOCK/pid"
+    LOCK_HELD=1
+    trap release_use_lock EXIT
+}
+
+# Codex homes contain refresh tokens and account-specific runtime state.
+secure_profile() {
+    local home="${1%/}"
+    [ -d "$home" ] || die "profile directory is missing: $home"
+    chmod 700 "$home" || die "could not set mode 0700 on $home"
+    if [ -e "$home/auth.json" ]; then
+        chmod 600 "$home/auth.json" || die "could not set mode 0600 on $home/auth.json"
+    fi
+}
+
+secure_all_profiles() {
+    local home
+    if ! migrated; then
+        secure_profile "$CODEX_LINK"
+    fi
+    for home in "$PROFILES"/*/; do
+        [ -d "$home" ] || continue
+        secure_profile "${home%/}"
+    done
 }
 
 # Symlink shared config from the main home into a profile. Codex writes
@@ -176,6 +253,151 @@ list_profiles() {
     migrated || echo "
 ($CODEX_LINK is a plain directory — run 'cdx init' to enable switching)"
 }
+# Map an app-server control/log path back to its owning profile.
+profile_from_control_path() {
+    local path="$1" rest
+    case "$path" in
+        "$PROFILES"/*/app-server-control/*)
+            rest="${path#"$PROFILES"/}"
+            echo "${rest%%/*}"
+            return 0
+            ;;
+        "$CODEX_LINK"/app-server-control/*)
+            active_profile
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Inspect open control-socket/log descriptors instead of trusting CODEX_HOME:
+# a long-running process may have inherited the moving ~/.codex symlink.
+app_server_profile() {
+    local pid="$1" fd line target profile
+    if [ -d "/proc/$pid/fd" ]; then
+        for fd in "/proc/$pid/fd"/*; do
+            target="$(readlink "$fd" 2>/dev/null)" || continue
+            if profile="$(profile_from_control_path "$target")"; then
+                echo "$profile"
+                return 0
+            fi
+        done
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            case "$line" in
+                n*)
+                    target="${line#n}"
+                    if profile="$(profile_from_control_path "$target")"; then
+                        echo "$profile"
+                        return 0
+                    fi
+                    ;;
+            esac
+        done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
+    fi
+    echo unknown
+}
+
+# Read-only check of account selection versus long-running remote machinery.
+cmd_status() {
+    local json=0
+    case "${1:-}" in
+        "") ;;
+        --json) json=1; shift ;;
+        *) die "status accepts only --json" ;;
+    esac
+    [ $# -eq 0 ] || die "status accepts only --json"
+    local active home account session_store state_store status_word status_message status_color
+    local server_pids proxy_pids pid profile server_rows=""
+    local server_count=0 proxy_count=0 mismatch=0
+    active="$(active_profile)"
+    home="$(home_of "$active")"
+    account="$(describe "$home")"
+    session_store="$(resolve_dir "$home/sessions" || true)"
+    [ -n "$session_store" ] || session_store="missing"
+    if [ -L "$home/state_5.sqlite" ]; then
+        state_store="shared -> $(readlink "$home/state_5.sqlite")"
+    elif [ -e "$home/state_5.sqlite" ]; then
+        state_store="$home/state_5.sqlite"
+    else
+        state_store="missing"
+    fi
+
+    server_pids="$(pgrep -u "$(id -un)" -f '[cC]odex.*app-server.*--listen[ =]unix://' 2>/dev/null || true)"
+    proxy_pids="$(pgrep -u "$(id -un)" -f '(^|/)codex app-server proxy( |$)' 2>/dev/null || true)"
+    for pid in $proxy_pids; do proxy_count=$((proxy_count + 1)); done
+
+    if [ "$json" = 0 ]; then
+        printf '%-20s %s%s%s\n' "Active profile:" "$C_CYAN" "$active" "$C_RESET"
+        printf '%-20s %s\n' "Selected account:" "$account"
+        printf '%-20s %s\n' "Conversation store:" "$session_store"
+        printf '%-20s %s\n' "State index:" "$state_store"
+    fi
+
+    if [ -z "$server_pids" ]; then
+        [ "$json" = 1 ] || printf '%-20s %s\n' "App server:" "not running"
+        [ "$proxy_count" -eq 0 ] || mismatch=1
+    else
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            server_count=$((server_count + 1))
+            profile="$(app_server_profile "$pid")"
+            server_rows+="$pid"$'\t'"$profile"$'\n'
+            if [ "$profile" = "$active" ]; then
+                [ "$json" = 1 ] || printf '%-20s PID %s, profile %s %s(matches)%s\n' "App server:" "$pid" "$profile" "$C_GREEN" "$C_RESET"
+            else
+                [ "$json" = 1 ] || printf '%-20s PID %s, profile %s %s(MISMATCH)%s\n' "App server:" "$pid" "$profile" "$C_RED" "$C_RESET"
+                mismatch=1
+            fi
+        done <<< "$server_pids"
+    fi
+    if [ "$json" = 0 ]; then
+        printf '%-20s %s\n' "SSH remote proxies:" "$proxy_count"
+        printf '%-20s %s\n' "Desktop account:" "not observable from this host"
+    fi
+
+    if [ "$mismatch" = 1 ]; then
+        status_word="mismatch"; status_color="$C_RED"
+        status_message="MISMATCH — run 'cdx use $active' to refresh Codex and remote clients."
+    elif [ "$server_count" -eq 0 ]; then
+        status_word="idle"; status_color="$C_YELLOW"
+        status_message="IDLE — the next Codex client should start with $active."
+    else
+        status_word="ok"; status_color="$C_GREEN"
+        status_message="OK — host-side Codex execution is using $active."
+    fi
+
+    if [ "$json" = 1 ]; then
+        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" <<'PY'
+import json, sys
+active, account, sessions, state, rows, proxies, status = sys.argv[1:]
+servers = []
+for row in rows.splitlines():
+    pid, profile = row.split("\t", 1)
+    servers.append({
+        "pid": int(pid),
+        "profile": profile,
+        "matches_active_profile": profile == active,
+    })
+print(json.dumps({
+    "active_profile": active,
+    "selected_account": account,
+    "conversation_store": sessions,
+    "state_index": state,
+    "app_servers": servers,
+    "ssh_remote_proxies": int(proxies),
+    "desktop_account_observable": False,
+    "status": status,
+    "recommended_command": f"cdx use {active}" if status == "mismatch" else None,
+}, indent=2))
+PY
+    else
+        printf 'Status: %s%s%s\n' "$status_color" "$status_message" "$C_RESET"
+    fi
+    [ "$mismatch" = 0 ] || return 1
+}
+
 
 # One-time: turn the real ~/.codex into profiles/main and leave a symlink in
 # its place. A rename on the same filesystem, so even 1.7G moves instantly.
@@ -203,24 +425,33 @@ cmd_init() {
 
     mkdir -p "$PROFILES"
     mv "$CODEX_LINK" "$PROFILES/main"
+    secure_profile "$PROFILES/main"
     ln -s "$PROFILES/main" "$CODEX_LINK"
     echo "set up: $CODEX_LINK -> $PROFILES/main"
 }
 
-# Kill only the running codex processes whose open files still point inside
-# $old — i.e. ones that resolved $CODEX_LINK before this switch and are still
-# holding it. Anything bound to a different profile (or not codex at all) is
-# left alone. CODEX_HOME isn't visible in argv/environ once a process is
-# running, so open fds pointing into the old profile dir are the only signal.
+# Kill running Codex processes whose open files still point inside $old. Also
+# stop every app-server proxy: those SSH remote clients hold anonymous socket
+# fds rather than paths below $old, but their initialized connection can retain
+# the old account until the controlling desktop reconnects.
 restart_bound_to() {
-    local old="${1%/}" pid fd line tgt matched killed=()
+    local old="${1%/}" dry_run="${2:-0}" pid fd line tgt cmd matched remote_proxy attempt
+    local killed=() survivors=() remote_proxies=0
     [ -n "$old" ] || return 0
     if [ ! -d /proc/self/fd ] && ! command -v lsof >/dev/null 2>&1; then
         echo "cdx: cannot find processes bound to the old profile (need /proc or lsof)" >&2
         return 1
     fi
     for pid in $(pgrep -u "$(id -un)" -f '[cC]odex' 2>/dev/null); do
-        matched=0
+        matched=0 remote_proxy=0 cmd=""
+        if [ -r "/proc/$pid/cmdline" ]; then
+            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        else
+            cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        fi
+        case "$cmd" in
+            *"codex app-server proxy"*) matched=1; remote_proxy=1 ;;
+        esac
         if [ -d "/proc/$pid/fd" ]; then
             for fd in "/proc/$pid/fd"/*; do
                 tgt="$(readlink "$fd" 2>/dev/null)" || continue
@@ -240,25 +471,54 @@ restart_bound_to() {
                 esac
             done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
         fi
-        [ "$matched" = 1 ] && killed+=("$pid")
+        if [ "$matched" = 1 ]; then
+            killed+=("$pid")
+            [ "$remote_proxy" = 1 ] && remote_proxies=$((remote_proxies + 1))
+        fi
     done
     if [ ${#killed[@]} -eq 0 ]; then
         echo "  No running processes were bound to the old profile."
         return
     fi
-    echo "  Stopping ${#killed[@]} process(es) bound to the old profile: ${killed[*]}"
+    if [ "$dry_run" = 1 ]; then
+        printf '%s  Would stop %s process(es): %s%s\n' "$C_YELLOW" "${#killed[@]}" "${killed[*]}" "$C_RESET"
+        if [ "$remote_proxies" -gt 0 ]; then
+            printf '%s  Would disconnect %s SSH remote proxy/proxies.%s\n' "$C_YELLOW" "$remote_proxies" "$C_RESET"
+        fi
+        return 0
+    fi
+    printf '%s  Stopping %s process(es) bound to the old profile: %s%s\n' "$C_YELLOW" "${#killed[@]}" "${killed[*]}" "$C_RESET"
+    if [ "$remote_proxies" -gt 0 ]; then
+        printf '%s  Disconnecting %s SSH remote proxy/proxies; desktop clients should reconnect.%s\n' "$C_YELLOW" "$remote_proxies" "$C_RESET"
+    fi
     kill "${killed[@]}" 2>/dev/null || true
+    for attempt in {1..50}; do
+        survivors=()
+        for pid in "${killed[@]}"; do
+            kill -0 "$pid" 2>/dev/null && survivors+=("$pid")
+        done
+        [ ${#survivors[@]} -eq 0 ] && break
+        sleep 0.1
+    done
+    if [ ${#survivors[@]} -gt 0 ]; then
+        printf '%scdx: %s process(es) did not exit after 5 seconds: %s%s\n' "$C_RED" "${#survivors[@]}" "${survivors[*]}" "$C_RESET" >&2
+        printf '%s     They were not force-killed; inspect them and rerun cdx status.%s\n' "$C_YELLOW" "$C_RESET" >&2
+        return 1
+    fi
+    printf '%s  All targeted processes exited.%s\n' "$C_GREEN" "$C_RESET"
 }
 
 # Activate an account for every client on this machine at once.
 cmd_use() {
-    local name="${1:-}" restart=0
+    local name="${1:-}" restart=1 dry_run=0
     [ -n "$name" ] || die "use needs a name (try 'cdx' to list)"
     validate_name "$name"
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
             --restart) restart=1 ;;
+            --no-restart) restart=0 ;;
+            --dry-run) dry_run=1 ;;
             *) die "unknown option to 'use': $1" ;;
         esac
         shift
@@ -266,22 +526,35 @@ cmd_use() {
     migrated || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
-    # Resolve the OLD target before repointing, so a --restart can find
-    # processes still holding it open.
+    # Resolve the old target before repointing. Restart it even when the name is
+    # already active: that is how a caller repairs stale cached connections.
     local old_target=""
+    if [ "$dry_run" = 0 ]; then
+        acquire_use_lock
+    fi
     old_target="$(resolve_dir "$CODEX_LINK" || true)"
+    if [ "$dry_run" = 1 ]; then
+        printf '%sDry run:%s would activate %s%s%s (%s -> %s)\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
+        if [ "$restart" = 1 ] && [ -n "$old_target" ]; then
+            restart_bound_to "$old_target" 1
+        else
+            echo "  Existing Codex and remote connections would be left running."
+        fi
+        return 0
+    fi
+    secure_all_profiles
     link_shared "$home"
     # -n is essential: without it ln (like mv) follows the existing symlink and
     # drops the new link *inside* the profile directory, silently doing nothing.
     ln -sfn "$home" "$CODEX_LINK"
-    echo "→ $name is now active ($CODEX_LINK -> $home)"
+    printf '%s→%s %s%s%s is now active (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
     if [ "$restart" = 1 ]; then
-        if [ -n "$old_target" ] && [ "$old_target" != "$(resolve_dir "$home")" ]; then
+        if [ -n "$old_target" ]; then
             restart_bound_to "$old_target"
         fi
     else
-        echo "  Already-running Codex processes keep their old account until restarted."
-        echo "  Run 'cdx use $name --restart' to restart the ones still on it."
+        echo "  Existing Codex and remote connections were left running by request."
+        echo "  They may keep the old account until restarted or reconnected."
     fi
 }
 
@@ -293,10 +566,11 @@ cmd_add() {
     local home; home="$(home_of "$name")"
     [ -d "$home" ] && die "$name already exists ($home)"
     mkdir -p "$home"
-    chmod 700 "$home"
+    secure_profile "$home"
     link_shared "$home"
     echo "→ logging in to '$name' (a browser window will open)"
     CODEX_HOME="$home" codex login
+    secure_profile "$home"
 }
 
 cmd_rm() {
@@ -318,6 +592,7 @@ cmd_rm() {
 
 cmd_link() {
     local home
+    secure_all_profiles
     for home in "$PROFILES"/*/; do
         [ -d "$home" ] || continue
         link_shared "$home"
@@ -344,6 +619,7 @@ cmd_app() {
     fi
     [ -n "$app" ] || die "desktop app not found — set CHATGPT_APP=/path/to/ChatGPT.app"
 
+    secure_profile "$home"
     link_shared "$home"
     echo "→ $app  (CODEX_HOME=$home)"
     if [ "$name" = main ]; then
@@ -392,6 +668,7 @@ cmd_run() {
     validate_name "$name"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    secure_profile "$home"
     link_shared "$home"
     [ -f "$home/auth.json" ] || echo "cdx: '$name' is not logged in — Codex will prompt." >&2
     exec env CODEX_HOME="$home" codex "$@"
@@ -406,6 +683,7 @@ case "${1:-}" in
     init)   shift; cmd_init "$@" ;;
     use)    shift; cmd_use "$@" ;;
     app)    shift; cmd_app "$@" ;;
+    status) shift; cmd_status "$@" ;;
     ssh)    shift; cmd_ssh "$@" ;;
     rm)     shift; cmd_rm "$@" ;;
     link)   shift; cmd_link ;;
