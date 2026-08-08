@@ -43,7 +43,10 @@ cdx — switch between Codex accounts.
 Usage:
   cdx                       list profiles ('*' marks the active one)
   cdx init [-y]             one-time: make $CODEX_LINK a switchable link
-  cdx use <name>            make <name> the active account for every client
+  cdx use <name> [--restart]   make <name> the active account for every client
+                             ('--restart' kills already-running codex processes
+                             still bound to the old profile so they pick up the
+                             switch on next launch/reconnect)
   cdx <name> [args...]      run codex as <name> once, without changing active
   cdx add <name>            create <name> and log in
   cdx app <name> [dir]      launch the desktop app as <name> (macOS)
@@ -70,10 +73,22 @@ EOF
 
 die() { echo "cdx: $*" >&2; exit 1; }
 
+validate_name() {
+    case "$1" in
+        ""|.|..|*[!A-Za-z0-9._-]*)
+            die "invalid profile name '$1' (use letters, numbers, '.', '_' or '-')"
+            ;;
+    esac
+}
+
 home_of() {
     if [ "$1" = "main" ] && ! migrated; then echo "$CODEX_LINK"; return; fi
     echo "$PROFILES/$1"
 }
+
+# Portable equivalent of `readlink -f` for an existing directory. macOS's
+# readlink has no -f, while pwd -P resolves every symlink in the path.
+resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
 
 # Name of the profile ~/.codex currently points at.
 active_profile() {
@@ -192,24 +207,88 @@ cmd_init() {
     echo "set up: $CODEX_LINK -> $PROFILES/main"
 }
 
+# Kill only the running codex processes whose open files still point inside
+# $old — i.e. ones that resolved $CODEX_LINK before this switch and are still
+# holding it. Anything bound to a different profile (or not codex at all) is
+# left alone. CODEX_HOME isn't visible in argv/environ once a process is
+# running, so open fds pointing into the old profile dir are the only signal.
+restart_bound_to() {
+    local old="${1%/}" pid fd line tgt matched killed=()
+    [ -n "$old" ] || return 0
+    if [ ! -d /proc/self/fd ] && ! command -v lsof >/dev/null 2>&1; then
+        echo "cdx: cannot find processes bound to the old profile (need /proc or lsof)" >&2
+        return 1
+    fi
+    for pid in $(pgrep -u "$(id -un)" -f '[cC]odex' 2>/dev/null); do
+        matched=0
+        if [ -d "/proc/$pid/fd" ]; then
+            for fd in "/proc/$pid/fd"/*; do
+                tgt="$(readlink "$fd" 2>/dev/null)" || continue
+                case "$tgt" in
+                    "$old"/*) matched=1; break ;;
+                esac
+            done
+        else
+            # macOS has no /proc; lsof's -Fn format gives one n-prefixed path
+            # per open file without fragile, column-oriented parsing.
+            while IFS= read -r line; do
+                case "$line" in
+                    n*)
+                        tgt="${line#n}"
+                        case "$tgt" in "$old"/*) matched=1; break ;; esac
+                        ;;
+                esac
+            done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
+        fi
+        [ "$matched" = 1 ] && killed+=("$pid")
+    done
+    if [ ${#killed[@]} -eq 0 ]; then
+        echo "  No running processes were bound to the old profile."
+        return
+    fi
+    echo "  Stopping ${#killed[@]} process(es) bound to the old profile: ${killed[*]}"
+    kill "${killed[@]}" 2>/dev/null || true
+}
+
 # Activate an account for every client on this machine at once.
 cmd_use() {
-    local name="${1:-}"
+    local name="${1:-}" restart=0
     [ -n "$name" ] || die "use needs a name (try 'cdx' to list)"
+    validate_name "$name"
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --restart) restart=1 ;;
+            *) die "unknown option to 'use': $1" ;;
+        esac
+        shift
+    done
     migrated || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    # Resolve the OLD target before repointing, so a --restart can find
+    # processes still holding it open.
+    local old_target=""
+    old_target="$(resolve_dir "$CODEX_LINK" || true)"
     link_shared "$home"
     # -n is essential: without it ln (like mv) follows the existing symlink and
     # drops the new link *inside* the profile directory, silently doing nothing.
     ln -sfn "$home" "$CODEX_LINK"
     echo "→ $name is now active ($CODEX_LINK -> $home)"
-    echo "  Already-running Codex processes keep their old account until restarted."
+    if [ "$restart" = 1 ]; then
+        if [ -n "$old_target" ] && [ "$old_target" != "$(resolve_dir "$home")" ]; then
+            restart_bound_to "$old_target"
+        fi
+    else
+        echo "  Already-running Codex processes keep their old account until restarted."
+        echo "  Run 'cdx use $name --restart' to restart the ones still on it."
+    fi
 }
 
 cmd_add() {
     local name="${1:-}"
     [ -n "$name" ] || die "add needs a name"
+    validate_name "$name"
     [ "$name" != main ] || die "'main' is reserved for $CODEX_LINK"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] && die "$name already exists ($home)"
@@ -223,9 +302,13 @@ cmd_add() {
 cmd_rm() {
     local name="${1:-}"
     [ -n "$name" ] || die "rm needs a name"
+    validate_name "$name"
     [ "$name" != main ] || die "refusing to delete $CODEX_LINK"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name"
+    if migrated && [ "$(resolve_dir "$CODEX_LINK")" = "$(resolve_dir "$home")" ]; then
+        die "refusing to delete the active profile '$name' (switch profiles first)"
+    fi
     printf 'delete %s and its credentials? [y/N] ' "$home"
     read -r reply
     [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; exit 0; }
@@ -248,6 +331,7 @@ cmd_link() {
 # ChatGPT login itself lives in the Electron session, hence --user-data-dir.
 cmd_app() {
     local name="${1:-main}" workspace="${2:-$PWD}"
+    validate_name "$name"
     [ "$(uname)" = Darwin ] || die "app launching is macOS-only"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name"
@@ -305,6 +389,7 @@ cmd_ssh() {
 
 cmd_run() {
     local name="$1"; shift
+    validate_name "$name"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
     link_shared "$home"
