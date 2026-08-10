@@ -7,7 +7,7 @@ Personal terminal and development configuration for macOS and Linux.
 - **Shell:** Zsh, Oh My Zsh, a custom theme, autosuggestions, and syntax highlighting
 - **Terminal:** Ghostty, tmux, TPM, and Catppuccin
 - **Editor:** Neovim with LSP, Treesitter, Telescope, Mason, and completion
-- **CLI tools:** `gmon`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
+- **CLI tools:** `gmon`, `cdx`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
 - **Development:** Git, Python debugger/linter settings, and VS Code keybindings
 
 ## Quick start
@@ -40,13 +40,30 @@ make dry-run
 
 Run `make help` for all targets and environment-variable overrides.
 
+## Switching Codex accounts (`cdx`)
+
+Every Codex client — CLI, desktop app, VS Code, and the app's SSH remote — reads `~/.codex`. `cdx` makes that path a symlink, so activating an account is just re-pointing it and no client needs configuring.
+
+```bash
+cdx                    # list accounts; '*' marks the active one
+cdx init               # one-time: make ~/.codex switchable
+cdx add work           # create an account and log in (device auth over SSH)
+cdx use work           # activate it, restarting clients that cached the old account
+cdx work resume        # run one command as 'work' without switching
+cdx ssh baram use work # drive another machine's accounts over SSH
+```
+
+Accounts live in `~/.codex-profiles/<name>`, holding only credentials and logs. Everything shareable — config, conversation history, memories, and the ~1.7 GB of binary and plugin caches — lives once in `~/.codex-profiles/.store`, which is not an account and is symlinked into each one. That keeps each account a few hundred KB, lets `resume` see your work whichever account is active, and means any account can be renamed or deleted without disturbing the rest. `cdx link` rebuilds those symlinks if Codex ever overwrites one.
+
+Run `cdx -h` for the full command list, and `make test` for the regression suite.
+
 ## Prerequisites
 
 The installer checks for `zsh`, `git`, `curl`, and `rsync`. On Linux, it installs missing prerequisites through `apt-get` when passwordless sudo is available; otherwise it prints the commands that still need to be installed. A minimal installation also expects tmux to be available. The full installer installs tmux through Homebrew or `apt-get` where supported.
 
 ## Safety and update behavior
 
-- Neovim, Ghostty, and `gmon` are symlinked into the home directory.
+- Neovim, Ghostty, `gmon`, and `cdx` are symlinked into the home directory.
 - An existing file, directory, or incorrect symlink is moved to a timestamped `*.dotfiles-backup-YYYYMMDD-HHMMSS` path before replacement.
 - Copied shell, theme, and Claude files use the same timestamped backup suffix when their contents change.
 - Dry-run mode performs no filesystem writes.
@@ -65,7 +82,8 @@ dotfiles/
 ├── ghostty/             # Ghostty configuration
 ├── claude/              # Claude settings and status line
 ├── git/                 # Shareable Git configuration
-├── bin/                 # Personal command-line tools
+├── bin/                 # Personal command-line tools (gmon, cdx)
+├── tests/               # Test suite for bin/ tools (make test)
 ├── vscode/              # VS Code keybindings
 ├── archive/             # Older configurations kept for reference
 └── fonts/               # Font assets
