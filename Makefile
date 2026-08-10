@@ -1,4 +1,4 @@
-.PHONY: install minimal update upgrade-nvim gitconfig dry-run help
+.PHONY: install minimal update upgrade-nvim gitconfig dry-run test help
 
 help:
 	@echo "Targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  make upgrade-nvim   Force re-download latest nvim (Linux only)"
 	@echo "  make gitconfig      Add include.path to ~/.gitconfig (opt-in)"
 	@echo "  make dry-run        Preview install + update without changing anything"
+	@echo "  make test           Run script tests (sandboxed, touches nothing real)"
 	@echo ""
 	@echo "Env vars:"
 	@echo "  DRY_RUN=true        Preview mode for any target"
@@ -29,6 +30,9 @@ upgrade-nvim:
 
 gitconfig:
 	@WITH_GITCONFIG=true ./install.sh
+
+test:
+	@bash tests/cdx.test.sh
 
 dry-run:
 	@echo "=== DRY RUN ==="
