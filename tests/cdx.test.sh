@@ -244,6 +244,15 @@ it "suggests a near-miss name";          assert_contains "$(cdx "$D" rm wrok -y)
 it "deletes with -y";                    assert_contains "$(cdx "$D" rm work -y)" "removed work"
 it "shared history outlives a profile";  assert_eq "$(cat "$D/profiles/school/sessions/s1.jsonl")" "transcript"
 
+# Pre-init, 'main' resolves to ~/.codex itself, and nothing has been hoisted
+# into the store yet — so deleting it destroys every profile's data at once.
+# The guard used to be skipped entirely on an uninitialised install.
+# Its own sandbox variable: the sections below still expect $D to be the
+# set-up install built above.
+PRE="$(new_env rm-preinit)"
+it "refuses to delete pre-init main";    assert_contains "$(cdx "$PRE" rm main -y)" "before 'cdx init' it is $PRE/codex itself"
+it "pre-init ~/.codex survives";         assert_eq "$(cat "$PRE/codex/sessions/s1.jsonl")" "transcript"
+
 # ------------------------------------------------------ reserved names -----
 echo "${DIM}reserved names${OFF}"
 it "rm cannot name the store";           assert_contains "$(cdx "$D" rm .store -y)" "reserved for cdx"
@@ -274,6 +283,23 @@ mkdir -p "$D/profiles/blank"
 it "use warns when not logged in";       assert_contains "$(cdx "$D" use blank --no-restart)" "not logged in yet"
 it "use suggests a near-miss name";      assert_contains "$(cdx "$D" use wrok)" "did you mean 'work'"
 it "unknown profile is an error";        assert_fails env HOME="$D" PATH="$D/bin:/usr/bin:/bin" CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" bash "$CDX" use nope
+
+# ---------------------------------------------------------- dependencies -----
+# Both are checked before dispatch, so the failure names the missing program
+# instead of surfacing as a listing that dies inside a heredoc.
+echo "${DIM}dependencies${OFF}"
+# bash by absolute path: these sandboxes exist to omit programs, and env
+# resolves the interpreter itself through the same stripped PATH.
+dep_env() {
+    env -i HOME="$D" PATH="$ROOT/$1" NO_COLOR=1 TERM=dumb \
+        CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" \
+        "$(command -v bash)" "$CDX" list 2>&1
+}
+mkdir -p "$ROOT/nopy" "$ROOT/nocodex"
+cp "$D/bin/codex" "$ROOT/nopy/codex"
+ln -sf "$(command -v python3)" "$ROOT/nocodex/python3"
+it "names a missing python3";            assert_contains "$(dep_env nopy)" "python3 is not on PATH"
+it "names a missing codex";              assert_contains "$(dep_env nocodex)" "codex is not on PATH"
 
 # ---------------------------------------------------- process matching -----
 # 'rename' is the surviving user of the if-stale proxy policy, so it is what

@@ -55,7 +55,7 @@ cdx ssh baram use work # drive another machine's accounts over SSH
 
 Accounts live in `~/.codex-profiles/<name>`, holding only credentials and logs. Everything shareable — config, conversation history, memories, and the ~1.7 GB of binary and plugin caches — lives once in `~/.codex-profiles/.store`, which is not an account and is symlinked into each one. That keeps each account a few hundred KB, lets `resume` see your work whichever account is active, and means any account can be renamed or deleted without disturbing the rest. `cdx link` rebuilds those symlinks if Codex ever overwrites one.
 
-Run `cdx -h` for the full command list, and `make test` for the regression suite.
+Run `cdx -h` for the full command list, and `make test` for the regression suite. `cdx` needs `codex` and `python3` on `PATH` and refuses to run without either.
 
 ## Prerequisites
 

@@ -877,8 +877,17 @@ cmd_rm() {
     validate_name "$name"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || missing_profile "$name"
-    if initialized && [ "$(resolve_dir "$CODEX_LINK")" = "$(resolve_dir "$home")" ]; then
-        die "refusing to delete the active profile '$name' (switch profiles first)"
+    # The guard must not be conditional on 'initialized'. Before 'cdx init',
+    # home_of maps 'main' to $CODEX_LINK itself — the one real copy of every
+    # profile's config, conversations and caches, none of it yet hoisted into
+    # the store. Skipping the check there turned 'cdx rm main' into an
+    # rm -rf ~/.codex behind a single y/N.
+    if [ "$(resolve_dir "$CODEX_LINK" || true)" = "$(resolve_dir "$home")" ]; then
+        if initialized; then
+            die "refusing to delete the active profile '$name' (switch profiles first)"
+        fi
+        die "refusing to delete '$name' — before 'cdx init' it is $CODEX_LINK itself,
+     which holds the only copy of your config, conversations and caches"
     fi
     if [ "$assume_yes" = 0 ]; then
         # Same reasoning as 'init': with no terminal nobody can answer, and
@@ -989,6 +998,11 @@ cmd_run() {
 }
 
 command -v codex >/dev/null || die "codex is not on PATH"
+# Checked up front rather than at each use: python3 decodes the id_token JWT
+# for the account column, ranks the typo suggestion, and emits 'status --json'.
+# Failing here names the missing dependency once, instead of letting the plain
+# 'cdx' listing die inside a heredoc. Any host with codex installed has it.
+command -v python3 >/dev/null || die "python3 is not on PATH"
 
 case "${1:-}" in
     ""|list|ls) list_profiles ;;
