@@ -103,6 +103,7 @@ new_env() {
     echo 'model="gpt-5"'  > "$d/codex/config.toml"
     echo 'agents-content' > "$d/codex/AGENTS.md"
     echo 'state-db'       > "$d/codex/state_5.sqlite"
+    echo 'memories-db'    > "$d/codex/memories_1.sqlite"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
     echo "$d"
@@ -248,6 +249,19 @@ mv "$D/profiles/personal/state_5.sqlite.tmp" "$D/profiles/personal/state_5.sqlit
 out="$(cdx "$D" link)"
 it "refuses to clobber private history"; assert_contains "$out" "is this profile's own"
 it "private history survives link";      assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
+
+# memories_1.sqlite is the exception among the sqlite files: Codex rewrites it
+# atomically, so a real file here is the app-server having clobbered the link,
+# not private data. Guarding it the way state_5.sqlite is guarded left the
+# profile permanently unlinked, since the next app-server recreated the file.
+echo 'clobbered-by-codex' > "$D/profiles/personal/memories_1.sqlite.tmp"
+rm -f "$D/profiles/personal/memories_1.sqlite"
+mv "$D/profiles/personal/memories_1.sqlite.tmp" "$D/profiles/personal/memories_1.sqlite"
+out="$(cdx "$D" link)"
+it "relinks a clobbered memories db";    assert_link "$D/profiles/personal/memories_1.sqlite" "$S/memories_1.sqlite"
+it "and says nothing about it";          assert_eq "$(printf %s "$out" | grep -c 'memories_1')" "0"
+it "the shared memories db is intact";   assert_eq "$([ -f "$S/memories_1.sqlite" ] && [ ! -L "$S/memories_1.sqlite" ] && echo real)" "real"
+it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
 
 # -------------------------------------------------------------- rename -----
 echo "${DIM}rename${OFF}"

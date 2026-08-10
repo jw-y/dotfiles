@@ -40,8 +40,16 @@ shared_src() {
 
 # Config, shared so settings live in one place, not N copies. Safe to replace
 # with a link if a profile has its own: nothing here is unrecoverable.
+#
+# memories_1.sqlite sits here rather than with the history below because Codex
+# rewrites it the same way it rewrites config.toml — atomically, temp file
+# renamed over the target, which destroys the symlink. Treating it as history
+# meant link_shared saw a real file, assumed private conversations, and
+# refused; the app-server then recreated it after every relink, so the profile
+# could never rejoin the store. It holds a job queue (stage1_outputs, jobs)
+# that Codex rebuilds, not anything a user typed.
 SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
-        custom-instructions.md models_cache.json)
+        custom-instructions.md models_cache.json memories_1.sqlite)
 
 # Same idea, but these hold irreplaceable history, so a real file is never
 # overwritten to make room for the link. state_5.sqlite is the index 'resume'
@@ -54,7 +62,7 @@ SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
 # files. state_5.sqlite carries auto-generated titles but leaves its 'name'
 # column empty, so leaving these per-profile split your own thread names by
 # whichever account happened to be active when you set them.
-SHARED_DATA=(state_5.sqlite memories_1.sqlite session_index.jsonl history.jsonl)
+SHARED_DATA=(state_5.sqlite session_index.jsonl history.jsonl)
 
 # Version-keyed download caches, identical for every account: the Codex binary
 # (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
