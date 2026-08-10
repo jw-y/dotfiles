@@ -988,7 +988,16 @@ cmd_run() {
     exec env CODEX_HOME="$home" codex "$@"
 }
 
-command -v codex >/dev/null || die "codex is not on PATH"
+# 'link' is exempt because it is the repair command, and the breakage it
+# repairs takes codex off PATH. The launcher at ~/.local/bin/codex is a symlink
+# through the shared packages/ dir, so the moment that dir moves — a hand-run
+# migration, a renamed store — resolving it fails. Demanding codex here would
+# put the only fix on the far side of the thing that needs fixing. Nothing in
+# cmd_link runs codex; it only rewrites symlinks.
+case "${1:-}" in
+    link) ;;
+    *) command -v codex >/dev/null || die "codex is not on PATH" ;;
+esac
 
 case "${1:-}" in
     ""|list|ls) list_profiles ;;
