@@ -8,18 +8,39 @@ PROFILES="${CODEX_PROFILES:-$HOME/.codex-profiles}"
 # Every Codex client — CLI, desktop app, VS Code, the app's remote bootstrap —
 # reads ~/.codex. Once that path is a symlink to a profile, "activating" an
 # account is just re-pointing it, and no client needs to know about CODEX_HOME.
-# Before migration it is still a real directory, which is the 'main' profile.
-CODEX_LINK="${CODEX_MAIN_HOME:-$HOME/.codex}"
+# Before 'cdx init' it is still a real directory, which is the 'main' profile.
+CODEX_LINK="${CDX_CODEX_LINK:-${CODEX_MAIN_HOME:-$HOME/.codex}}"
 
-migrated() { [ -L "$CODEX_LINK" ]; }
+# True once 'cdx init' has replaced ~/.codex with a switchable symlink.
+initialized() { [ -L "$CODEX_LINK" ]; }
 
-# Where the shared files actually live. After migration ~/.codex is a moving
-# pointer, so the shared originals must sit in a profile that never moves.
-shared_src() { migrated && echo "$PROFILES/main" || echo "$CODEX_LINK"; }
+# The store holds the one real copy of everything profiles share. It is NOT a
+# profile: it has no credentials, never becomes active, and the leading dot
+# keeps it out of the "$PROFILES"/*/ glob that enumerates profiles.
+#
+# Giving it its own directory is the whole point of the layout. When the store
+# lived inside whichever profile happened to be first ('main'), that profile
+# was secretly load-bearing: it could not be deleted, renaming it had to
+# rewrite every other profile's links, and an out-of-band marker file had to
+# record where it went. Here every profile is equal and disposable, and every
+# link points at a path that never moves — which is what lets 'cdx link'
+# reconstruct any profile's links from scratch at any time.
+STORE="$PROFILES/.store"
+
+stored() { [ -d "$STORE" ]; }
+
+# Where the shared originals actually live. Before 'cdx init' there is only
+# ~/.codex; an install predating the store still keeps them in 'main'.
+shared_src() {
+    if stored; then echo "$STORE"
+    elif initialized; then echo "$PROFILES/main"
+    else echo "$CODEX_LINK"
+    fi
+}
 
 # Config, shared so settings live in one place, not N copies. Safe to replace
 # with a link if a profile has its own: nothing here is unrecoverable.
-SHARED=(config.toml AGENTS.md AGENTS.override.md instructions.md
+SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
         custom-instructions.md models_cache.json)
 
 # Same idea, but these hold irreplaceable history, so a real file is never
@@ -27,14 +48,24 @@ SHARED=(config.toml AGENTS.md AGENTS.override.md instructions.md
 # reads; without it, shared sessions/ transcripts exist but stay invisible.
 # Their -wal/-shm siblings need no linking: sqlite creates those next to the
 # resolved path, which is the shared original.
-SHARED_DATA=(state_5.sqlite memories_1.sqlite)
+#
+# session_index.jsonl and history.jsonl belong here for a subtler reason: the
+# names you give threads and the prompts you have typed live *only* in these
+# files. state_5.sqlite carries auto-generated titles but leaves its 'name'
+# column empty, so leaving these per-profile split your own thread names by
+# whichever account happened to be active when you set them.
+SHARED_DATA=(state_5.sqlite memories_1.sqlite session_index.jsonl history.jsonl)
 
 # Version-keyed download caches, identical for every account: the Codex binary
 # (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
 # what keeps a profile a few hundred KB instead of ~660M. skills/ is shared so
 # what you install is available under every account; sessions/ so conversation
 # history follows you across accounts rather than splitting per login.
-SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions)
+# attachments/, generated_images/ and visualizations/ are keyed by thread id,
+# exactly like the transcripts in sessions/. Keeping them per-profile meant a
+# thread resumed under a different account could not find its own files.
+SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions
+             attachments generated_images visualizations)
 
 
 # Color is interactive-only by default. NO_COLOR always wins; JSON never uses it.
@@ -66,30 +97,29 @@ Usage:
                                (including SSH remote proxies, so they reconnect)
                                pass --no-restart to leave clients running
   cdx <name> [args...]      run codex as <name> once, without changing active
-  cdx add <name>            create <name> and log in
-  cdx app <name> [dir]      launch the desktop app as <name> (macOS)
+  cdx add <name> [args...]  create <name> and log in (extra args pass through
+                            to 'codex login'; over SSH or without a display the
+                            device-auth flow is used; rerun to retry a login)
+  cdx app <name> [dir] [--stock]
+                            launch the desktop app as <name> (macOS); --stock
+                            reuses the app's existing ChatGPT desktop login
   cdx ssh <host> [args...]  run cdx on <host> (no install needed there),
                             e.g. 'cdx ssh baram use work'
   cdx status [--json]       verify selected account, app server, and remotes
-  cdx rm <name>             delete <name> and its credentials
-  cdx link                  re-link shared config into every profile
+  cdx rename <old> <new>    rename a profile — any of them, 'main' included
+  cdx rm <name> [-y]        delete <name> and its credentials
+  cdx link                  rebuild every profile's links to the store (repair)
   cdx -h                    this help
 
-'cdx use' points $CODEX_LINK at a profile, then restarts clients that cached the
-old account. SSH remote proxies are disconnected and should reconnect from the
-desktop app. Pass --no-restart only when you intentionally want existing clients
-to keep using their current account.
-'cdx <name> ...' instead overrides CODEX_HOME for that one command, which is
-how two accounts run at once in different terminals.
-Color: CDX_COLOR=auto|always|never (default: auto); NO_COLOR disables it.
+Layout: each account is $PROFILES/<name> and holds only its credentials and
+logs. Everything else — config, conversations, memories, attachments, caches —
+lives once in $STORE and is symlinked in, so accounts stay small, 'resume'
+finds your work whichever one is active, and any of them can be renamed or
+deleted. 'cdx link' rebuilds those symlinks if Codex overwrites one.
 
-Profiles live in $PROFILES (override with CODEX_PROFILES).
-Symlinked from the main profile, so they are not duplicated:
-  ${SHARED[*]}
-  ${SHARED_DATA[*]}
-  ${SHARED_DIRS[*]}
-Per-profile: credentials and logs. Conversations and memories are shared, so
-'resume' shows your work whichever account is active.
+Env: CODEX_PROFILES, CDX_CODEX_LINK override the paths above.
+     CDX_COLOR=auto|always|never (NO_COLOR also disables color).
+     CDX_NO_KILL=1 reports which processes would be stopped, but signals none.
 EOF
 }
 
@@ -97,14 +127,20 @@ die() { printf '%scdx: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 
 validate_name() {
     case "$1" in
-        ""|.|..|*[!A-Za-z0-9._-]*)
+        ""|*[!A-Za-z0-9._-]*)
             die "invalid profile name '$1' (use letters, numbers, '.', '_' or '-')"
+            ;;
+        # A leading dot is how cdx marks its own directories ($STORE, the switch
+        # lock). Without this, 'cdx rm .store' would resolve to the store and
+        # delete every profile's shared history.
+        .*)
+            die "invalid profile name '$1' (names starting with '.' are reserved for cdx)"
             ;;
     esac
 }
 
 home_of() {
-    if [ "$1" = "main" ] && ! migrated; then echo "$CODEX_LINK"; return; fi
+    if [ "$1" = "main" ] && ! initialized; then echo "$CODEX_LINK"; return; fi
     echo "$PROFILES/$1"
 }
 
@@ -114,42 +150,42 @@ resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
 
 # Name of the profile ~/.codex currently points at.
 active_profile() {
-    migrated || { echo main; return; }
+    initialized || { echo main; return; }
     basename "$(readlink "$CODEX_LINK")"
 }
 
 # Serialize account switches so symlink changes and process restarts cannot race.
-USE_LOCK="$PROFILES/.cdx-use.lock"
+SWITCH_LOCK="$PROFILES/.cdx-switch.lock"
 LOCK_HELD=0
 
-release_use_lock() {
+release_switch_lock() {
     [ "$LOCK_HELD" = 1 ] || return 0
-    rm -f "$USE_LOCK/pid" 2>/dev/null || true
-    rmdir "$USE_LOCK" 2>/dev/null || true
+    rm -f "$SWITCH_LOCK/pid" 2>/dev/null || true
+    rmdir "$SWITCH_LOCK" 2>/dev/null || true
     LOCK_HELD=0
 }
 
-acquire_use_lock() {
+acquire_switch_lock() {
     local owner=""
     mkdir -p "$PROFILES"
-    if mkdir -m 700 "$USE_LOCK" 2>/dev/null; then
-        printf '%s\n' "$$" > "$USE_LOCK/pid"
+    if mkdir -m 700 "$SWITCH_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$SWITCH_LOCK/pid"
         LOCK_HELD=1
-        trap release_use_lock EXIT
+        trap release_switch_lock EXIT
         return 0
     fi
-    [ ! -L "$USE_LOCK" ] || die "unsafe switch lock is a symlink: $USE_LOCK"
-    [ -f "$USE_LOCK/pid" ] && read -r owner < "$USE_LOCK/pid" || true
+    [ ! -L "$SWITCH_LOCK" ] || die "unsafe switch lock is a symlink: $SWITCH_LOCK"
+    [ -f "$SWITCH_LOCK/pid" ] && read -r owner < "$SWITCH_LOCK/pid" || true
     case "$owner" in
         ''|*[!0-9]*) ;;
-        *) kill -0 "$owner" 2>/dev/null && die "another cdx use is running (PID $owner)" ;;
+        *) kill -0 "$owner" 2>/dev/null && die "another cdx switch is running (PID $owner)" ;;
     esac
-    rm -f "$USE_LOCK/pid" 2>/dev/null || true
-    rmdir "$USE_LOCK" 2>/dev/null || die "stale switch lock needs inspection: $USE_LOCK"
-    mkdir -m 700 "$USE_LOCK" || die "could not acquire switch lock: $USE_LOCK"
-    printf '%s\n' "$$" > "$USE_LOCK/pid"
+    rm -f "$SWITCH_LOCK/pid" 2>/dev/null || true
+    rmdir "$SWITCH_LOCK" 2>/dev/null || die "stale switch lock needs inspection: $SWITCH_LOCK"
+    mkdir -m 700 "$SWITCH_LOCK" || die "could not acquire switch lock: $SWITCH_LOCK"
+    printf '%s\n' "$$" > "$SWITCH_LOCK/pid"
     LOCK_HELD=1
-    trap release_use_lock EXIT
+    trap release_switch_lock EXIT
 }
 
 # Codex homes contain refresh tokens and account-specific runtime state.
@@ -164,7 +200,8 @@ secure_profile() {
 
 secure_all_profiles() {
     local home
-    if ! migrated; then
+    stored && chmod 700 "$STORE"
+    if ! initialized; then
         secure_profile "$CODEX_LINK"
     fi
     for home in "$PROFILES"/*/; do
@@ -176,73 +213,144 @@ secure_all_profiles() {
 # Symlink shared config from the main home into a profile. Codex writes
 # config.toml atomically on some edits, which replaces the symlink with a
 # real file — 'cdx link' puts it back.
+# True when $1 is already the link we would create. A link left over from an
+# older layout (pointing into a profile, or at a renamed path) is not, and
+# gets re-pointed — that repair is what makes the layout reconstructable.
+links_to() {
+    local path="$1" want="$2" tgt
+    [ -L "$path" ] || return 1
+    tgt="$(readlink "$path")"
+    [ "$tgt" = "$want" ]
+}
+
 link_shared() {
     local home="${1%/}" f src
     src="$(shared_src)"; src="${src%/}"
-    # Nothing to link when this profile IS the shared original. The trailing
+    # The store links to nothing: it is the thing being linked to. The trailing
     # slash from "$PROFILES"/*/ has to go first or this compare silently fails.
     [ "$home" != "$src" ] || return 0
-    for f in "${SHARED[@]}"; do
+    for f in "${SHARED_FILES[@]}"; do
         [ -e "$src/$f" ] || continue
-        [ -L "$home/$f" ] && continue
+        links_to "$home/$f" "$src/$f" && continue
+        # Safe to clobber: a real file here is a copy Codex wrote over the
+        # link (it rewrites config.toml atomically), not unrecoverable data.
         rm -f "$home/$f"
         ln -s "$src/$f" "$home/$f"
     done
     # History: a real file here is this profile's own conversations or
-    # memories. Never delete one to make room for the link.
+    # memories. Never delete one to make room for the link. A symlink is
+    # always safe to re-point, since the data is wherever it points.
     for f in "${SHARED_DATA[@]}"; do
         [ -e "$src/$f" ] || continue
-        [ -L "$home/$f" ] && continue
-        if [ -e "$home/$f" ]; then
+        links_to "$home/$f" "$src/$f" && continue
+        if [ -e "$home/$f" ] && [ ! -L "$home/$f" ]; then
             echo "cdx: $home/$f is this profile's own — not shared. Move or" >&2
             echo "     delete it, then 'cdx link', to join the shared history." >&2
             continue
         fi
+        rm -f "$home/$f"
         ln -s "$src/$f" "$home/$f"
     done
     # Directories: never rm -rf a real one, since that would be a profile's
-    # own data. Leave it alone and say so instead.
+    # own data. Leave it alone and say so instead. Replacing a *link* is fine,
+    # and -n stops ln from descending into the old target directory.
     for f in "${SHARED_DIRS[@]}"; do
         [ -d "$src/$f" ] || continue
-        [ -L "$home/$f" ] && continue
-        if [ -d "$home/$f" ]; then
-            echo "cdx: $home/$f is a real directory, not shared with main" >&2
+        links_to "$home/$f" "$src/$f" && continue
+        if [ -d "$home/$f" ] && [ ! -L "$home/$f" ]; then
+            echo "cdx: $home/$f is this profile's own directory — left as is" >&2
             continue
         fi
-        ln -s "$src/$f" "$home/$f"
+        rm -f "$home/$f"
+        ln -sfn "$src/$f" "$home/$f"
     done
 }
 
-# account_id and last_refresh are non-secret; tokens are never printed.
+# Who a profile is logged in as. The id_token is a JWT whose payload carries
+# the account email and plan; it is decoded locally (no verification needed
+# for display) and the token itself is never printed. Falls back to the
+# account_id prefix when there is no id_token (API-key logins).
 describe() {
     local auth="$1/auth.json"
     [ -f "$auth" ] || { echo "not logged in"; return; }
     python3 - "$auth" <<'PY'
-import json, sys
+import base64, json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     print("unreadable auth.json"); sys.exit()
 t = d.get("tokens") or {}
 mode = d.get("auth_mode") or ("apikey" if d.get("OPENAI_API_KEY") else "?")
-acct = (t.get("account_id") or "")[:8]
-print(f"{mode:8} {acct:8} refreshed {(d.get('last_refresh') or '?')[:10]}")
+who = (t.get("account_id") or "")[:8]
+plan = ""
+try:
+    payload = t["id_token"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    who = claims.get("email") or who
+    plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
+except Exception:
+    pass
+print(f"{mode:8} {who:26} {plan:9} refreshed {(d.get('last_refresh') or '?')[:10]}")
 PY
+}
+
+# Pre-migration 'main' is ~/.codex and not under $PROFILES; afterwards it
+# is an ordinary profile the glob finds, so only add it in the first case.
+profile_names() {
+    local home
+    initialized || echo main
+    if [ -d "$PROFILES" ]; then
+        for home in "$PROFILES"/*/; do
+            [ -d "$home" ] || continue
+            basename "$home"
+        done
+    fi
+}
+
+# Closest existing profile to a name that matched nothing — usually a typo.
+# Prints the best candidate within edit distance 2, or fails. Adjacent-swap
+# counts as one edit, since transpositions dominate real typos.
+suggest_profile() {
+    local name="$1" names=() n
+    while IFS= read -r n; do names+=("$n"); done < <(profile_names)
+    [ ${#names[@]} -gt 0 ] || return 1
+    python3 - "$name" "${names[@]}" <<'PY'
+import sys
+name, *cands = sys.argv[1:]
+def dist(a, b):
+    rows = [list(range(len(b) + 1))]
+    for i, ca in enumerate(a, 1):
+        rows.append([i] + [0] * len(b))
+        for j, cb in enumerate(b, 1):
+            best = min(rows[i - 1][j] + 1, rows[i][j - 1] + 1,
+                       rows[i - 1][j - 1] + (ca != cb))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                best = min(best, rows[i - 2][j - 2] + 1)
+            rows[i][j] = best
+    return rows[-1][-1]
+best = min(cands, key=lambda c: dist(name.lower(), c.lower()))
+if dist(name.lower(), best.lower()) <= 2:
+    print(best)
+else:
+    sys.exit(1)
+PY
+}
+
+# What to say when <name> has no profile directory: point at the near-miss
+# if there is one, so a typo is not answered with 'cdx add <typo>'.
+missing_profile() {
+    local name="$1" hint
+    if hint="$(suggest_profile "$name")"; then
+        die "no such profile: $name (did you mean '$hint'?)"
+    fi
+    die "no such profile: $name (try 'cdx add $name')"
 }
 
 list_profiles() {
     local names=() n home active mark
-    # Pre-migration 'main' is ~/.codex and not under $PROFILES; afterwards it
-    # is an ordinary profile the glob finds, so only add it in the first case.
-    migrated || names=(main)
-    if [ -d "$PROFILES" ]; then
-        for home in "$PROFILES"/*/; do
-            [ -d "$home" ] || continue
-            names+=("$(basename "$home")")
-        done
-    fi
+    while IFS= read -r n; do names+=("$n"); done < <(profile_names)
     active="$(active_profile)"
-    printf '   %-12s %-8s %-8s %s\n' NAME MODE ACCOUNT ""
+    printf '   %-12s %-8s %-26s %s\n' NAME MODE ACCOUNT PLAN
     for n in "${names[@]}"; do
         home="$(home_of "$n")"
         # A variable, not $(... && echo ' *' || echo '  ') — command
@@ -250,8 +358,15 @@ list_profiles() {
         if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
         printf '%s %-12s %s\n' "$mark" "$n" "$(describe "$home")"
     done
-    migrated || echo "
+    if ! initialized; then
+        echo "
 ($CODEX_LINK is a plain directory — run 'cdx init' to enable switching)"
+    elif legacy_layout; then
+        # Non-fatal: listing accounts still works fine on the old layout. Only
+        # the commands that depend on the store refuse outright.
+        printf '\n%s(no shared store — %s still holds it; %s explains the fix)%s\n' \
+            "$C_YELLOW" "$PROFILES/main" "'cdx link'" "$C_RESET"
+    fi
 }
 # Map an app-server control/log path back to its owning profile.
 profile_from_control_path() {
@@ -270,32 +385,36 @@ profile_from_control_path() {
     return 1
 }
 
+# Every filesystem path a process currently has open, one per line. /proc is
+# authoritative where it exists and resolves each fd to its real path, which is
+# what lets a caller recognise a file reached through the moving ~/.codex
+# symlink. macOS has no /proc, so lsof stands in; its -Fn format gives one
+# n-prefixed path per line, avoiding fragile column parsing. Callers filter.
+open_paths() {
+    local pid="$1" fd line
+    if [ -d "/proc/$pid/fd" ]; then
+        for fd in "/proc/$pid/fd"/*; do
+            readlink "$fd" 2>/dev/null || true
+        done
+        return 0
+    fi
+    command -v lsof >/dev/null 2>&1 || return 0
+    while IFS= read -r line; do
+        case "$line" in n*) printf '%s\n' "${line#n}" ;; esac
+    done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
+}
+
 # Inspect open control-socket/log descriptors instead of trusting CODEX_HOME:
 # a long-running process may have inherited the moving ~/.codex symlink.
 app_server_profile() {
-    local pid="$1" fd line target profile
-    if [ -d "/proc/$pid/fd" ]; then
-        for fd in "/proc/$pid/fd"/*; do
-            target="$(readlink "$fd" 2>/dev/null)" || continue
-            if profile="$(profile_from_control_path "$target")"; then
-                echo "$profile"
-                return 0
-            fi
-        done
-    fi
-    if command -v lsof >/dev/null 2>&1; then
-        while IFS= read -r line; do
-            case "$line" in
-                n*)
-                    target="${line#n}"
-                    if profile="$(profile_from_control_path "$target")"; then
-                        echo "$profile"
-                        return 0
-                    fi
-                    ;;
-            esac
-        done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
-    fi
+    local pid="$1" target profile
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        if profile="$(profile_from_control_path "$target")"; then
+            echo "$profile"
+            return 0
+        fi
+    done < <(open_paths "$pid")
     echo unknown
 }
 
@@ -333,6 +452,11 @@ cmd_status() {
         printf '%-20s %s\n' "Selected account:" "$account"
         printf '%-20s %s\n' "Conversation store:" "$session_store"
         printf '%-20s %s\n' "State index:" "$state_store"
+        if stored; then
+            printf '%-20s %s\n' "Shared store:" "$STORE"
+        else
+            printf '%-20s %s%s%s\n' "Shared store:" "$C_YELLOW" "none — predates the store; run any command for the fix" "$C_RESET"
+        fi
     fi
 
     if [ -z "$server_pids" ]; then
@@ -400,15 +524,24 @@ PY
 
 
 # One-time: turn the real ~/.codex into profiles/main and leave a symlink in
-# its place. A rename on the same filesystem, so even 1.7G moves instantly.
-# Its own command rather than a step hidden inside 'use', because it is the
-# one operation here that restructures your home directory.
+# its place, and hoist the shared data into the store. A rename on the same
+# filesystem, so even 1.7G moves instantly. Its own command rather than a step
+# hidden inside 'use', because it is the one operation here that restructures
+# your home directory.
+#
+# This is the whole setup for a new machine. Installs created before the
+# store existed are detected elsewhere and told how to catch up.
 cmd_init() {
     local reply
-    migrated && {
+    if initialized; then
         echo "already set up: $CODEX_LINK -> $(readlink "$CODEX_LINK")"
+        # Not a full no-op: an install from before the store looks "set up"
+        # but still has its shared data buried in the 'main' profile. The
+        # explicit 'if' matters — a bare '&&' as the last statement would make
+        # the function exit non-zero whenever the layout is already correct.
+        if legacy_layout; then explain_legacy; fi
         return 0
-    }
+    fi
     [ -d "$CODEX_LINK" ] || die "$CODEX_LINK does not exist — nothing to set up"
 
     if [ "${1:-}" != "-y" ]; then
@@ -428,16 +561,104 @@ cmd_init() {
     secure_profile "$PROFILES/main"
     ln -s "$PROFILES/main" "$CODEX_LINK"
     echo "set up: $CODEX_LINK -> $PROFILES/main"
+    # Hoist the shared data straight out of 'main' so it is never load-bearing.
+    move_store_out_of "$PROFILES/main" >/dev/null
+    link_shared "$PROFILES/main"
+    echo "shared store: $STORE"
 }
 
-# Kill running Codex processes whose open files still point inside $old. Also
-# stop every app-server proxy: those SSH remote clients hold anonymous socket
-# fds rather than paths below $old, but their initialized connection can retain
-# the old account until the controlling desktop reconnects.
-restart_bound_to() {
-    local old="${1%/}" dry_run="${2:-0}" pid fd line tgt cmd matched remote_proxy attempt
-    local killed=() survivors=() remote_proxies=0
+# Move the one real copy of every shared entry into the store. Everything is
+# a same-filesystem rename, so nothing is copied and nothing is deleted; items
+# already in the store, or already links, are skipped. Safe to run twice.
+move_store_out_of() {
+    local src="${1%/}" f moved=0
+    [ -e "$STORE" ] && [ ! -d "$STORE" ] && die "$STORE exists but is not a directory — move it aside and rerun"
+    mkdir -p "$STORE"
+    chmod 700 "$STORE"
+    for f in "${SHARED_FILES[@]}" "${SHARED_DATA[@]}" "${SHARED_DIRS[@]}"; do
+        # Only real files/dirs move; a symlink is already pointing at the data.
+        [ -e "$src/$f" ] && [ ! -L "$src/$f" ] || continue
+        [ -e "$STORE/$f" ] && continue
+        mv "$src/$f" "$STORE/$f"
+        moved=$((moved + 1))
+    done
+    # sqlite's sidecars must travel with their database or the index looks
+    # corrupt; they are recreated next to the resolved path afterwards.
+    for f in "${SHARED_DATA[@]}"; do
+        local side
+        for side in "$src/$f-wal" "$src/$f-shm"; do
+            [ -e "$side" ] && [ ! -L "$side" ] || continue
+            [ -e "$STORE/$(basename "$side")" ] || mv "$side" "$STORE/"
+        done
+    done
+    echo "$moved"
+}
+
+# An install made before the store existed keeps its shared data inside the
+# 'main' profile. cdx no longer carries a converter for that: it was a one-time
+# operation, and keeping a rarely-run command that stops processes and moves
+# gigabytes is worse than explaining the fix. Detect it and print the exact
+# commands instead — the move is a handful of renames, and 'cdx link' does the
+# rest, so the manual path is short and inspectable.
+legacy_layout() { initialized && ! stored; }
+
+explain_legacy() {
+    local legacy="$PROFILES/main" f items=()
+    for f in "${SHARED_FILES[@]}" "${SHARED_DATA[@]}" "${SHARED_DIRS[@]}"; do
+        [ -e "$legacy/$f" ] && [ ! -L "$legacy/$f" ] || continue
+        items+=("$f")
+    done
+    {
+        printf '%scdx: this install predates the shared store.%s\n' "$C_YELLOW" "$C_RESET"
+        echo "     Its shared data still lives inside the 'main' profile, which makes"
+        echo "     'main' undeletable and unrenameable. To finish the layout:"
+        echo
+        echo "       # 1. stop Codex on this machine (the desktop app will reconnect)"
+        echo "       pkill -u \"\$(id -un)\" -f 'codex.*app-server'"
+        echo
+        echo "       # 2. move the shared data into the store (same filesystem: instant)"
+        echo "       mkdir -p $STORE && chmod 700 $STORE"
+        if [ ${#items[@]} -gt 0 ]; then
+            printf '       mv %s \\\n' "$legacy/{$(IFS=,; echo "${items[*]}")}"
+            echo "          $STORE/"
+            echo "       mv $legacy/*.sqlite-wal $legacy/*.sqlite-shm $STORE/ 2>/dev/null"
+        else
+            echo "       # (nothing left to move — 'main' holds no unshared originals)"
+        fi
+        echo
+        echo "       # 3. re-point every profile at the store"
+        echo "       cdx link"
+    } >&2
+}
+
+require_store() {
+    legacy_layout || return 0
+    explain_legacy
+    exit 1
+}
+
+# Kill running Codex processes whose open files still point inside $old.
+#
+# SSH remote proxies need their own rule: they hold anonymous socket fds rather
+# than paths below $old, so the fd scan never sees them, yet they front the
+# app-server we are about to kill. Leaving them up strands the desktop on a
+# dead backend. proxy_policy picks between:
+#   always  — 'use', where the account itself changes, so every cached
+#             connection is stale whether or not we stopped anything.
+#   if-stale — 'rename', where the account is unchanged: disconnect
+#             them only when we actually stopped a process they could be
+#             fronting, so an idle machine keeps its remote sessions.
+stop_bound_to() {
+    local old="${1%/}" dry_run="${2:-0}" proxy_policy="${3:-always}"
+    local pid tgt cmd matched remote_proxy attempt
+    local killed=() survivors=() proxies=() remote_proxies=0
     [ -n "$old" ] || return 0
+    case "$proxy_policy" in
+        always|if-stale) ;;
+        0) proxy_policy=if-stale ;;
+        1) proxy_policy=always ;;
+        *) die "internal: bad proxy policy '$proxy_policy'" ;;
+    esac
     if [ ! -d /proc/self/fd ] && ! command -v lsof >/dev/null 2>&1; then
         echo "cdx: cannot find processes bound to the old profile (need /proc or lsof)" >&2
         return 1
@@ -450,32 +671,31 @@ restart_bound_to() {
             cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
         fi
         case "$cmd" in
-            *"codex app-server proxy"*) matched=1; remote_proxy=1 ;;
+            *"codex app-server proxy"*)
+                remote_proxy=1
+                [ "$proxy_policy" = always ] && matched=1
+                ;;
         esac
-        if [ -d "/proc/$pid/fd" ]; then
-            for fd in "/proc/$pid/fd"/*; do
-                tgt="$(readlink "$fd" 2>/dev/null)" || continue
-                case "$tgt" in
-                    "$old"/*) matched=1; break ;;
-                esac
-            done
-        else
-            # macOS has no /proc; lsof's -Fn format gives one n-prefixed path
-            # per open file without fragile, column-oriented parsing.
-            while IFS= read -r line; do
-                case "$line" in
-                    n*)
-                        tgt="${line#n}"
-                        case "$tgt" in "$old"/*) matched=1; break ;; esac
-                        ;;
-                esac
-            done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
+        if [ "$matched" = 0 ]; then
+            while IFS= read -r tgt; do
+                case "$tgt" in "$old"/*) matched=1; break ;; esac
+            done < <(open_paths "$pid")
         fi
         if [ "$matched" = 1 ]; then
             killed+=("$pid")
             [ "$remote_proxy" = 1 ] && remote_proxies=$((remote_proxies + 1))
+        elif [ "$remote_proxy" = 1 ]; then
+            # Not bound to $old itself, but a candidate if anything else is:
+            # tracked separately so escalation cannot list it twice.
+            proxies+=("$pid")
         fi
     done
+    # We stopped something a proxy could be fronting, so those connections are
+    # now dead ends: take them down too and let the desktop reconnect.
+    if [ "$proxy_policy" = if-stale ] && [ ${#killed[@]} -gt 0 ] && [ ${#proxies[@]} -gt 0 ]; then
+        killed+=("${proxies[@]}")
+        remote_proxies=$((remote_proxies + ${#proxies[@]}))
+    fi
     if [ ${#killed[@]} -eq 0 ]; then
         echo "  No running processes were bound to the old profile."
         return
@@ -491,20 +711,35 @@ restart_bound_to() {
     if [ "$remote_proxies" -gt 0 ]; then
         printf '%s  Disconnecting %s SSH remote proxy/proxies; desktop clients should reconnect.%s\n' "$C_YELLOW" "$remote_proxies" "$C_RESET"
     fi
+    # Escape hatch for anything running cdx against a scratch CODEX_PROFILES.
+    # Process selection is the one part of cdx that cannot be sandboxed by env
+    # vars — pgrep sees the whole user's process table — so a bug in the path
+    # filter reaches real Codex sessions no matter how isolated the profiles
+    # are. The test suite sets this so a broken build cannot kill live work.
+    if [ "${CDX_NO_KILL:-}" = 1 ]; then
+        printf '%s  CDX_NO_KILL=1 — signalling nothing.%s\n' "$C_YELLOW" "$C_RESET"
+        return 0
+    fi
     kill "${killed[@]}" 2>/dev/null || true
-    for attempt in {1..50}; do
+    # A real app-server takes its time on SIGTERM — it closes sqlite handles and
+    # tears down client sessions first. Five seconds was not enough and made
+    # 'rename' abort on a perfectly healthy shutdown, so wait 20.
+    local waited=0
+    for attempt in {1..200}; do
         survivors=()
         for pid in "${killed[@]}"; do
             kill -0 "$pid" 2>/dev/null && survivors+=("$pid")
         done
         [ ${#survivors[@]} -eq 0 ] && break
         sleep 0.1
+        waited=$attempt
     done
     if [ ${#survivors[@]} -gt 0 ]; then
-        printf '%scdx: %s process(es) did not exit after 5 seconds: %s%s\n' "$C_RED" "${#survivors[@]}" "${survivors[*]}" "$C_RESET" >&2
+        printf '%scdx: %s process(es) did not exit after 20 seconds: %s%s\n' "$C_RED" "${#survivors[@]}" "${survivors[*]}" "$C_RESET" >&2
         printf '%s     They were not force-killed; inspect them and rerun cdx status.%s\n' "$C_YELLOW" "$C_RESET" >&2
         return 1
     fi
+    [ "$waited" -lt 10 ] || printf '%s  (waited %ss for a graceful exit)%s\n' "$C_YELLOW" "$((waited / 10))" "$C_RESET"
     printf '%s  All targeted processes exited.%s\n' "$C_GREEN" "$C_RESET"
 }
 
@@ -523,20 +758,20 @@ cmd_use() {
         esac
         shift
     done
-    migrated || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
+    initialized || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
     local home; home="$(home_of "$name")"
-    [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    [ -d "$home" ] || missing_profile "$name"
     # Resolve the old target before repointing. Restart it even when the name is
     # already active: that is how a caller repairs stale cached connections.
     local old_target=""
     if [ "$dry_run" = 0 ]; then
-        acquire_use_lock
+        acquire_switch_lock
     fi
     old_target="$(resolve_dir "$CODEX_LINK" || true)"
     if [ "$dry_run" = 1 ]; then
         printf '%sDry run:%s would activate %s%s%s (%s -> %s)\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
         if [ "$restart" = 1 ] && [ -n "$old_target" ]; then
-            restart_bound_to "$old_target" 1
+            stop_bound_to "$old_target" 1
         else
             echo "  Existing Codex and remote connections would be left running."
         fi
@@ -548,9 +783,10 @@ cmd_use() {
     # drops the new link *inside* the profile directory, silently doing nothing.
     ln -sfn "$home" "$CODEX_LINK"
     printf '%s→%s %s%s%s is now active (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
+    [ -f "$home/auth.json" ] || printf "%s  '%s' is not logged in yet — run 'cdx add %s' to authenticate.%s\n" "$C_YELLOW" "$name" "$name" "$C_RESET"
     if [ "$restart" = 1 ]; then
         if [ -n "$old_target" ]; then
-            restart_bound_to "$old_target"
+            stop_bound_to "$old_target"
         fi
     else
         echo "  Existing Codex and remote connections were left running by request."
@@ -558,44 +794,114 @@ cmd_use() {
     fi
 }
 
+# The browser flow needs a browser on THIS machine: 'codex login' spins up a
+# localhost callback server, so a browser elsewhere cannot complete it. Over
+# SSH or on a display-less box, device auth is the flow that works.
+headless() {
+    [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && return 0
+    [ "$(uname)" = Darwin ] && return 1
+    [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
+}
+
 cmd_add() {
     local name="${1:-}"
     [ -n "$name" ] || die "add needs a name"
+    shift
     validate_name "$name"
-    [ "$name" != main ] || die "'main' is reserved for $CODEX_LINK"
+    # Before 'cdx init', 'main' means ~/.codex itself; afterwards (and perhaps
+    # renamed away) it is an ordinary name again.
+    if ! initialized && [ "$name" = main ]; then die "'main' is reserved for $CODEX_LINK"; fi
     local home; home="$(home_of "$name")"
-    [ -d "$home" ] && die "$name already exists ($home)"
+    if [ -d "$home" ]; then
+        # A profile with no credentials is a login that never finished (say,
+        # a Ctrl-C'd browser flow) — retry it instead of demanding a new name.
+        [ ! -f "$home/auth.json" ] || die "$name already exists ($home)"
+        echo "→ '$name' exists but is not logged in — retrying login"
+    fi
     mkdir -p "$home"
     secure_profile "$home"
     link_shared "$home"
-    echo "→ logging in to '$name' (a browser window will open)"
-    CODEX_HOME="$home" codex login
+    local login_args=("$@")
+    if [ ${#login_args[@]} -eq 0 ] && headless; then
+        login_args=(--device-auth)
+    fi
+    case " ${login_args[*]-} " in
+        *" --device-auth "*)
+            echo "→ logging in to '$name' with device auth (no local browser needed)" ;;
+        *)  echo "→ logging in to '$name' (a browser window will open)" ;;
+    esac
+    CODEX_HOME="$home" codex login ${login_args[@]+"${login_args[@]}"}
     secure_profile "$home"
 }
 
+# Rename a profile. Nothing points *into* a profile once the store exists, so
+# this is a same-filesystem mv plus the active pointer — no link rewriting, and
+# no profile is exempt.
+cmd_rename() {
+    local old="${1:-}" new="${2:-}"
+    [ -n "$old" ] && [ -n "$new" ] || die "usage: cdx rename <old> <new>"
+    validate_name "$old"
+    validate_name "$new"
+    initialized || die "run 'cdx init' first — before that, 'main' is $CODEX_LINK itself"
+    require_store
+    local old_home="$PROFILES/$old" new_home="$PROFILES/$new"
+    [ -d "$old_home" ] || missing_profile "$old"
+    [ ! -e "$new_home" ] || die "$new already exists ($new_home)"
+    acquire_switch_lock
+    local active; active="$(active_profile)"
+    # Running processes cache the old path (CODEX_HOME strings, log fds); stop
+    # the ones holding files under it while fd inspection can still see the
+    # pre-rename path. Proxies without such files keep running: the account
+    # behind ~/.codex is not changing, only its directory name.
+    stop_bound_to "$old_home" 0 if-stale || die "rename aborted — inspect the survivors and rerun"
+    mv "$old_home" "$new_home"
+    [ "$active" != "$old" ] || ln -sfn "$new_home" "$CODEX_LINK"
+    printf '%s→%s renamed %s%s%s to %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$old" "$C_RESET" "$C_CYAN" "$new" "$C_RESET"
+    [ "$active" != "$old" ] || echo "  It stays the active profile ($CODEX_LINK -> $new_home)."
+}
+
 cmd_rm() {
-    local name="${1:-}"
+    local name="${1:-}" assume_yes=0 reply
     [ -n "$name" ] || die "rm needs a name"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes) assume_yes=1 ;;
+            *) die "unknown option to 'rm': $1" ;;
+        esac
+        shift
+    done
+    # No profile-is-load-bearing guard needed: shared data lives in $STORE,
+    # which validate_name cannot name. Deleting any profile costs its
+    # credentials and logs — the history and caches are not inside it.
     validate_name "$name"
-    [ "$name" != main ] || die "refusing to delete $CODEX_LINK"
     local home; home="$(home_of "$name")"
-    [ -d "$home" ] || die "no such profile: $name"
-    if migrated && [ "$(resolve_dir "$CODEX_LINK")" = "$(resolve_dir "$home")" ]; then
+    [ -d "$home" ] || missing_profile "$name"
+    if initialized && [ "$(resolve_dir "$CODEX_LINK")" = "$(resolve_dir "$home")" ]; then
         die "refusing to delete the active profile '$name' (switch profiles first)"
     fi
-    printf 'delete %s and its credentials? [y/N] ' "$home"
-    read -r reply
-    [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; exit 0; }
+    if [ "$assume_yes" = 0 ]; then
+        # Same reasoning as 'init': with no terminal nobody can answer, and
+        # letting 'read' hit EOF would abort with no explanation.
+        [ -t 0 ] || die "not a terminal — rerun as 'cdx rm $name -y' to confirm"
+        printf 'delete %s and its credentials? [y/N] ' "$home"
+        read -r reply || reply=""
+        [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; return 1; }
+    fi
     rm -rf "$home"
     echo "removed $name"
 }
 
+# Rebuild every profile's links to the store. This is the repair command: the
+# store path is fixed, so a profile's links are fully derivable and any of them
+# can be recreated after Codex overwrites one, or a rename leaves one stale.
 cmd_link() {
     local home
+    require_store
     secure_all_profiles
     for home in "$PROFILES"/*/; do
         [ -d "$home" ] || continue
-        link_shared "$home"
+        link_shared "${home%/}"
         echo "linked $(basename "$home")"
     done
 }
@@ -605,11 +911,18 @@ cmd_link() {
 # is two things: CODEX_HOME holds Codex-local state (auth.json), while the
 # ChatGPT login itself lives in the Electron session, hence --user-data-dir.
 cmd_app() {
-    local name="${1:-main}" workspace="${2:-$PWD}"
+    # Default to whatever is active, not a hardcoded 'main' — that name is
+    # only the initial one and 'cdx rename' may have moved it.
+    local name="${1:-$(active_profile)}" workspace="${2:-$PWD}" stock=0
+    case "${3:-}" in
+        "") ;;
+        --stock) stock=1 ;;
+        *) die "unknown option to 'app': $3" ;;
+    esac
     validate_name "$name"
     [ "$(uname)" = Darwin ] || die "app launching is macOS-only"
     local home; home="$(home_of "$name")"
-    [ -d "$home" ] || die "no such profile: $name"
+    [ -d "$home" ] || missing_profile "$name"
 
     local app="${CHATGPT_APP:-}"
     if [ -z "$app" ]; then
@@ -622,8 +935,9 @@ cmd_app() {
     secure_profile "$home"
     link_shared "$home"
     echo "→ $app  (CODEX_HOME=$home)"
-    if [ "$name" = main ]; then
-        # Stock session: don't hand the default install a separate Electron profile.
+    if [ "$stock" = 1 ]; then
+        # Reuse the app's default Electron session — the existing ChatGPT
+        # desktop login — rather than giving this profile its own.
         open -n --env "CODEX_HOME=$home" -a "$app" "$workspace"
     else
         mkdir -p "$home/electron"
@@ -667,7 +981,7 @@ cmd_run() {
     local name="$1"; shift
     validate_name "$name"
     local home; home="$(home_of "$name")"
-    [ -d "$home" ] || die "no such profile: $name (try 'cdx add $name')"
+    [ -d "$home" ] || missing_profile "$name"
     secure_profile "$home"
     link_shared "$home"
     [ -f "$home/auth.json" ] || echo "cdx: '$name' is not logged in — Codex will prompt." >&2
@@ -685,6 +999,13 @@ case "${1:-}" in
     app)    shift; cmd_app "$@" ;;
     status) shift; cmd_status "$@" ;;
     ssh)    shift; cmd_ssh "$@" ;;
+    rename|mv) shift; cmd_rename "$@" ;;
+    # Removed once every machine had been converted. Kept as a dispatch entry
+    # so muscle memory gets the layout answer instead of "no such profile".
+    migrate)
+        if legacy_layout; then explain_legacy; exit 1; fi
+        echo "cdx: 'migrate' is gone — this install already uses the store ($STORE)"
+        ;;
     rm)     shift; cmd_rm "$@" ;;
     link)   shift; cmd_link ;;
     -*)     die "unknown option $1 (see cdx -h)" ;;
