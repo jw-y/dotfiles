@@ -202,6 +202,31 @@ it "data survived the manual path";       assert_eq "$(cat "$D/profiles/personal
 it "listing stops warning";               assert_eq "$(cdx "$D" list | grep -c 'no shared store')" "0"
 it "'migrate' says it is gone";           assert_contains "$(cdx "$D" migrate)" "already uses the store"
 
+# ------------------------------------------- link without codex on PATH -----
+# A real install launches codex through ~/.local/bin/codex, a symlink into the
+# shared packages/ dir by way of the active profile. So the moment a profile's
+# packages link goes stale — which is precisely what a hand-run migration
+# leaves behind — codex stops resolving. 'link' is the command that re-points
+# it, so requiring codex on PATH would strand the fix behind the breakage.
+echo "${DIM}link without codex on PATH${OFF}"
+D="$(store_env nolauncher)"
+chmod +x "$D/profiles/.store/packages/codex-bin"
+ln -sf "$D/codex/packages/codex-bin" "$D/bin/codex"
+it "launcher resolves while linked";      assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "yes"
+
+# What a migration leaves: the store moved, the profile still points at the old
+# path, and every hop through the active profile now dangles.
+ln -sfn "$D/profiles/.store/packages-old" "$D/profiles/main/packages"
+it "a stale link breaks the launcher";    assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "no"
+it "other commands still demand codex";   assert_contains "$(cdx "$D" list)" "not on PATH"
+it "so does running a profile";           assert_contains "$(cdx "$D" personal)" "not on PATH"
+
+out="$(cdx "$D" link)"
+it "link runs without codex on PATH";     assert_contains "$out" "linked main"
+it "link re-pointed the stale link";      assert_link "$D/profiles/main/packages" "$D/profiles/.store/packages"
+it "the launcher resolves again";         assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "yes"
+it "and codex is demanded once more";     assert_eq "$(cdx "$D" list | grep -c 'not on PATH')" "0"
+
 # ------------------------------------------------------- link (repair) -----
 echo "${DIM}link — reconstruction${OFF}"
 D="$(store_env rep)"
