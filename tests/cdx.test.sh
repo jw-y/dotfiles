@@ -494,6 +494,19 @@ it "--no-usage skips the lookup";        assert_eq "$(printf %s "$out" | grep -c
 it "--no-usage leaves no cache behind";  assert_eq "$(ls "$U"/profiles/*/.cdx-usage.json 2>/dev/null | wc -l)" "0"
 it "--refresh is accepted bare";         assert_contains "$(cdx "$U" --refresh)" "42%"
 it "rejects unknown list options";       assert_contains "$(cdx "$U" list --bogus)" "unknown option to 'list'"
+
+# The listing as data. Anything consuming this wants to compare numbers, so it
+# carries the percentage and the epoch rather than '42% wk' and a countdown —
+# re-parsing a cell built for a terminal is the mistake this file has made
+# twice already.
+js="$(cdx "$U" list --json)"
+it "list --json is valid json";          assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")')" "ok"
+it "it names the active profile";        assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;print(json.load(sys.stdin)["active_profile"])')" "lab"
+it "one entry per account";              assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["accounts"]))')" "3"
+it "the figure is a number, not a cell"; assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;a=json.load(sys.stdin)["accounts"];print(type([x for x in a if x["name"]=="lab"][0]["used_percent"]).__name__)')" "int"
+it "and the reset keeps its epoch";      assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;a=json.load(sys.stdin)["accounts"];print(type([x for x in a if x["name"]=="lab"][0]["windows"][0]["reset_at"]).__name__)')" "float"
+it "usability is stated outright";       assert_eq "$(printf %s "$js" | python3 -c 'import json,sys;a=json.load(sys.stdin)["accounts"];print([x["usable"] for x in a if x["name"]=="lab"][0])')" "True"
+it "and no ANSI leaks into it";          assert_eq "$(printf %s "$js" | grep -c $'\033')" "0"
 # status must read the cache rather than call out, so it works offline —
 # and 'main' here was never logged in, so switch to an account that has creds.
 cdx "$U" use lab --no-restart >/dev/null

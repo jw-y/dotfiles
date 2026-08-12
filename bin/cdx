@@ -721,18 +721,48 @@ def pct_of(used: str) -> int | None:
 
 # ── listing ──────────────────────────────────────────────────────────────────
 def list_profiles(argv: list[str]) -> int:
-    force = False
+    force = as_json = False
     for arg in argv:
         if arg == "--refresh":
             force = True
         elif arg == "--no-usage":
             os.environ["CDX_USAGE"] = "off"
+        elif arg == "--json":
+            as_json = True
         else:
             die(f"unknown option to 'list': {arg}")
 
     names = profile_names()
     active = active_profile()
     rows = profile_rows(names, force=force)
+
+    if as_json:
+        # The record, not the rendering: raw percentages and epochs rather
+        # than '52% wk' and 'Aug 18 18:17 (in 6d)'. Anything reading this
+        # wants to compare numbers, and re-parsing a cell built for a terminal
+        # is the mistake this file has already made twice.
+        out(json.dumps({
+            "active_profile": active,
+            "accounts": [{
+                "name": r.name,
+                "active": r.name == active,
+                "auth_mode": r.kind,
+                "account": r.account,
+                "plan": r.plan,
+                "used_percent": pct_of(r.used),
+                "window_seconds": next(
+                    (w.get("seconds") for w in r.windows
+                     if w.get("used") == pct_of(r.used)), None),
+                "windows": r.windows,
+                "state": r.state,
+                "usable": r.state == "ok",
+                "note": r.note,
+                "allowance": r.allowance,
+                "measured_seconds_ago": r.age,
+                "credentials_refreshed": r.refreshed or None,
+            } for r in rows],
+        }, indent=2))
+        return 0
 
     relogin = any(r.state == "relogin" for r in rows)
     oldest = max([r.age or 0 for r in rows], default=0)
@@ -1749,6 +1779,7 @@ re-pointing it and no client needs configuring.
 {C.CYAN}Options{C.RESET}
   --refresh                take a live quota reading instead of the cached one
   --no-usage               skip quota entirely
+  --json                   machine-readable listing (also 'status --json')
   use --no-restart         leave running clients on the old account
   use --dry-run            show what would change, and change nothing
   add <name> [args...]     extra arguments pass through to 'codex login'
@@ -1780,7 +1811,7 @@ re-pointing it and no client needs configuring.
 
 
 SUB_HELP = {
-    "list": """cdx [list] [--refresh] [--no-usage]
+    "list": """cdx [list] [--refresh] [--no-usage] [--json]
 
   List accounts, '*' marking the active one, with how much of its rate-limit
   window each has spent and when that window resets. An account that cannot
@@ -1788,7 +1819,8 @@ SUB_HELP = {
   're-login'); 'cdx status <name>' then gives the long form.
 
   --refresh    ask OpenAI for live figures instead of using the cache
-  --no-usage   skip the quota lookup entirely""",
+  --no-usage   skip the quota lookup entirely
+  --json       raw percentages, epochs and states instead of a table""",
     "status": """cdx status [name] [--json]
 
   Report an account and check it against what is running on this machine.
