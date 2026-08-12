@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -80,6 +81,7 @@ def load_config():
 
     Format:
         jump=<host>     # optional jump host
+        local           # this machine, polled without SSH
         host1
         host2           # inline comments ignored
     """
@@ -122,11 +124,46 @@ def build_ssh_opts(jump):
     ]
 
 
+# The machine gmon runs on, addressed without SSH. Naming it in the host file
+# is how you monitor your own GPUs: listing this box under its own SSH alias
+# works, but only if sshd is up and the alias resolves from here, and it spends
+# a connection and the timeout budget on data that is already local.
+LOCAL_HOST = "local"
+
+
+def local_names():
+    """Names that mean "this machine": the keyword, loopback, and our hostname.
+
+    Writing the box's real hostname in the host file is the obvious thing to
+    try, so treat it as local rather than quietly SSH-ing to ourselves. Both
+    the short and full forms match, since gethostname() may return either.
+
+    Deliberately no getfqdn() — it can trigger a blocking reverse-DNS lookup,
+    and stalling startup to recognize one extra spelling is a bad trade.
+    """
+    names = {LOCAL_HOST, "localhost"}
+    try:
+        host = socket.gethostname()
+    except OSError:
+        return names  # nameless host: the keyword still works
+    if host:
+        names.add(host.lower())
+        names.add(host.split(".", 1)[0].lower())
+    return names
+
+
+LOCAL_NAMES = local_names()
+
+
+def is_local(host):
+    return host.strip().lower() in LOCAL_NAMES
+
+
 def query_host(host, ssh_opts):
     try:
+        argv = ["bash", "-c", CMD] if is_local(host) else ["ssh", *ssh_opts, host, CMD]
         result = subprocess.run(
-            ["ssh", *ssh_opts, host, CMD],
-            capture_output=True, text=True, timeout=SSH_TIMEOUT
+            argv, capture_output=True, text=True, timeout=SSH_TIMEOUT
         )
         if not result.stdout.strip():
             return host, None, "no output"
@@ -380,7 +417,8 @@ def edit_config():
         CONFIG_FILE.write_text(
             "# GPU monitor hosts — one SSH host per line\n"
             "# jump=thor       # optional jump host\n"
-            "# baram\n"
+            f"# {LOCAL_HOST:<14}# this machine, without SSH\n"
+            f"# {socket.gethostname().split('.', 1)[0]:<14}# so is this machine's own hostname\n"
             "# namu\n"
         )
     editor = os.environ.get("EDITOR", "vi")
@@ -462,7 +500,8 @@ def parse_args(argv):
         epilog=(
             f"Config file: {CONFIG_FILE}\n"
             "  jump=thor       # optional jump host\n"
-            "  baram\n"
+            f"  {LOCAL_HOST}           # this machine, polled without SSH\n"
+            "  baram           # this machine's own hostname works too\n"
             "  namu\n"
         ),
     )
