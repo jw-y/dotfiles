@@ -612,20 +612,26 @@ it "use suggests a near-miss name";      assert_contains "$(cdx "$D" use wrok)" 
 it "unknown profile is an error";        assert_fails env HOME="$D" PATH="$D/bin:/usr/bin:/bin" CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" "$CDX" use nope
 
 # ---------------------------------------------------------- dependencies -----
-# Both are checked before dispatch, so the failure names the missing program
-# instead of surfacing as a listing that dies inside a heredoc.
+# codex is checked before dispatch, so the failure names the missing program
+# instead of surfacing as a listing that dies part-way through.
+#
+# python3 is no longer checked, and cannot be: cdx is written in it, so a
+# machine without it fails at the shebang with env's own message before any
+# cdx code runs. That is the one behaviour the port gave up — the bash version
+# printed "python3 is not on PATH", which was a kindness to a host that cdx
+# was about to be copied onto by 'cdx ssh'. What must still hold is that it
+# fails loudly rather than half-working, which is what this asserts.
 echo "${DIM}dependencies${OFF}"
-# bash by absolute path: these sandboxes exist to omit programs, and env
-# resolves the interpreter itself through the same stripped PATH.
 dep_env() {
     env -i HOME="$D" PATH="$ROOT/$1" NO_COLOR=1 TERM=dumb \
         CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" \
-        "$(command -v bash)" "$CDX" list 2>&1
+        "$CDX" list 2>&1
 }
 mkdir -p "$ROOT/nopy" "$ROOT/nocodex"
 cp "$D/bin/codex" "$ROOT/nopy/codex"
 ln -sf "$(command -v python3)" "$ROOT/nocodex/python3"
-it "names a missing python3";            assert_contains "$(dep_env nopy)" "python3 is not on PATH"
+it "refuses to run without python3";     assert_fails env -i HOME="$D" PATH="$ROOT/nopy" \
+    CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" "$CDX" list
 it "names a missing codex";              assert_contains "$(dep_env nocodex)" "codex is not on PATH"
 
 # ---------------------------------------------------- process matching -----

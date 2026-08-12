@@ -1,22 +1,59 @@
-#!/usr/bin/env bash
-# cdx — run Codex under a named account profile (separate CODEX_HOME per account).
-set -euo pipefail
+#!/usr/bin/env python3
+"""cdx — run Codex under a named account profile (separate CODEX_HOME per account).
 
-SELF="${BASH_SOURCE[0]}"
-PROFILES="${CODEX_PROFILES:-$HOME/.codex-profiles}"
+Ported from the bash implementation. The behaviour is the contract — every
+string, exit code and side effect below is asserted by tests/cdx.test.sh, which
+drives this file as a subprocess and therefore never had to know which language
+it was written in.
+
+Why Python: the tool already required python3 to start, because the account
+column decodes a JWT, the quota column speaks HTTP and JSON, and the typo
+suggester ranks edit distances. Three heredocs of Python inside a shell script
+is the shell telling you what the program is. The two bugs that cost the most
+were both bash-shaped — 'read a b c' silently packing the tail into c, and two
+hand-rolled string trims that were meant to be one rule — and neither is
+expressible here.
+
+What was lost: 'cdx link' used to run with neither codex nor python3 on PATH,
+because a repair command should not depend on the thing it repairs. It now
+needs the interpreter it is written in. Every machine this runs on has
+python3 3.10+, which is why that trade was acceptable.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SELF = Path(__file__).resolve()
+HOME = Path(os.path.expanduser("~"))
+PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
 
 # Every Codex client — CLI, desktop app, VS Code, the app's remote bootstrap —
 # reads ~/.codex. Once that path is a symlink to a profile, "activating" an
 # account is just re-pointing it, and no client needs to know about CODEX_HOME.
 # Before 'cdx init' it is still a real directory, which is the 'main' profile.
-CODEX_LINK="${CDX_CODEX_LINK:-${CODEX_MAIN_HOME:-$HOME/.codex}}"
-
-# True once 'cdx init' has replaced ~/.codex with a switchable symlink.
-initialized() { [ -L "$CODEX_LINK" ]; }
+CODEX_LINK = Path(os.environ.get("CDX_CODEX_LINK")
+                  or os.environ.get("CODEX_MAIN_HOME")
+                  or HOME / ".codex")
 
 # The store holds the one real copy of everything profiles share. It is NOT a
 # profile: it has no credentials, never becomes active, and the leading dot
-# keeps it out of the "$PROFILES"/*/ glob that enumerates profiles.
+# keeps it out of the glob that enumerates profiles.
 #
 # Giving it its own directory is the whole point of the layout. When the store
 # lived inside whichever profile happened to be first ('main'), that profile
@@ -25,18 +62,7 @@ initialized() { [ -L "$CODEX_LINK" ]; }
 # record where it went. Here every profile is equal and disposable, and every
 # link points at a path that never moves — which is what lets 'cdx link'
 # reconstruct any profile's links from scratch at any time.
-STORE="$PROFILES/.store"
-
-stored() { [ -d "$STORE" ]; }
-
-# Where the shared originals actually live. Before 'cdx init' there is only
-# ~/.codex; an install predating the store still keeps them in 'main'.
-shared_src() {
-    if stored; then echo "$STORE"
-    elif initialized; then echo "$PROFILES/main"
-    else echo "$CODEX_LINK"
-    fi
-}
+STORE = PROFILES / ".store"
 
 # Config, shared so settings live in one place, not N copies. Safe to replace
 # with a link if a profile has its own: nothing here is unrecoverable.
@@ -46,10 +72,11 @@ shared_src() {
 # renamed over the target, which destroys the symlink. Treating it as history
 # meant link_shared saw a real file, assumed private conversations, and
 # refused; the app-server then recreated it after every relink, so the profile
-# could never rejoin the store. It holds a job queue (stage1_outputs, jobs)
-# that Codex rebuilds, not anything a user typed.
-SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
-        custom-instructions.md models_cache.json memories_1.sqlite)
+# could never rejoin the store. It holds a job queue that Codex rebuilds, not
+# anything a user typed.
+SHARED_FILES = ["config.toml", "AGENTS.md", "AGENTS.override.md",
+                "instructions.md", "custom-instructions.md",
+                "models_cache.json", "memories_1.sqlite"]
 
 # Same idea, but these hold irreplaceable history, so a real file is never
 # overwritten to make room for the link. state_5.sqlite is the index 'resume'
@@ -62,7 +89,7 @@ SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
 # files. state_5.sqlite carries auto-generated titles but leaves its 'name'
 # column empty, so leaving these per-profile split your own thread names by
 # whichever account happened to be active when you set them.
-SHARED_DATA=(state_5.sqlite session_index.jsonl history.jsonl)
+SHARED_DATA = ["state_5.sqlite", "session_index.jsonl", "history.jsonl"]
 
 # Version-keyed download caches, identical for every account: the Codex binary
 # (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
@@ -72,252 +99,292 @@ SHARED_DATA=(state_5.sqlite session_index.jsonl history.jsonl)
 # attachments/, generated_images/ and visualizations/ are keyed by thread id,
 # exactly like the transcripts in sessions/. Keeping them per-profile meant a
 # thread resumed under a different account could not find its own files.
-SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions
-             attachments generated_images visualizations)
+SHARED_DIRS = ["packages", "plugins", "cache", "skills", "rules", "sessions",
+               "archived_sessions", "attachments", "generated_images",
+               "visualizations"]
+
+SWITCH_LOCK = PROFILES / ".cdx-switch.lock"
+QUOTA_WARN_PERCENT = int(os.environ.get("CDX_QUOTA_WARN") or 90)
 
 
-# Color is interactive-only by default. NO_COLOR always wins; JSON never uses it.
-COLOR_MODE="${CDX_COLOR:-auto}"
-C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_DIM=""
-if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
-    case "$COLOR_MODE" in
-        auto) [ -t 1 ] && COLOR_MODE=always || COLOR_MODE=never ;;
-        always|never) ;;
-        *) printf 'cdx: invalid CDX_COLOR=%s (use auto, always, or never)\n' "$COLOR_MODE" >&2; exit 1 ;;
-    esac
-fi
-if [ "$COLOR_MODE" = always ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
-    C_RESET=$'\033[0m'
-    C_RED=$'\033[31m'
-    C_GREEN=$'\033[32m'
-    C_YELLOW=$'\033[33m'
-    C_CYAN=$'\033[36m'
-    C_DIM=$'\033[2m'
-fi
-# Grouped by what you came here to do. The flat alphabetical list this
-# replaced put 'init' (run once, ever) above 'use' (run daily), and buried
-# each command's flags in the paragraph describing it.
-usage() {
-    cat <<EOF
-cdx — switch between Codex accounts.
+# ── colour ───────────────────────────────────────────────────────────────────
+# Interactive-only by default. NO_COLOR always wins; JSON never uses it.
+class C:
+    RESET = RED = GREEN = YELLOW = CYAN = DIM = ""
 
-Every Codex client — CLI, desktop app, VS Code, the app's SSH remote — reads
-$(tilde "$CODEX_LINK"). cdx makes that a symlink, so switching accounts is just
-re-pointing it and no client needs configuring.
 
-${C_CYAN}Every day${C_RESET}
-  cdx                      list accounts, with how much quota each has left
-  cdx use <name>           make <name> active for every client on this machine
-  cdx <name> [args...]     run one codex command as <name>, without switching
-  cdx status [name]        check an account (the active one by default)
-                           against what is running
+def _init_color() -> None:
+    mode = os.environ.get("CDX_COLOR", "auto")
+    if "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        if mode == "auto":
+            mode = "always" if sys.stdout.isatty() else "never"
+        elif mode not in ("always", "never"):
+            sys.stderr.write(
+                f"cdx: invalid CDX_COLOR={mode} (use auto, always, or never)\n")
+            raise SystemExit(1)
+    if mode == "always" and "NO_COLOR" not in os.environ \
+            and os.environ.get("TERM") != "dumb":
+        C.RESET, C.RED, C.GREEN = "\033[0m", "\033[31m", "\033[32m"
+        C.YELLOW, C.CYAN, C.DIM = "\033[33m", "\033[36m", "\033[2m"
 
-${C_CYAN}Managing accounts${C_RESET}
-  cdx add <name>           create <name> and log in
-  cdx rename <old> <new>   rename an account — any of them, 'main' included
-  cdx rm <name>            delete <name> and its credentials
 
-${C_CYAN}Other machines${C_RESET}
-  cdx app <name> [dir]     launch the desktop app as <name> (macOS only)
-  cdx ssh <host> [args...] run cdx on <host>, e.g. 'cdx ssh baram use work'
-                           (cdx ships itself; nothing to install there)
+def die(message: str) -> "NoReturn":  # type: ignore[valid-type]
+    sys.stderr.write(f"{C.RED}cdx: {message}{C.RESET}\n")
+    raise SystemExit(1)
 
-${C_CYAN}Setup and repair${C_RESET}
-  cdx init                 one-time: make $(tilde "$CODEX_LINK") a switchable link
-  cdx link                 rebuild every account's links to the store
 
-${C_CYAN}Options${C_RESET}
-  --refresh                take a live quota reading instead of the cached one
-  --no-usage               skip quota entirely
-  use --no-restart         leave running clients on the old account
-  use --dry-run            show what would change, and change nothing
-  add <name> [args...]     extra arguments pass through to 'codex login'
-  app <name> [dir] --stock reuse the app's existing ChatGPT desktop login
-  init -y / rm <name> -y   skip the confirmation prompt
-  status <name>            report that account instead of the active one
-  status --json            machine-readable, with the raw quota figures
+def out(text: str = "") -> None:
+    sys.stdout.write(text + "\n")
 
-${C_CYAN}Layout${C_RESET}
-  accounts  $(tilde "$PROFILES")/<name>
-  shared    $(tilde "$STORE")
-  An account holds only its credentials and logs. Everything shareable —
-  config, conversations, memories, attachments, caches — lives once in the
-  store and is symlinked into each account, so accounts stay a few hundred KB,
-  'resume' finds your work whichever account is active, and any account can be
-  renamed or deleted. 'cdx link' rebuilds those symlinks if Codex overwrites
-  one.
 
-${C_CYAN}Environment${C_RESET}
-  CODEX_PROFILES           where accounts live
-  CDX_CODEX_LINK           the switchable link, normally $(tilde "$CODEX_LINK")
-  CDX_USAGE                off never asks OpenAI for quota; auto re-fetches
-                           once the cache is older than CDX_USAGE_TTL seconds
-                           (900). The default only fills an empty cache, so
-                           listing never waits on the network.
-  CDX_QUOTA_WARN           percent at which 'use' warns you (90)
-  CDX_COLOR                auto, always or never (NO_COLOR also disables it)
-  CDX_NO_KILL=1            report which processes would be stopped, stop none
-EOF
-}
+# ── layout ───────────────────────────────────────────────────────────────────
+def initialized() -> bool:
+    """True once 'cdx init' has replaced ~/.codex with a switchable symlink."""
+    return CODEX_LINK.is_symlink()
 
-die() { printf '%scdx: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 
-validate_name() {
-    case "$1" in
-        ""|*[!A-Za-z0-9._-]*)
-            die "invalid profile name '$1' (use letters, numbers, '.', '_' or '-')"
-            ;;
-        # A leading dot is how cdx marks its own directories ($STORE, the switch
-        # lock). Without this, 'cdx rm .store' would resolve to the store and
-        # delete every profile's shared history.
-        .*)
-            die "invalid profile name '$1' (names starting with '.' are reserved for cdx)"
-            ;;
-    esac
-}
+def stored() -> bool:
+    return STORE.is_dir()
 
-home_of() {
-    if [ "$1" = "main" ] && ! initialized; then echo "$CODEX_LINK"; return; fi
-    echo "$PROFILES/$1"
-}
 
-# Portable equivalent of `readlink -f` for an existing directory. macOS's
-# readlink has no -f, while pwd -P resolves every symlink in the path.
-resolve_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+def shared_src() -> Path:
+    """Where the shared originals actually live.
 
-# Name of the profile ~/.codex currently points at.
-active_profile() {
-    initialized || { echo main; return; }
-    basename "$(readlink "$CODEX_LINK")"
-}
+    Before 'cdx init' there is only ~/.codex; an install predating the store
+    still keeps them in 'main'.
+    """
+    if stored():
+        return STORE
+    if initialized():
+        return PROFILES / "main"
+    return CODEX_LINK
 
-# Serialize account switches so symlink changes and process restarts cannot race.
-SWITCH_LOCK="$PROFILES/.cdx-switch.lock"
-LOCK_HELD=0
 
-release_switch_lock() {
-    [ "$LOCK_HELD" = 1 ] || return 0
-    rm -f "$SWITCH_LOCK/pid" 2>/dev/null || true
-    rmdir "$SWITCH_LOCK" 2>/dev/null || true
-    LOCK_HELD=0
-}
+def validate_name(name: str) -> None:
+    if not name or re.search(r"[^A-Za-z0-9._-]", name):
+        die(f"invalid profile name '{name}' (use letters, numbers, '.', '_' or '-')")
+    # A leading dot is how cdx marks its own directories (the store, the switch
+    # lock). Without this, 'cdx rm .store' would resolve to the store and
+    # delete every profile's shared history.
+    if name.startswith("."):
+        die(f"invalid profile name '{name}' (names starting with '.' are reserved for cdx)")
 
-acquire_switch_lock() {
-    local owner=""
-    mkdir -p "$PROFILES"
-    if mkdir -m 700 "$SWITCH_LOCK" 2>/dev/null; then
-        printf '%s\n' "$$" > "$SWITCH_LOCK/pid"
-        LOCK_HELD=1
-        trap release_switch_lock EXIT
-        return 0
-    fi
-    [ ! -L "$SWITCH_LOCK" ] || die "unsafe switch lock is a symlink: $SWITCH_LOCK"
-    [ -f "$SWITCH_LOCK/pid" ] && read -r owner < "$SWITCH_LOCK/pid" || true
-    case "$owner" in
-        ''|*[!0-9]*) ;;
-        *) kill -0 "$owner" 2>/dev/null && die "another cdx switch is running (PID $owner)" ;;
-    esac
-    rm -f "$SWITCH_LOCK/pid" 2>/dev/null || true
-    rmdir "$SWITCH_LOCK" 2>/dev/null || die "stale switch lock needs inspection: $SWITCH_LOCK"
-    mkdir -m 700 "$SWITCH_LOCK" || die "could not acquire switch lock: $SWITCH_LOCK"
-    printf '%s\n' "$$" > "$SWITCH_LOCK/pid"
-    LOCK_HELD=1
-    trap release_switch_lock EXIT
-}
 
-# Codex homes contain refresh tokens and account-specific runtime state.
-secure_profile() {
-    local home="${1%/}"
-    [ -d "$home" ] || die "profile directory is missing: $home"
-    chmod 700 "$home" || die "could not set mode 0700 on $home"
-    if [ -e "$home/auth.json" ]; then
-        chmod 600 "$home/auth.json" || die "could not set mode 0600 on $home/auth.json"
-    fi
-}
+def home_of(name: str) -> Path:
+    if name == "main" and not initialized():
+        return CODEX_LINK
+    return PROFILES / name
 
-secure_all_profiles() {
-    local home
-    stored && chmod 700 "$STORE"
-    if ! initialized; then
-        secure_profile "$CODEX_LINK"
-    fi
-    for home in "$PROFILES"/*/; do
-        [ -d "$home" ] || continue
-        secure_profile "${home%/}"
-    done
-}
 
-# Symlink shared config from the main home into a profile. Codex writes
-# config.toml atomically on some edits, which replaces the symlink with a
-# real file — 'cdx link' puts it back.
-# True when $1 is already the link we would create. A link left over from an
-# older layout (pointing into a profile, or at a renamed path) is not, and
-# gets re-pointed — that repair is what makes the layout reconstructable.
-links_to() {
-    local path="$1" want="$2" tgt
-    [ -L "$path" ] || return 1
-    tgt="$(readlink "$path")"
-    [ "$tgt" = "$want" ]
-}
+def resolve_dir(path: Path) -> str:
+    """Every symlink in the path resolved, or '' when it does not exist."""
+    try:
+        return str(path.resolve(strict=True)) if path.is_dir() else ""
+    except OSError:
+        return ""
 
-link_shared() {
-    local home="${1%/}" f src
-    src="$(shared_src)"; src="${src%/}"
-    # The store links to nothing: it is the thing being linked to. The trailing
-    # slash from "$PROFILES"/*/ has to go first or this compare silently fails.
-    [ "$home" != "$src" ] || return 0
-    for f in "${SHARED_FILES[@]}"; do
-        [ -e "$src/$f" ] || continue
-        links_to "$home/$f" "$src/$f" && continue
+
+def active_profile() -> str:
+    if not initialized():
+        return "main"
+    return os.path.basename(os.readlink(CODEX_LINK))
+
+
+def profile_names() -> list[str]:
+    """Pre-migration 'main' is ~/.codex and not under PROFILES; afterwards it
+    is an ordinary profile the glob finds, so only add it in the first case."""
+    names = [] if initialized() else ["main"]
+    if PROFILES.is_dir():
+        for entry in sorted(PROFILES.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                names.append(entry.name)
+    return names
+
+
+def suggest_profile(name: str) -> str | None:
+    """Closest existing profile to a name that matched nothing — usually a typo.
+
+    Returns the best candidate within edit distance 2. Adjacent-swap counts as
+    one edit, since transpositions dominate real typos.
+    """
+    def dist(a: str, b: str) -> int:
+        rows = [list(range(len(b) + 1))]
+        for i, ca in enumerate(a, 1):
+            rows.append([i] + [0] * len(b))
+            for j, cb in enumerate(b, 1):
+                best = min(rows[i - 1][j] + 1, rows[i][j - 1] + 1,
+                           rows[i - 1][j - 1] + (ca != cb))
+                if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                    best = min(best, rows[i - 2][j - 2] + 1)
+                rows[i][j] = best
+        return rows[-1][-1]
+
+    cands = profile_names()
+    if not cands:
+        return None
+    best = min(cands, key=lambda c: dist(name.lower(), c.lower()))
+    return best if dist(name.lower(), best.lower()) <= 2 else None
+
+
+def missing_profile(name: str) -> "NoReturn":  # type: ignore[valid-type]
+    """What to say when <name> has no profile directory: point at the near-miss
+    if there is one, so a typo is not answered with 'cdx add <typo>'."""
+    hint = suggest_profile(name)
+    if hint:
+        die(f"no such profile: {name} (did you mean '{hint}'?)")
+    die(f"no such profile: {name} (try 'cdx add {name}')")
+
+
+# ── locking ──────────────────────────────────────────────────────────────────
+_lock_held = False
+
+
+def release_switch_lock() -> None:
+    global _lock_held
+    if not _lock_held:
+        return
+    try:
+        (SWITCH_LOCK / "pid").unlink()
+    except OSError:
+        pass
+    try:
+        SWITCH_LOCK.rmdir()
+    except OSError:
+        pass
+    _lock_held = False
+
+
+def acquire_switch_lock() -> None:
+    """Serialize account switches so symlink changes and process restarts
+    cannot race. mkdir is the atomic primitive, as in the shell version."""
+    global _lock_held
+    PROFILES.mkdir(parents=True, exist_ok=True)
+
+    def take() -> bool:
+        try:
+            os.mkdir(SWITCH_LOCK, 0o700)
+        except FileExistsError:
+            return False
+        (SWITCH_LOCK / "pid").write_text(f"{os.getpid()}\n")
+        return True
+
+    if take():
+        _lock_held = True
+        return
+    if SWITCH_LOCK.is_symlink():
+        die(f"unsafe switch lock is a symlink: {SWITCH_LOCK}")
+    owner = ""
+    try:
+        owner = (SWITCH_LOCK / "pid").read_text().split("\n", 1)[0].strip()
+    except OSError:
+        pass
+    if owner.isdigit():
+        try:
+            os.kill(int(owner), 0)
+            die(f"another cdx switch is running (PID {owner})")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            die(f"another cdx switch is running (PID {owner})")
+    try:
+        (SWITCH_LOCK / "pid").unlink()
+    except OSError:
+        pass
+    try:
+        SWITCH_LOCK.rmdir()
+    except OSError:
+        die(f"stale switch lock needs inspection: {SWITCH_LOCK}")
+    if not take():
+        die(f"could not acquire switch lock: {SWITCH_LOCK}")
+    _lock_held = True
+
+
+# ── permissions ──────────────────────────────────────────────────────────────
+def secure_profile(home: Path) -> None:
+    """Codex homes contain refresh tokens and account-specific runtime state."""
+    if not home.is_dir():
+        die(f"profile directory is missing: {home}")
+    try:
+        os.chmod(home, 0o700)
+    except OSError:
+        die(f"could not set mode 0700 on {home}")
+    auth = home / "auth.json"
+    if auth.exists():
+        try:
+            os.chmod(auth, 0o600)
+        except OSError:
+            die(f"could not set mode 0600 on {auth}")
+
+
+def secure_all_profiles() -> None:
+    if stored():
+        os.chmod(STORE, 0o700)
+    if not initialized():
+        secure_profile(CODEX_LINK)
+    if PROFILES.is_dir():
+        for entry in sorted(PROFILES.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                secure_profile(entry)
+
+
+# ── shared links ─────────────────────────────────────────────────────────────
+def links_to(path: Path, want: Path) -> bool:
+    """True when path is already the link we would create. A link left over
+    from an older layout (pointing into a profile, or at a renamed path) is
+    not, and gets re-pointed — that repair is what makes the layout
+    reconstructable."""
+    return path.is_symlink() and os.readlink(path) == str(want)
+
+
+def link_shared(home: Path) -> None:
+    src = shared_src()
+    # The store links to nothing: it is the thing being linked to.
+    if home == src:
+        return
+    for name in SHARED_FILES:
+        target, link = src / name, home / name
+        if not target.exists() or links_to(link, target):
+            continue
         # Safe to clobber: a real file here is a copy Codex wrote over the
         # link (it rewrites config.toml atomically), not unrecoverable data.
-        rm -f "$home/$f"
-        ln -s "$src/$f" "$home/$f"
-    done
-    # History: a real file here is this profile's own conversations or
-    # memories. Never delete one to make room for the link. A symlink is
-    # always safe to re-point, since the data is wherever it points.
-    for f in "${SHARED_DATA[@]}"; do
-        [ -e "$src/$f" ] || continue
-        links_to "$home/$f" "$src/$f" && continue
-        if [ -e "$home/$f" ] && [ ! -L "$home/$f" ]; then
-            echo "cdx: $home/$f is this profile's own — not shared. Move or" >&2
-            echo "     delete it, then 'cdx link', to join the shared history." >&2
+        _unlink(link)
+        os.symlink(target, link)
+    # History: a real file here is this profile's own conversations. Never
+    # delete one to make room for the link. A symlink is always safe to
+    # re-point, since the data is wherever it points.
+    for name in SHARED_DATA:
+        target, link = src / name, home / name
+        if not target.exists() or links_to(link, target):
             continue
-        fi
-        rm -f "$home/$f"
-        ln -s "$src/$f" "$home/$f"
-    done
-    # Directories: never rm -rf a real one, since that would be a profile's
-    # own data. Leave it alone and say so instead. Replacing a *link* is fine,
-    # and -n stops ln from descending into the old target directory.
-    for f in "${SHARED_DIRS[@]}"; do
-        [ -d "$src/$f" ] || continue
-        links_to "$home/$f" "$src/$f" && continue
-        if [ -d "$home/$f" ] && [ ! -L "$home/$f" ]; then
-            echo "cdx: $home/$f is this profile's own directory — left as is" >&2
+        if link.exists() and not link.is_symlink():
+            sys.stderr.write(
+                f"cdx: {link} is this profile's own — not shared. Move or\n"
+                f"     delete it, then 'cdx link', to join the shared history.\n")
             continue
-        fi
-        rm -f "$home/$f"
-        ln -sfn "$src/$f" "$home/$f"
-    done
-}
+        _unlink(link)
+        os.symlink(target, link)
+    # Directories: never remove a real one, since that would be a profile's
+    # own data. Leave it alone and say so instead. Replacing a *link* is fine.
+    for name in SHARED_DIRS:
+        target, link = src / name, home / name
+        if not target.is_dir() or links_to(link, target):
+            continue
+        if link.is_dir() and not link.is_symlink():
+            sys.stderr.write(
+                f"cdx: {link} is this profile's own directory — left as is\n")
+            continue
+        _unlink(link)
+        os.symlink(target, link)
 
-# The percentage out of a rendered USED cell. The cell carries more than the
-# number — a '~' when the figure could not be refreshed, and the window it
-# belongs to ('96%~ wk') — so both ends have to be trimmed, and every caller
-# has to trim them the same way. They did not: 'use' anchored its strip at the
-# end of the string, which silently yielded nothing as soon as the window
-# label was appended, and its quota warning could never fire. One rule, one
-# place. Prints the bare integer, or nothing if there is no usable figure.
-pct_of() {
-    local pct="${1%%\%*}"
-    case "$pct" in
-        ''|*[!0-9]*) return 1 ;;
-        *) printf '%s' "$pct" ;;
-    esac
-}
 
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+# ── quota ────────────────────────────────────────────────────────────────────
 # Live quota, per account. The number Codex shows in '/status' comes from
 # GET /wham/usage, which the CLI itself polls while it runs; asking for it
 # directly is the only way to get a per-account figure here, because the
@@ -329,44 +396,27 @@ pct_of() {
 # (Codex refreshes access tokens behind them), so a date column would report
 # alarm on accounts that are fine. A 401 here means the refresh token itself
 # is dead and the account needs 'cdx add' again — that is worth showing.
-USAGE_ENDPOINT="${CDX_USAGE_ENDPOINT:-https://chatgpt.com/backend-api/wham/usage}"
-# The request carries a live access token, so the destination is checked before
-# it is sent anywhere: 'http://' would put the token on the wire in clear, and
-# any other scheme is a typo worth catching. 'file://' is how the tests point
-# it at a fixture, and reads nothing over the network.
-case "$USAGE_ENDPOINT" in
-    https://*|file://*) ;;
-    *) die "refusing to send credentials to CDX_USAGE_ENDPOINT=$USAGE_ENDPOINT (https:// or file:// only)" ;;
-esac
+USAGE_ENDPOINT = os.environ.get(
+    "CDX_USAGE_ENDPOINT", "https://chatgpt.com/backend-api/wham/usage")
 
-# One process for every profile: the requests run concurrently, so a cold
-# cache costs one timeout rather than one per account, and an offline machine
-# stalls once. Answers are cached per profile so the common 'cdx' listing is
-# a local read. Emits one US-separated row per profile:
-#   name, mode, account, plan, used, resets, state, age, refreshed, note,
-#   credits (spelled out, for 'status')
-profile_rows() {
-    local force="${1:-0}"; shift
-    python3 - "$force" "${CDX_USAGE:-cache}" "$USAGE_ENDPOINT" "${CDX_USAGE_TTL:-900}" "$@" <<'PY'
-import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
-force, mode, endpoint, ttl, *pairs = sys.argv[1:]
-force = force == "1"
-ttl = int(ttl)
+def _check_endpoint() -> None:
+    """The request carries a live access token, so the destination is checked
+    before it is sent anywhere: 'http://' would put the token on the wire in
+    clear, and any other scheme is a typo worth catching. 'file://' is how the
+    tests point it at a fixture, and reads nothing over the network."""
+    if not (USAGE_ENDPOINT.startswith("https://")
+            or USAGE_ENDPOINT.startswith("file://")):
+        die(f"refusing to send credentials to CDX_USAGE_ENDPOINT={USAGE_ENDPOINT}"
+            " (https:// or file:// only)")
 
-def claims(token):
-    try:
-        payload = token.split(".")[1]
-        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-    except Exception:
-        return {}
 
-# urllib replays the original headers on a 30x — it drops only content-length
-# and content-type — so a redirect off chatgpt.com would hand the access token
-# to whatever host answered. Keep it on redirects that stay on the same host,
-# strip it otherwise.
 class SameHostAuth(urllib.request.HTTPRedirectHandler):
+    """urllib replays the original headers on a 30x — it drops only
+    content-length and content-type — so a redirect off chatgpt.com would hand
+    the access token to whatever host answered. Keep it on redirects that stay
+    on the same host, strip it otherwise."""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and urllib.parse.urlsplit(newurl).netloc != \
@@ -374,13 +424,27 @@ class SameHostAuth(urllib.request.HTTPRedirectHandler):
             new.remove_header("Authorization")
         return new
 
-opener = urllib.request.build_opener(SameHostAuth)
 
-# Cached inside the profile, not the store: it is per-account by definition.
-def quota(home, token):
-    cache = os.path.join(home, ".cdx-usage.json")
+_opener = urllib.request.build_opener(SameHostAuth)
+
+
+def _claims(token: str) -> dict:
     try:
-        with open(cache) as fh: cached = json.load(fh)
+        payload = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(
+            payload + "=" * (-len(payload) % 4)))
+    except Exception:
+        return {}
+
+
+def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
+    """Cached inside the profile, not the store: it is per-account by definition."""
+    mode = os.environ.get("CDX_USAGE", "cache")
+    ttl = int(os.environ.get("CDX_USAGE_TTL") or 900)
+    force = _quota.force  # type: ignore[attr-defined]
+    cache = home / ".cdx-usage.json"
+    try:
+        cached = json.loads(cache.read_text())
     except Exception:
         cached = None
     if mode == "off" or not token:
@@ -392,16 +456,16 @@ def quota(home, token):
     if cached and not force and (mode == "cache"
                                  or time.time() - cached.get("fetched_at", 0) < ttl):
         return cached, "cache"
-    req = urllib.request.Request(endpoint, headers={
+    req = urllib.request.Request(USAGE_ENDPOINT, headers={
         "Authorization": "Bearer " + token, "User-Agent": "cdx"})
     try:
-        with opener.open(req, timeout=5) as fh:
+        with _opener.open(req, timeout=5) as fh:
             body = json.load(fh)
-    except urllib.error.HTTPError as e:
+    except urllib.error.HTTPError as exc:
         # 401/403 is the signal we actually care about: the credentials are
         # no longer usable, whatever the token dates claim.
         rec = dict(cached or {})
-        rec["state"] = "relogin" if e.code in (401, 403) else "error"
+        rec["state"] = "relogin" if exc.code in (401, 403) else "error"
         return rec, "live"
     except Exception:
         # Offline, DNS failure, timeout: fall back to whatever we knew last.
@@ -428,10 +492,7 @@ def quota(home, token):
     #
     # What it is NOT used for is a verdict. 'has_credits: false' reads like
     # 'spent' and actually means 'this account does not use credits at all' —
-    # it is what the subscriptions report. Deriving exhaustion from it marked
-    # every working account empty and left the one genuinely out of credits
-    # as unknown. Until the field carrying a real balance is identified, this
-    # records what the endpoint said and claims nothing about it.
+    # it is what the subscriptions report.
     credits = limits.get("credits") or body.get("credits") or {}
     # The third axis, and the only one that catches an admin-set budget. An
     # account over its monthly credit allowance reports allowed=true,
@@ -445,37 +506,56 @@ def quota(home, token):
            "windows": windows, "plan": body.get("plan_type"),
            "email": body.get("email"),
            "credits": credits or None, "spend_control": spend or None,
-           # 'allowed' false means this account is refusing work right now,
-           # which a percentage alone does not say.
            "state": "spendlimit" if spend.get("reached") else
                     "blocked" if limits.get("limit_reached")
                                  or limits.get("allowed") is False else "ok"}
     try:
-        tmp = cache + ".tmp"
-        with open(tmp, "w") as fh: json.dump(rec, fh)
+        tmp = cache.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec))
         os.chmod(tmp, 0o600)
         os.replace(tmp, cache)
     except Exception:
         pass
     return rec, "live"
 
-def row(pair):
-    name, home = pair.split("=", 1)
+
+_quota.force = False  # type: ignore[attr-defined]
+
+
+@dataclass
+class Row:
+    """One account's line. A record rather than a delimited string: the shell
+    version packed these into unit-separated fields and read them back
+    positionally, which silently shifted every column left the moment a field
+    was added."""
+    name: str
+    kind: str = "-"
+    account: str = ""
+    plan: str = ""
+    used: str = ""
+    resets: str = ""
+    state: str = ""
+    age: int | None = None
+    refreshed: str = ""
+    note: str = ""
+    allowance: str = ""
+
+
+def _row(name: str, home: Path) -> Row:
     try:
-        with open(os.path.join(home, "auth.json")) as fh: auth = json.load(fh)
-    # Every return has to carry the full field count: bash reads these
-    # positionally, so a short row shifts every later column left.
+        auth = json.loads((home / "auth.json").read_text())
     except FileNotFoundError:
-        return (name, "-", "not logged in", "", "", "", "none", "", "", "", "")
+        return Row(name, "-", "not logged in", state="none")
     except Exception:
-        return (name, "-", "unreadable auth.json", "", "", "", "bad", "", "", "", "")
+        return Row(name, "-", "unreadable auth.json", state="bad")
     tokens = auth.get("tokens") or {}
     kind = auth.get("auth_mode") or ("apikey" if auth.get("OPENAI_API_KEY") else "?")
-    c = claims(tokens.get("id_token") or "")
-    who = c.get("email") or (tokens.get("account_id") or "")[:8] or "?"
-    plan = (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
-    rec, src = quota(home, tokens.get("access_token"))
+    claims = _claims(tokens.get("id_token") or "")
+    who = claims.get("email") or (tokens.get("account_id") or "")[:8] or "?"
+    plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
+    rec, src = _quota(home, tokens.get("access_token"))
     rec = rec or {}
+
     used = resets = ""
     if rec.get("used") is not None:
         # '~' marks a figure we could not refresh, so a stale number is never
@@ -492,1053 +572,1054 @@ def row(pair):
         # window closing in five hours renders as today's date, which reads as
         # already reset.
         left = rec["reset_at"] - time.time()
-        if left <= 0:      rel = "now"
-        elif left < 3600:  rel = f"in {round(left / 60)}m"
-        elif left < 86400: rel = f"in {round(left / 3600)}h"
-        else:              rel = f"in {round(left / 86400)}d"
-        # Wall clock first, countdown in parentheses. A reset that has already
-        # rolled over has no useful clock time left to print, so it is just
-        # 'now'. Last column on the line, so the extra width costs nothing.
+        if left <= 0:
+            rel = "now"
+        elif left < 3600:
+            rel = f"in {round(left / 60)}m"
+        elif left < 86400:
+            rel = f"in {round(left / 3600)}h"
+        else:
+            rel = f"in {round(left / 86400)}d"
         resets = rel if left <= 0 else \
             time.strftime("%b %d %H:%M", time.localtime(rec["reset_at"])) + f" ({rel})"
-    # Age of the figure, so the caller can say how old the numbers are rather
-    # than presenting a cached percentage as though it were current.
-    age = ""
-    if rec.get("fetched_at"):
-        age = str(int(time.time() - rec["fetched_at"]))
-    # One cell for whatever qualifies the percentage, since the percentage on
-    # its own is not the whole story: an account can be at 16% and unusable.
-    # Blank unless there is something to say, which is what keeps the column
-    # off an install where every account is simply fine.
-    #
-    # A stated balance is shown as-is; a subscription reports
-    # 'has_credits: false' with a zero balance attached, and printing that
-    # zero would read as 'spent' on an account that does not use credits.
+
+    age = int(time.time() - rec["fetched_at"]) if rec.get("fetched_at") else None
     cr = rec.get("credits") or {}
     # Codex models a spend limit as {limit, remaining_percent, resets_at}, but
     # only fills it in for a limit set on the individual. A budget set on the
     # workspace arrives as the bare 'reached' boolean — no numbers exist to
     # show, on this endpoint or any other the CLI knows.
     ind = (rec.get("spend_control") or {}).get("individual_limit") or {}
-    state = rec.get("state") or ""
-    if state == "relogin":      note = "re-login"
-    elif state == "spendlimit": note = "spend limit"
-    elif state == "blocked":    note = "rate limited"
+    state = rec.get("state") or ("none" if not rec else "")
+
+    if state == "relogin":
+        note = "re-login"
+    elif state == "spendlimit":
+        note = "spend limit"
+    elif state == "blocked":
+        note = "rate limited"
     elif ind.get("remaining_percent") is not None:
         note = f"{round(ind['remaining_percent'])}% budget"
-    elif cr.get("unlimited"):   note = "unlimited"
+    elif cr.get("unlimited"):
+        note = "unlimited"
     elif cr.get("has_credits") is True and cr.get("balance") is not None:
         note = str(cr["balance"])
-    else:                       note = ""
-    # When the credentials were last renewed. Carried here rather than decoded
-    # a second time by 'status', which used to run a whole separate helper to
-    # slice this one date off the end of a formatted line.
+    else:
+        note = ""
+
     # Spelled out for 'status' only. The listing stays silent when there is no
     # balance to show; a diagnostic is the one place where "the endpoint
     # reports none" beats an empty cell you have to interpret.
     if ind.get("remaining_percent") is not None:
-        # An individual spend budget is the one allowance that comes with real
-        # numbers, so it wins the line when it exists.
-        credit_desc = f"{round(ind['remaining_percent'])}% of the spend budget left"
+        allowance = f"{round(ind['remaining_percent'])}% of the spend budget left"
         if ind.get("limit"):
-            credit_desc += f" (limit {ind['limit']})"
-    elif not cr:                     credit_desc = "not reported"
-    elif cr.get("unlimited"):        credit_desc = "unlimited"
+            allowance += f" (limit {ind['limit']})"
+    elif not cr:
+        allowance = "not reported"
+    elif cr.get("unlimited"):
+        allowance = "unlimited"
     elif cr.get("has_credits") is False:
-        credit_desc = "not used on this plan"
+        allowance = "not used on this plan"
     elif cr.get("balance") is not None:
-        credit_desc = str(cr["balance"])
+        allowance = str(cr["balance"])
     else:
         # has_credits true with no balance: the account spends credits but the
         # figure is held by the workspace, not this endpoint.
-        credit_desc = "used, but the balance is not exposed here"
-    return (name, kind, rec.get("email") or who, rec.get("plan") or plan,
-            used, resets, state or ("none" if not rec else ""), age,
-            (auth.get("last_refresh") or "?")[:10], note, credit_desc)
+        allowance = "used, but the balance is not exposed here"
 
-# Unit separator, not tab: tab is an IFS whitespace character, so bash's 'read'
-# collapses runs of them and an empty column would silently shift every later
-# field left — which is exactly how the state ended up in the USED column.
-with ThreadPoolExecutor(max_workers=8) as pool:
-    for r in pool.map(row, pairs):
-        print("\x1f".join(str(x) for x in r))
-PY
-}
+    return Row(name, kind, rec.get("email") or who, rec.get("plan") or plan,
+               used, resets, state, age,
+               (auth.get("last_refresh") or "?")[:10], note, allowance)
 
-# Pre-migration 'main' is ~/.codex and not under $PROFILES; afterwards it
-# is an ordinary profile the glob finds, so only add it in the first case.
-profile_names() {
-    local home
-    initialized || echo main
-    if [ -d "$PROFILES" ]; then
-        for home in "$PROFILES"/*/; do
-            [ -d "$home" ] || continue
-            basename "$home"
-        done
-    fi
-}
 
-# Closest existing profile to a name that matched nothing — usually a typo.
-# Prints the best candidate within edit distance 2, or fails. Adjacent-swap
-# counts as one edit, since transpositions dominate real typos.
-suggest_profile() {
-    local name="$1" names=() n
-    while IFS= read -r n; do names+=("$n"); done < <(profile_names)
-    [ ${#names[@]} -gt 0 ] || return 1
-    python3 - "$name" "${names[@]}" <<'PY'
-import sys
-name, *cands = sys.argv[1:]
-def dist(a, b):
-    rows = [list(range(len(b) + 1))]
-    for i, ca in enumerate(a, 1):
-        rows.append([i] + [0] * len(b))
-        for j, cb in enumerate(b, 1):
-            best = min(rows[i - 1][j] + 1, rows[i][j - 1] + 1,
-                       rows[i - 1][j - 1] + (ca != cb))
-            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
-                best = min(best, rows[i - 2][j - 2] + 1)
-            rows[i][j] = best
-    return rows[-1][-1]
-best = min(cands, key=lambda c: dist(name.lower(), c.lower()))
-if dist(name.lower(), best.lower()) <= 2:
-    print(best)
-else:
-    sys.exit(1)
-PY
-}
+def profile_rows(names: list[str], *, force: bool = False) -> list[Row]:
+    """One request per profile, concurrently: a cold cache costs one timeout
+    rather than one per account, and an offline machine stalls once."""
+    _quota.force = force  # type: ignore[attr-defined]
+    if not names:
+        return []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(lambda n: _row(n, home_of(n)), names))
 
-# What to say when <name> has no profile directory: point at the near-miss
-# if there is one, so a typo is not answered with 'cdx add <typo>'.
-missing_profile() {
-    local name="$1" hint
-    if hint="$(suggest_profile "$name")"; then
-        die "no such profile: $name (did you mean '$hint'?)"
-    fi
-    die "no such profile: $name (try 'cdx add $name')"
-}
 
-list_profiles() {
-    local names=() pairs=() n home active mark force=0 relogin=0 oldest=0
-    local kind acct plan used resets state age
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            # Quota is cached, so the listing stays a local read; --refresh is
-            # how you ask for a live figure before deciding where to switch.
-            --refresh) force=1 ;;
-            --no-usage) CDX_USAGE=off ;;
-            *) die "unknown option to 'list': $1" ;;
-        esac
-        shift
-    done
-    while IFS= read -r n; do names+=("$n"); done < <(profile_names)
-    active="$(active_profile)"
-    for n in "${names[@]}"; do pairs+=("$n=$(home_of "$n")"); done
+def pct_of(used: str) -> int | None:
+    """The percentage out of a rendered USED cell.
 
-    # Buffered, not streamed, so the columns can be sized to the content: fixed
-    # widths either truncate a long account or leave a gutter of blanks for
-    # everyone who has short ones. No borders — this output gets piped and
-    # grepped, and box drawing costs more there than the neatness is worth.
-    local rows=() row wn=4 wk=4 wa=7 wp=4 wu=4 note
-    # The trailing '_' is load-bearing: 'read' packs every remaining field into
-    # its last variable, so without it the next column added upstream lands
-    # inside the previous one rather than being ignored.
-    while IFS=$'\037' read -r n kind acct plan used resets state age _ note _; do
-        [ -z "$age" ] || [ "$age" -le "$oldest" ] || oldest="$age"
+    The cell carries more than the number — a '~' when the figure could not be
+    refreshed, and the window it belongs to ('96%~ wk'). One rule, one place:
+    the shell version had two, which diverged the moment the window label was
+    appended and silently disabled the quota warning.
+    """
+    head = used.split("%", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+# ── listing ──────────────────────────────────────────────────────────────────
+def list_profiles(argv: list[str]) -> int:
+    force = False
+    for arg in argv:
+        if arg == "--refresh":
+            force = True
+        elif arg == "--no-usage":
+            os.environ["CDX_USAGE"] = "off"
+        else:
+            die(f"unknown option to 'list': {arg}")
+
+    names = profile_names()
+    active = active_profile()
+    rows = profile_rows(names, force=force)
+
+    relogin = any(r.state == "relogin" for r in rows)
+    oldest = max([r.age or 0 for r in rows], default=0)
+    for r in rows:
         # An account that cannot run takes over the USED cell rather than
         # earning a column of its own: the percentage is not what stopped it,
         # so it is not the thing to read. 'status' still gives both.
-        case "$state" in
-            relogin) relogin=1 ;;&
-            relogin|blocked|spendlimit) used="$note" ;;
-        esac
-        [ ${#n} -le $wn ] || wn=${#n}
-        [ ${#kind} -le $wk ] || wk=${#kind}
-        [ ${#acct} -le $wa ] || wa=${#acct}
-        [ ${#plan} -le $wp ] || wp=${#plan}
-        [ ${#used} -le $wu ] || wu=${#used}
-        rows+=("$n"$'\037'"$kind"$'\037'"$acct"$'\037'"$plan"$'\037'"$used"$'\037'"$resets"$'\037'"$state")
-    done < <(profile_rows "$force" ${pairs[@]+"${pairs[@]}"})
+        if r.state in ("relogin", "blocked", "spendlimit"):
+            r.used = r.note
 
-    printf '%s   %-*s  %-*s  %-*s  %-*s  %*s  %s%s\n' "$C_DIM" \
-        $wn NAME $wk MODE $wa ACCOUNT $wp PLAN $wu USED RESETS "$C_RESET"
-    local color pct pad
-    for row in "${rows[@]}"; do
-        IFS=$'\037' read -r n kind acct plan used resets state <<< "$row"
-        # A variable, not $(... && echo ' *' || echo '  ') — command
-        # substitution strips the trailing space and misaligns the column.
-        if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
+    # Widths follow the content: fixed ones either truncate a long account or
+    # leave a gutter of blanks for everyone who has short ones.
+    wn = max([len("NAME")] + [len(r.name) for r in rows])
+    wk = max([len("MODE")] + [len(r.kind) for r in rows])
+    wa = max([len("ACCOUNT")] + [len(r.account) for r in rows])
+    wp = max([len("PLAN")] + [len(r.plan) for r in rows])
+    wu = max([len("USED")] + [len(r.used) for r in rows])
+
+    out(f"{C.DIM}   {'NAME':<{wn}}  {'MODE':<{wk}}  {'ACCOUNT':<{wa}}  "
+        f"{'PLAN':<{wp}}  {'USED':>{wu}}  RESETS{C.RESET}")
+    for r in rows:
+        mark = " *" if r.name == active else "  "
+        pct = pct_of(r.used)
         # Colour tracks whichever limit actually stops this account, which is
         # not always the percentage: a spent balance sits at a LOW percentage
-        # precisely because it cannot spend, so colouring that cell green would
-        # advertise room on an account that can do nothing. Green means "you
-        # can work here" and has to keep meaning exactly that.
-        pct="$(pct_of "$used" || true)"
-        color=""
-        case "$state" in
-            # Unusable for a reason the percentage cannot express, so the cell
-            # says the reason instead, in red. Green has to keep meaning "you
-            # can work here" — an account over its spend limit sits at 16%.
-            relogin|blocked|spendlimit) color="$C_RED" ;;
-            *) case "$pct" in
-                   ''|*[!0-9]*) ;;
-                   *) if   [ "$pct" -ge "$QUOTA_WARN_PERCENT" ]; then color="$C_RED"
-                      elif [ "$pct" -ge 60 ]; then color="$C_YELLOW"
-                      else color="$C_GREEN"; fi ;;
-               esac ;;
-        esac
-        # Padding is applied before the escapes are wrapped around it: printf
-        # counts those invisible bytes as width and would misalign every later
-        # column.
-        printf -v pad '%*s' $wu "$used"
-        printf '%s %-*s  %-*s  %-*s  %s%-*s%s  %s%s%s' \
-            "$mark" $wn "$n" $wk "$kind" $wa "$acct" \
-            "$C_DIM" $wp "$plan" "$C_RESET" "$color" "$pad" "$C_RESET"
-        printf '  %s%s%s\n' "$C_DIM" "$resets" "$C_RESET"
-    done
+        # precisely because it cannot spend. Green means "you can work here"
+        # and has to keep meaning exactly that.
+        if r.state in ("relogin", "blocked", "spendlimit"):
+            color = C.RED
+        elif pct is None:
+            color = ""
+        elif pct >= QUOTA_WARN_PERCENT:
+            color = C.RED
+        elif pct >= 60:
+            color = C.YELLOW
+        else:
+            color = C.GREEN
+        out(f"{mark} {r.name:<{wn}}  {r.kind:<{wk}}  {r.account:<{wa}}  "
+            f"{C.DIM}{r.plan:<{wp}}{C.RESET}  {color}{r.used:>{wu}}{C.RESET}  "
+            f"{C.DIM}{r.resets}{C.RESET}")
+
     # The default never re-fetches, so the figures have to say how old they are
     # — an unlabelled percentage reads as current no matter when it was taken.
-    if [ "$oldest" -ge 300 ]; then
-        local ago
-        if   [ "$oldest" -lt 3600 ];  then ago="$((oldest / 60))m"
-        elif [ "$oldest" -lt 86400 ]; then ago="$((oldest / 3600))h"
-        else                               ago="$((oldest / 86400))d"
-        fi
-        printf '%s   quota measured %s ago — %s for live figures%s\n' \
-            "$C_YELLOW" "$ago" "'cdx --refresh'" "$C_RESET"
-    fi
-    if [ "$relogin" = 1 ]; then
-        printf '\n%s(re-login: the account was rejected — its refresh token is dead.%s\n' "$C_YELLOW" "$C_RESET"
-        printf '%s run "cdx add <name>" to sign in again.)%s\n' "$C_YELLOW" "$C_RESET"
-    fi
-    if ! initialized; then
-        echo "
-($CODEX_LINK is a plain directory — run 'cdx init' to enable switching)"
-    elif legacy_layout; then
+    if oldest >= 300:
+        ago = (f"{oldest // 60}m" if oldest < 3600 else
+               f"{oldest // 3600}h" if oldest < 86400 else f"{oldest // 86400}d")
+        out(f"{C.YELLOW}   quota measured {ago} ago — 'cdx --refresh' "
+            f"for live figures{C.RESET}")
+    if relogin:
+        out(f"\n{C.YELLOW}(re-login: the account was rejected — its refresh "
+            f"token is dead.{C.RESET}")
+        out(f'{C.YELLOW} run "cdx add <name>" to sign in again.){C.RESET}')
+    if not initialized():
+        out(f"\n({CODEX_LINK} is a plain directory — run 'cdx init' to enable switching)")
+    elif legacy_layout():
         # Non-fatal: listing accounts still works fine on the old layout. Only
         # the commands that depend on the store refuse outright.
-        printf '\n%s(no shared store — %s still holds it; %s explains the fix)%s\n' \
-            "$C_YELLOW" "$PROFILES/main" "'cdx link'" "$C_RESET"
-    fi
-}
-# Map an app-server control/log path back to its owning profile.
-profile_from_control_path() {
-    local path="$1" rest
-    case "$path" in
-        "$PROFILES"/*/app-server-control/*)
-            rest="${path#"$PROFILES"/}"
-            echo "${rest%%/*}"
-            return 0
-            ;;
-        "$CODEX_LINK"/app-server-control/*)
-            active_profile
-            return 0
-            ;;
-    esac
-    return 1
-}
+        out(f"\n{C.YELLOW}(no shared store — {PROFILES / 'main'} still holds it; "
+            f"'cdx link' explains the fix){C.RESET}")
+    return 0
 
-# Every filesystem path a process currently has open, one per line. /proc is
-# authoritative where it exists and resolves each fd to its real path, which is
-# what lets a caller recognise a file reached through the moving ~/.codex
-# symlink. macOS has no /proc, so lsof stands in; its -Fn format gives one
-# n-prefixed path per line, avoiding fragile column parsing. Callers filter.
-open_paths() {
-    local pid="$1" fd line
-    if [ -d "/proc/$pid/fd" ]; then
-        for fd in "/proc/$pid/fd"/*; do
-            readlink "$fd" 2>/dev/null || true
-        done
-        return 0
-    fi
-    command -v lsof >/dev/null 2>&1 || return 0
-    while IFS= read -r line; do
-        case "$line" in n*) printf '%s\n' "${line#n}" ;; esac
-    done < <(lsof -a -p "$pid" -Fn 2>/dev/null)
-}
 
-# Inspect open control-socket/log descriptors instead of trusting CODEX_HOME:
-# a long-running process may have inherited the moving ~/.codex symlink.
-app_server_profile() {
-    local pid="$1" target profile
-    while IFS= read -r target; do
-        [ -n "$target" ] || continue
-        if profile="$(profile_from_control_path "$target")"; then
-            echo "$profile"
-            return 0
-        fi
-    done < <(open_paths "$pid")
-    echo unknown
-}
+# ── process inspection ───────────────────────────────────────────────────────
+def profile_from_control_path(path: str) -> str | None:
+    """Map an app-server control/log path back to its owning profile."""
+    prefix = f"{PROFILES}/"
+    if path.startswith(prefix) and "/app-server-control/" in path:
+        return path[len(prefix):].split("/", 1)[0]
+    if path.startswith(f"{CODEX_LINK}/app-server-control/"):
+        return active_profile()
+    return None
 
-# Presentation helpers for 'status'. Grouping the facts under headings beats
-# one flat column of twenty-character labels: the three questions it answers —
-# who am I, where is the data, what is running — are what you scan for.
-section() { printf '\n%s%s%s\n' "$C_CYAN" "$1" "$C_RESET"; }
-row()     { printf '  %-13s %s\n' "$1" "$2"; }
 
-# Paths here are long and mostly $HOME. Shortening keeps the value column from
-# wrapping, which is what made the old output hard to read on a narrow window.
-tilde()   { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+def open_paths(pid: int) -> list[str]:
+    """Every filesystem path a process currently has open.
 
-# Read-only check of account selection versus long-running remote machinery.
-cmd_status() {
-    local json=0 subject=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --json) json=1 ;;
-            -*) die "unknown option to 'status': $1" ;;
-            # An account you are not on is exactly the one you want to inspect
-            # before switching — 'is snu still over its limit?' should not
-            # require switching to snu to find out.
-            *) [ -z "$subject" ] || die "status takes one profile name"
-               subject="$1" ;;
-        esac
-        shift
-    done
-    local active home account session_store state_store status_word status_message status_color
-    local server_pids proxy_pids pid profile server_rows=""
-    local server_count=0 proxy_count=0 mismatch=0
-    active="$(active_profile)"
+    /proc is authoritative where it exists and resolves each fd to its real
+    path, which is what lets a caller recognise a file reached through the
+    moving ~/.codex symlink. macOS has no /proc, so lsof stands in; its -Fn
+    format gives one n-prefixed path per line.
+    """
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if fd_dir.is_dir():
+        paths = []
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    paths.append(os.readlink(fd))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return paths
+    if not shutil.which("lsof"):
+        return []
+    proc = subprocess.run(["lsof", "-a", "-p", str(pid), "-Fn"],
+                          capture_output=True, text=True)
+    return [line[1:] for line in proc.stdout.splitlines() if line.startswith("n")]
+
+
+def app_server_profile(pid: int) -> str:
+    """Inspect open control-socket descriptors instead of trusting CODEX_HOME:
+    a long-running process may have inherited the moving ~/.codex symlink."""
+    for target in open_paths(pid):
+        owner = profile_from_control_path(target)
+        if owner:
+            return owner
+    return "unknown"
+
+
+def pgrep(pattern: str) -> list[int]:
+    proc = subprocess.run(["pgrep", "-u", _username(), "-f", pattern],
+                          capture_output=True, text=True)
+    return [int(p) for p in proc.stdout.split() if p.isdigit()]
+
+
+def _username() -> str:
+    proc = subprocess.run(["id", "-un"], capture_output=True, text=True)
+    return proc.stdout.strip()
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
+    except OSError:
+        proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                              capture_output=True, text=True)
+        return proc.stdout.strip()
+
+
+# ── status ───────────────────────────────────────────────────────────────────
+def section(title: str) -> None:
+    out(f"\n{C.CYAN}{title}{C.RESET}")
+
+
+def row(label: str, value: str) -> None:
+    out(f"  {label:<13} {value}")
+
+
+def tilde(path: str) -> str:
+    """Paths here are long and mostly $HOME. Shortening keeps the value column
+    from wrapping, which is what made the old output hard to read."""
+    home = str(HOME)
+    return "~" + path[len(home):] if path.startswith(home + "/") else path
+
+
+def cmd_status(argv: list[str]) -> int:
+    as_json = False
+    subject = ""
+    for arg in argv:
+        if arg == "--json":
+            as_json = True
+        elif arg.startswith("-"):
+            die(f"unknown option to 'status': {arg}")
+        elif subject:
+            die("status takes one profile name")
+        else:
+            subject = arg
+
+    active = active_profile()
     # The Clients section and the verdict are always about the active profile:
     # they describe what is running on this machine, which does not change
     # because you asked about another account.
-    if [ -n "$subject" ]; then
-        validate_name "$subject"
-        home="$(home_of "$subject")"
-        [ -d "$home" ] || missing_profile "$subject"
-    else
-        subject="$active"
-        home="$(home_of "$active")"
-    fi
+    if subject:
+        validate_name(subject)
+        home = home_of(subject)
+        if not home.is_dir():
+            missing_profile(subject)
+    else:
+        subject = active
+        home = home_of(active)
+
     # Cached figure only: status is a diagnostic that must work offline, and
     # 'cdx --refresh' is right there when a live number is wanted.
-    local quota="" who="" kind="" plan="" resets="" refreshed="" state="" credits=""
-    IFS=$'\037' read -r _ kind who plan quota resets state _ refreshed _ credits \
-        < <(CDX_USAGE=off profile_rows 0 "$subject=$home") || true
-    # What the JSON calls the selected account. One line assembled from the
-    # row rather than a second pass over auth.json.
-    account="$who${kind:+ ($kind)}${plan:+ $plan}"
+    saved = os.environ.get("CDX_USAGE")
+    os.environ["CDX_USAGE"] = "off"
+    try:
+        r = profile_rows([subject])[0]
+    finally:
+        if saved is None:
+            os.environ.pop("CDX_USAGE", None)
+        else:
+            os.environ["CDX_USAGE"] = saved
+
+    account = r.account + (f" ({r.kind})" if r.kind else "") + (f" {r.plan}" if r.plan else "")
     # The listing's compact '43% wk' is a column heading's worth of context;
     # here there is room for the sentence it stands for.
-    if [ -n "$quota" ]; then
-        local span="${quota#* }"; quota="${quota%% *}"
-        case "$span" in
-            wk) span=" of the weekly limit" ;;
-            "$quota"|"") span="" ;;
-            *)  span=" of the ${span/h/-hour} limit" ;;
-        esac
-        quota="$quota$span, resets $resets"
-    else
-        quota="unknown — run 'cdx --refresh'"
-    fi
+    if r.used:
+        head, _, span = r.used.partition(" ")
+        if span == "wk":
+            span_text = " of the weekly limit"
+        elif not span:
+            span_text = ""
+        else:
+            span_text = f" of the {span.replace('h', '-hour')} limit"
+        quota = f"{head}{span_text}, resets {r.resets}"
+    else:
+        quota = "unknown — run 'cdx --refresh'"
     # The rate limit is not always what stopped the account, so say which one
     # it is rather than letting the percentage answer for both.
-    case "$state" in
-        spendlimit) quota="$quota
-                ${C_RED}over its spend limit — cannot run regardless of the above${C_RESET}" ;;
-        blocked)    quota="$quota ${C_RED}(rate limited now)${C_RESET}" ;;
-    esac
-    [ -n "$refreshed" ] || refreshed="never"
-    session_store="$(resolve_dir "$home/sessions" || true)"
-    [ -n "$session_store" ] || session_store="missing"
-    if [ -L "$home/state_5.sqlite" ]; then
-        state_store="shared -> $(readlink "$home/state_5.sqlite")"
-    elif [ -e "$home/state_5.sqlite" ]; then
-        state_store="$home/state_5.sqlite"
-    else
-        state_store="missing"
-    fi
+    if r.state == "spendlimit":
+        quota += (f"\n                {C.RED}over its spend limit — cannot run "
+                  f"regardless of the above{C.RESET}")
+    elif r.state == "blocked":
+        quota += f" {C.RED}(rate limited now){C.RESET}"
+    refreshed = r.refreshed or "never"
+
+    session_store = resolve_dir(home / "sessions") or "missing"
+    state_file = home / "state_5.sqlite"
+    if state_file.is_symlink():
+        state_store = f"shared -> {os.readlink(state_file)}"
+    elif state_file.exists():
+        state_store = str(state_file)
+    else:
+        state_store = "missing"
 
     # Display forms only — the JSON keeps the full paths, since a consumer has
-    # no way to expand 'shared' back into one. What a reader needs to know is
-    # whether the data is the shared copy or this profile's own.
-    local session_disp="$session_store" state_disp="$state_store"
-    case "$session_store" in "$STORE"/*) session_disp="shared" ;;
-        *) session_disp="$(tilde "$session_store")" ;; esac
-    case "$state_store" in "shared -> $STORE"/*) state_disp="shared" ;;
-        *) state_disp="$(tilde "$state_store")" ;; esac
+    # no way to expand 'shared' back into one.
+    session_disp = "shared" if session_store.startswith(f"{STORE}/") else tilde(session_store)
+    state_disp = "shared" if state_store.startswith(f"shared -> {STORE}/") else tilde(state_store)
 
-    server_pids="$(pgrep -u "$(id -un)" -f '[cC]odex.*app-server.*--listen[ =]unix://' 2>/dev/null || true)"
-    proxy_pids="$(pgrep -u "$(id -un)" -f '(^|/)codex app-server proxy( |$)' 2>/dev/null || true)"
-    for pid in $proxy_pids; do proxy_count=$((proxy_count + 1)); done
+    server_pids = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
+    proxy_count = len(pgrep(r"(^|/)codex app-server proxy( |$)"))
 
-    # The app-server scan drives the mismatch verdict, so it runs either way;
-    # its lines are collected rather than printed, to keep the sections below
-    # in a readable order instead of the order the work happens in.
-    local server_lines=""
-    if [ -z "$server_pids" ]; then
-        server_lines="$(row "app server" "not running")"$'\n'
-        [ "$proxy_count" -eq 0 ] || mismatch=1
-    else
-        while IFS= read -r pid; do
-            [ -n "$pid" ] || continue
-            server_count=$((server_count + 1))
-            profile="$(app_server_profile "$pid")"
-            server_rows+="$pid"$'\t'"$profile"$'\n'
-            if [ "$profile" = "$active" ]; then
-                server_lines+="$(row "app server" "PID $pid — $profile $C_GREEN(matches)$C_RESET")"$'\n'
-            else
-                server_lines+="$(row "app server" "PID $pid — $profile $C_RED(MISMATCH)$C_RESET")"$'\n'
-                mismatch=1
-            fi
-        done <<< "$server_pids"
-    fi
+    mismatch = False
+    server_rows: list[tuple[int, str]] = []
+    server_lines: list[str] = []
+    if not server_pids:
+        server_lines.append(f"  {'app server':<13} not running")
+        if proxy_count:
+            mismatch = True
+    else:
+        for pid in server_pids:
+            owner = app_server_profile(pid)
+            server_rows.append((pid, owner))
+            if owner == active:
+                server_lines.append(
+                    f"  {'app server':<13} PID {pid} — {owner} {C.GREEN}(matches){C.RESET}")
+            else:
+                server_lines.append(
+                    f"  {'app server':<13} PID {pid} — {owner} {C.RED}(MISMATCH){C.RESET}")
+                mismatch = True
 
-    if [ "$json" = 0 ]; then
-        section Account
-        if [ "$subject" = "$active" ]; then
-            row profile "$C_CYAN$subject$C_RESET"
-        else
+    if not as_json:
+        section("Account")
+        if subject == active:
+            row("profile", f"{C.CYAN}{subject}{C.RESET}")
+        else:
             # Say it plainly: every other section still describes the machine,
             # so a reader must not take this for the account in use.
-            row profile "$C_CYAN$subject$C_RESET ${C_YELLOW}(not active — '$active' is)$C_RESET"
-        fi
-        row "signed in" "$who${kind:+ — $kind}${plan:+, $plan}"
-        row quota "$quota"
+            row("profile", f"{C.CYAN}{subject}{C.RESET} "
+                           f"{C.YELLOW}(not active — '{active}' is){C.RESET}")
+        row("signed in", r.account + (f" — {r.kind}" if r.kind else "")
+                         + (f", {r.plan}" if r.plan else ""))
+        row("quota", quota)
         # 'allowance' rather than 'credits': the same line carries a credit
         # balance, a spend budget, or the fact that neither is reported.
-        [ -z "$credits" ] || row allowance "$credits"
-        row refreshed "$refreshed"
-        section Storage
-        if stored; then
-            row store "$(tilde "$STORE")"
-        else
-            row store "${C_YELLOW}none — predates the store; run any command for the fix$C_RESET"
-        fi
-        row conversations "$session_disp"
-        row "state index" "$state_disp"
-        section Clients
-        printf '%s' "$server_lines"
-        row "ssh proxies" "$proxy_count"
-        row desktop "not observable from this host"
-        echo
-    fi
+        if r.allowance:
+            row("allowance", r.allowance)
+        row("refreshed", refreshed)
+        section("Storage")
+        if stored():
+            row("store", tilde(str(STORE)))
+        else:
+            row("store", f"{C.YELLOW}none — predates the store; run any command "
+                         f"for the fix{C.RESET}")
+        row("conversations", session_disp)
+        row("state index", state_disp)
+        section("Clients")
+        for line in server_lines:
+            out(line)
+        row("ssh proxies", str(proxy_count))
+        row("desktop", "not observable from this host")
+        out()
 
-    if [ "$mismatch" = 1 ]; then
-        status_word="mismatch"; status_color="$C_RED"
-        status_message="MISMATCH — run 'cdx use $active' to refresh Codex and remote clients."
-    elif [ "$server_count" -eq 0 ]; then
-        status_word="idle"; status_color="$C_YELLOW"
-        status_message="IDLE — the next Codex client should start with $active."
-    else
-        status_word="ok"; status_color="$C_GREEN"
-        status_message="OK — host-side Codex execution is using $active."
-    fi
+    if mismatch:
+        status_word, color = "mismatch", C.RED
+        message = f"MISMATCH — run 'cdx use {active}' to refresh Codex and remote clients."
+    elif not server_pids:
+        status_word, color = "idle", C.YELLOW
+        message = f"IDLE — the next Codex client should start with {active}."
+    else:
+        status_word, color = "ok", C.GREEN
+        message = f"OK — host-side Codex execution is using {active}."
 
-    if [ "$json" = 1 ]; then
-        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" "$home" "$subject" <<'PY'
-import json, os, sys
-active, account, sessions, state, rows, proxies, status, home, subject = sys.argv[1:]
-# Straight from the cache file, not the rendered column: a consumer wants the
-# percentage and the epoch, not "42%" and "Aug 18 18:17 (in 6d)".
-try:
-    with open(os.path.join(home, ".cdx-usage.json")) as fh:
-        c = json.load(fh)
-    quota = {"used_percent": c.get("used"), "reset_at": c.get("reset_at"),
-             "measured_at": c.get("fetched_at"), "state": c.get("state"),
-             # None where the plan has no credit balance at all, so a consumer
-             # can tell "not applicable" from "spent".
-             "credits": c.get("credits")}
-except Exception:
-    quota = None
-servers = []
-for row in rows.splitlines():
-    pid, profile = row.split("\t", 1)
-    servers.append({
-        "pid": int(pid),
-        "profile": profile,
-        "matches_active_profile": profile == active,
-    })
-print(json.dumps({
-    "active_profile": active,
-    # Which account the account-level fields describe. Equal to active_profile
-    # unless a name was given, so a consumer never has to guess.
-    "reported_profile": subject,
-    "selected_account": account,
-    "quota": quota,
-    "conversation_store": sessions,
-    "state_index": state,
-    "app_servers": servers,
-    "ssh_remote_proxies": int(proxies),
-    "desktop_account_observable": False,
-    "status": status,
-    "recommended_command": f"cdx use {active}" if status == "mismatch" else None,
-}, indent=2))
-PY
-    else
-        printf 'Status: %s%s%s\n' "$status_color" "$status_message" "$C_RESET"
-    fi
-    [ "$mismatch" = 0 ] || return 1
-}
+    if as_json:
+        # Straight from the cache file, not the rendered column: a consumer
+        # wants the percentage and the epoch, not "42%" and "Aug 18 (in 6d)".
+        try:
+            c = json.loads((home / ".cdx-usage.json").read_text())
+            quota_json = {"used_percent": c.get("used"), "reset_at": c.get("reset_at"),
+                          "measured_at": c.get("fetched_at"), "state": c.get("state"),
+                          "credits": c.get("credits")}
+        except Exception:
+            quota_json = None
+        out(json.dumps({
+            "active_profile": active,
+            "reported_profile": subject,
+            "selected_account": account,
+            "quota": quota_json,
+            "conversation_store": session_store,
+            "state_index": state_store,
+            "app_servers": [{"pid": pid, "profile": owner,
+                             "matches_active_profile": owner == active}
+                            for pid, owner in server_rows],
+            "ssh_remote_proxies": proxy_count,
+            "desktop_account_observable": False,
+            "status": status_word,
+            "recommended_command": f"cdx use {active}" if status_word == "mismatch" else None,
+        }, indent=2))
+    else:
+        out(f"Status: {color}{message}{C.RESET}")
+    return 1 if mismatch else 0
 
 
-# One-time: turn the real ~/.codex into profiles/main and leave a symlink in
-# its place, and hoist the shared data into the store. A rename on the same
-# filesystem, so even 1.7G moves instantly. Its own command rather than a step
-# hidden inside 'use', because it is the one operation here that restructures
-# your home directory.
-#
-# This is the whole setup for a new machine. Installs created before the
-# store existed are detected elsewhere and told how to catch up.
-cmd_init() {
-    local reply
-    if initialized; then
-        echo "already set up: $CODEX_LINK -> $(readlink "$CODEX_LINK")"
-        # Not a full no-op: an install from before the store looks "set up"
-        # but still has its shared data buried in the 'main' profile. The
-        # explicit 'if' matters — a bare '&&' as the last statement would make
-        # the function exit non-zero whenever the layout is already correct.
-        if legacy_layout; then explain_legacy; fi
-        return 0
-    fi
-    [ -d "$CODEX_LINK" ] || die "$CODEX_LINK does not exist — nothing to set up"
-    # 'mv dir existing-dir/' moves it *inside*, so without this the real home
-    # lands at $PROFILES/main/.codex and the pointer ends up on a stale 'main'
-    # — no data lost, but the wrong account is silently active. Reachable
-    # whenever the symlink is gone while its profile is not (Codex recreates
-    # ~/.codex after the link is deleted; an interrupted setup leaves both).
-    [ ! -e "$PROFILES/main" ] || die "$PROFILES/main already exists, but $CODEX_LINK is a real
-     directory. Move one aside — if that profile is the account you want, delete
-     or rename $CODEX_LINK and 'ln -s $PROFILES/main $CODEX_LINK' instead"
+# ── init and the store ───────────────────────────────────────────────────────
+def legacy_layout() -> bool:
+    return initialized() and not stored()
 
-    if [ "${1:-}" != "-y" ]; then
-        # Without a terminal there is nobody to answer, and silently doing
-        # nothing is the worst outcome — say how to proceed instead.
-        [ -t 0 ] || die "not a terminal — rerun as 'cdx init -y' to confirm"
-        echo "cdx: one-time setup — $CODEX_LINK becomes a symlink so accounts can be"
-        echo "     switched by re-pointing it. Your current account moves to"
-        echo "     $PROFILES/main and stays the active one. Nothing is copied."
-        printf 'proceed? [y/N] '
-        read -r reply || reply=""
-        [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; return 1; }
-    fi
 
-    mkdir -p "$PROFILES"
-    mv "$CODEX_LINK" "$PROFILES/main"
-    secure_profile "$PROFILES/main"
-    ln -s "$PROFILES/main" "$CODEX_LINK"
-    echo "set up: $CODEX_LINK -> $PROFILES/main"
-    # Hoist the shared data straight out of 'main' so it is never load-bearing.
-    move_store_out_of "$PROFILES/main" >/dev/null
-    link_shared "$PROFILES/main"
-    echo "shared store: $STORE"
-}
+def explain_legacy() -> None:
+    """An install made before the store existed keeps its shared data inside
+    'main'. cdx carries no converter for that: it was a one-time operation, and
+    keeping a rarely-run command that stops processes and moves gigabytes is
+    worse than explaining the fix."""
+    legacy = PROFILES / "main"
+    items = [f for f in SHARED_FILES + SHARED_DATA + SHARED_DIRS
+             if (legacy / f).exists() and not (legacy / f).is_symlink()]
+    w = sys.stderr.write
+    w(f"{C.YELLOW}cdx: this install predates the shared store.{C.RESET}\n")
+    w("     Its shared data still lives inside the 'main' profile, which makes\n")
+    w("     'main' undeletable and unrenameable. To finish the layout:\n")
+    w("\n")
+    w("       # 1. stop Codex on this machine (the desktop app will reconnect)\n")
+    w("       pkill -u \"$(id -un)\" -f 'codex.*app-server'\n")
+    w("\n")
+    w("       # 2. move the shared data into the store (same filesystem: instant)\n")
+    w(f"       mkdir -p {STORE} && chmod 700 {STORE}\n")
+    if len(items) > 1:
+        # Brace expansion needs a comma: '{sessions}' stays literal, so a
+        # single leftover item has to be printed as a plain path.
+        w(f"       mv {legacy}/{{{','.join(items)}}} \\\n")
+        w(f"          {STORE}/\n")
+    elif len(items) == 1:
+        w(f"       mv {legacy}/{items[0]} \\\n")
+        w(f"          {STORE}/\n")
+    else:
+        w("       # (nothing left to move — 'main' holds no unshared originals)\n")
+    if items:
+        w(f"       mv {legacy}/*.sqlite-wal {legacy}/*.sqlite-shm {STORE}/ 2>/dev/null\n")
+    w("\n")
+    w("       # 3. re-point every profile at the store\n")
+    w("       cdx link\n")
 
-# Move the one real copy of every shared entry into the store. Everything is
-# a same-filesystem rename, so nothing is copied and nothing is deleted; items
-# already in the store, or already links, are skipped. Safe to run twice.
-move_store_out_of() {
-    local src="${1%/}" f moved=0
-    [ -e "$STORE" ] && [ ! -d "$STORE" ] && die "$STORE exists but is not a directory — move it aside and rerun"
-    mkdir -p "$STORE"
-    chmod 700 "$STORE"
-    for f in "${SHARED_FILES[@]}" "${SHARED_DATA[@]}" "${SHARED_DIRS[@]}"; do
-        # Only real files/dirs move; a symlink is already pointing at the data.
-        [ -e "$src/$f" ] && [ ! -L "$src/$f" ] || continue
-        [ -e "$STORE/$f" ] && continue
-        mv "$src/$f" "$STORE/$f"
-        moved=$((moved + 1))
-    done
+
+def require_store() -> None:
+    if legacy_layout():
+        explain_legacy()
+        raise SystemExit(1)
+
+
+def move_store_out_of(src: Path) -> int:
+    """Move the one real copy of every shared entry into the store. Everything
+    is a same-filesystem rename, so nothing is copied and nothing is deleted;
+    items already in the store, or already links, are skipped."""
+    if STORE.exists() and not STORE.is_dir():
+        die(f"{STORE} exists but is not a directory — move it aside and rerun")
+    STORE.mkdir(parents=True, exist_ok=True)
+    os.chmod(STORE, 0o700)
+    moved = 0
+    for name in SHARED_FILES + SHARED_DATA + SHARED_DIRS:
+        item = src / name
+        if not item.exists() or item.is_symlink() or (STORE / name).exists():
+            continue
+        os.rename(item, STORE / name)
+        moved += 1
     # sqlite's sidecars must travel with their database or the index looks
     # corrupt; they are recreated next to the resolved path afterwards.
-    for f in "${SHARED_DATA[@]}"; do
-        local side
-        for side in "$src/$f-wal" "$src/$f-shm"; do
-            [ -e "$side" ] && [ ! -L "$side" ] || continue
-            [ -e "$STORE/$(basename "$side")" ] || mv "$side" "$STORE/"
-        done
-    done
-    echo "$moved"
-}
+    for name in SHARED_DATA:
+        for suffix in ("-wal", "-shm"):
+            side = src / (name + suffix)
+            if side.exists() and not side.is_symlink() and not (STORE / side.name).exists():
+                os.rename(side, STORE / side.name)
+    return moved
 
-# An install made before the store existed keeps its shared data inside the
-# 'main' profile. cdx no longer carries a converter for that: it was a one-time
-# operation, and keeping a rarely-run command that stops processes and moves
-# gigabytes is worse than explaining the fix. Detect it and print the exact
-# commands instead — the move is a handful of renames, and 'cdx link' does the
-# rest, so the manual path is short and inspectable.
-legacy_layout() { initialized && ! stored; }
 
-explain_legacy() {
-    local legacy="$PROFILES/main" f items=()
-    for f in "${SHARED_FILES[@]}" "${SHARED_DATA[@]}" "${SHARED_DIRS[@]}"; do
-        [ -e "$legacy/$f" ] && [ ! -L "$legacy/$f" ] || continue
-        items+=("$f")
-    done
-    {
-        printf '%scdx: this install predates the shared store.%s\n' "$C_YELLOW" "$C_RESET"
-        echo "     Its shared data still lives inside the 'main' profile, which makes"
-        echo "     'main' undeletable and unrenameable. To finish the layout:"
-        echo
-        echo "       # 1. stop Codex on this machine (the desktop app will reconnect)"
-        echo "       pkill -u \"\$(id -un)\" -f 'codex.*app-server'"
-        echo
-        echo "       # 2. move the shared data into the store (same filesystem: instant)"
-        echo "       mkdir -p $STORE && chmod 700 $STORE"
-        if [ ${#items[@]} -gt 1 ]; then
-            # Brace expansion needs a comma: '{sessions}' stays literal, so a
-            # single leftover item has to be printed as a plain path.
-            printf '       mv %s \\\n' "$legacy/{$(IFS=,; echo "${items[*]}")}"
-            echo "          $STORE/"
-        elif [ ${#items[@]} -eq 1 ]; then
-            printf '       mv %s \\\n' "$legacy/${items[0]}"
-            echo "          $STORE/"
-        else
-            echo "       # (nothing left to move — 'main' holds no unshared originals)"
-        fi
-        if [ ${#items[@]} -gt 0 ]; then
-            echo "       mv $legacy/*.sqlite-wal $legacy/*.sqlite-shm $STORE/ 2>/dev/null"
-        fi
-        echo
-        echo "       # 3. re-point every profile at the store"
-        echo "       cdx link"
-    } >&2
-}
+def cmd_init(argv: list[str]) -> int:
+    if initialized():
+        out(f"already set up: {CODEX_LINK} -> {os.readlink(CODEX_LINK)}")
+        # Not a full no-op: an install from before the store looks "set up"
+        # but still has its shared data buried in the 'main' profile.
+        if legacy_layout():
+            explain_legacy()
+        return 0
+    if not CODEX_LINK.is_dir():
+        die(f"{CODEX_LINK} does not exist — nothing to set up")
+    # 'mv dir existing-dir/' moves it *inside*, so without this the real home
+    # lands at PROFILES/main/.codex and the pointer ends up on a stale 'main'
+    # — no data lost, but the wrong account is silently active.
+    if (PROFILES / "main").exists():
+        die(f"{PROFILES / 'main'} already exists, but {CODEX_LINK} is a real\n"
+            f"     directory. Move one aside — if that profile is the account you want, delete\n"
+            f"     or rename {CODEX_LINK} and 'ln -s {PROFILES / 'main'} {CODEX_LINK}' instead")
 
-require_store() {
-    legacy_layout || return 0
-    explain_legacy
-    exit 1
-}
+    if not argv or argv[0] != "-y":
+        # Without a terminal there is nobody to answer, and silently doing
+        # nothing is the worst outcome — say how to proceed instead.
+        if not sys.stdin.isatty():
+            die("not a terminal — rerun as 'cdx init -y' to confirm")
+        out(f"cdx: one-time setup — {CODEX_LINK} becomes a symlink so accounts can be")
+        out("     switched by re-pointing it. Your current account moves to")
+        out(f"     {PROFILES / 'main'} and stays the active one. Nothing is copied.")
+        sys.stdout.write("proceed? [y/N] ")
+        sys.stdout.flush()
+        reply = sys.stdin.readline().strip()
+        if reply not in ("y", "Y"):
+            out("cancelled")
+            return 1
 
-# Kill running Codex processes whose open files still point inside $old.
-#
-# SSH remote proxies need their own rule: they hold anonymous socket fds rather
-# than paths below $old, so the fd scan never sees them, yet they front the
-# app-server we are about to kill. Leaving them up strands the desktop on a
-# dead backend. proxy_policy picks between:
-#   always  — 'use', where the account itself changes, so every cached
-#             connection is stale whether or not we stopped anything.
-#   if-stale — 'rename', where the account is unchanged: disconnect
-#             them only when we actually stopped a process they could be
-#             fronting, so an idle machine keeps its remote sessions.
-stop_bound_to() {
-    local old="${1%/}" dry_run="${2:-0}" proxy_policy="${3:-always}"
-    local pid tgt cmd matched remote_proxy attempt
-    local killed=() survivors=() proxies=() remote_proxies=0
-    [ -n "$old" ] || return 0
-    case "$proxy_policy" in
-        always|if-stale) ;;
-        0) proxy_policy=if-stale ;;
-        1) proxy_policy=always ;;
-        *) die "internal: bad proxy policy '$proxy_policy'" ;;
-    esac
-    if [ ! -d /proc/self/fd ] && ! command -v lsof >/dev/null 2>&1; then
-        echo "cdx: cannot find processes bound to the old profile (need /proc or lsof)" >&2
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    os.rename(CODEX_LINK, PROFILES / "main")
+    secure_profile(PROFILES / "main")
+    os.symlink(PROFILES / "main", CODEX_LINK)
+    out(f"set up: {CODEX_LINK} -> {PROFILES / 'main'}")
+    # Hoist the shared data straight out of 'main' so it is never load-bearing.
+    move_store_out_of(PROFILES / "main")
+    link_shared(PROFILES / "main")
+    out(f"shared store: {STORE}")
+    return 0
+
+
+# ── stopping bound processes ─────────────────────────────────────────────────
+def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always") -> int:
+    """Kill running Codex processes whose open files still point inside `old`.
+
+    SSH remote proxies need their own rule: they hold anonymous socket fds
+    rather than paths below `old`, so the fd scan never sees them, yet they
+    front the app-server we are about to kill. Leaving them up strands the
+    desktop on a dead backend.
+      always   — 'use', where the account itself changes, so every cached
+                 connection is stale whether or not we stopped anything.
+      if-stale — 'rename', where the account is unchanged: disconnect them
+                 only when we actually stopped a process they could be
+                 fronting, so an idle machine keeps its remote sessions.
+    """
+    old = old.rstrip("/")
+    if not old:
+        return 0
+    if not Path("/proc/self/fd").is_dir() and not shutil.which("lsof"):
+        sys.stderr.write("cdx: cannot find processes bound to the old profile "
+                         "(need /proc or lsof)\n")
         return 1
-    fi
-    for pid in $(pgrep -u "$(id -un)" -f '[cC]odex' 2>/dev/null); do
-        matched=0 remote_proxy=0 cmd=""
-        if [ -r "/proc/$pid/cmdline" ]; then
-            cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-        else
-            cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-        fi
-        case "$cmd" in
-            *"codex app-server proxy"*)
-                remote_proxy=1
-                [ "$proxy_policy" = always ] && matched=1
-                ;;
-        esac
-        if [ "$matched" = 0 ]; then
-            while IFS= read -r tgt; do
-                case "$tgt" in "$old"/*) matched=1; break ;; esac
-            done < <(open_paths "$pid")
-        fi
-        if [ "$matched" = 1 ]; then
-            killed+=("$pid")
-            [ "$remote_proxy" = 1 ] && remote_proxies=$((remote_proxies + 1))
-        elif [ "$remote_proxy" = 1 ]; then
-            # Not bound to $old itself, but a candidate if anything else is:
+
+    killed: list[int] = []
+    proxies: list[int] = []
+    remote_proxies = 0
+    for pid in pgrep("[cC]odex"):
+        matched = False
+        cmd = _cmdline(pid)
+        remote_proxy = "codex app-server proxy" in cmd
+        if remote_proxy and proxy_policy == "always":
+            matched = True
+        if not matched:
+            matched = any(target.startswith(old + "/") for target in open_paths(pid))
+        if matched:
+            killed.append(pid)
+            if remote_proxy:
+                remote_proxies += 1
+        elif remote_proxy:
+            # Not bound to `old` itself, but a candidate if anything else is:
             # tracked separately so escalation cannot list it twice.
-            proxies+=("$pid")
-        fi
-    done
+            proxies.append(pid)
+
     # We stopped something a proxy could be fronting, so those connections are
     # now dead ends: take them down too and let the desktop reconnect.
-    if [ "$proxy_policy" = if-stale ] && [ ${#killed[@]} -gt 0 ] && [ ${#proxies[@]} -gt 0 ]; then
-        killed+=("${proxies[@]}")
-        remote_proxies=$((remote_proxies + ${#proxies[@]}))
-    fi
-    if [ ${#killed[@]} -eq 0 ]; then
-        echo "  No running processes were bound to the old profile."
-        return
-    fi
-    if [ "$dry_run" = 1 ]; then
-        printf '%s  Would stop %s process(es): %s%s\n' "$C_YELLOW" "${#killed[@]}" "${killed[*]}" "$C_RESET"
-        if [ "$remote_proxies" -gt 0 ]; then
-            printf '%s  Would disconnect %s SSH remote proxy/proxies.%s\n' "$C_YELLOW" "$remote_proxies" "$C_RESET"
-        fi
+    if proxy_policy == "if-stale" and killed and proxies:
+        killed.extend(proxies)
+        remote_proxies += len(proxies)
+
+    if not killed:
+        out("  No running processes were bound to the old profile.")
         return 0
-    fi
-    printf '%s  Stopping %s process(es) bound to the old profile: %s%s\n' "$C_YELLOW" "${#killed[@]}" "${killed[*]}" "$C_RESET"
-    if [ "$remote_proxies" -gt 0 ]; then
-        printf '%s  Disconnecting %s SSH remote proxy/proxies; desktop clients should reconnect.%s\n' "$C_YELLOW" "$remote_proxies" "$C_RESET"
-    fi
+    listed = " ".join(str(p) for p in killed)
+    if dry_run:
+        out(f"{C.YELLOW}  Would stop {len(killed)} process(es): {listed}{C.RESET}")
+        if remote_proxies:
+            out(f"{C.YELLOW}  Would disconnect {remote_proxies} SSH remote "
+                f"proxy/proxies.{C.RESET}")
+        return 0
+    out(f"{C.YELLOW}  Stopping {len(killed)} process(es) bound to the old "
+        f"profile: {listed}{C.RESET}")
+    if remote_proxies:
+        out(f"{C.YELLOW}  Disconnecting {remote_proxies} SSH remote proxy/proxies; "
+            f"desktop clients should reconnect.{C.RESET}")
     # Escape hatch for anything running cdx against a scratch CODEX_PROFILES.
     # Process selection is the one part of cdx that cannot be sandboxed by env
     # vars — pgrep sees the whole user's process table — so a bug in the path
     # filter reaches real Codex sessions no matter how isolated the profiles
     # are. The test suite sets this so a broken build cannot kill live work.
-    if [ "${CDX_NO_KILL:-}" = 1 ]; then
-        printf '%s  CDX_NO_KILL=1 — signalling nothing.%s\n' "$C_YELLOW" "$C_RESET"
+    if os.environ.get("CDX_NO_KILL") == "1":
+        out(f"{C.YELLOW}  CDX_NO_KILL=1 — signalling nothing.{C.RESET}")
         return 0
-    fi
-    kill "${killed[@]}" 2>/dev/null || true
-    # A real app-server takes its time on SIGTERM — it closes sqlite handles and
-    # tears down client sessions first. Five seconds was not enough and made
-    # 'rename' abort on a perfectly healthy shutdown, so wait 20.
-    local waited=0
-    for attempt in {1..200}; do
-        survivors=()
-        for pid in "${killed[@]}"; do
-            kill -0 "$pid" 2>/dev/null && survivors+=("$pid")
-        done
-        [ ${#survivors[@]} -eq 0 ] && break
-        sleep 0.1
-        waited=$attempt
-    done
-    if [ ${#survivors[@]} -gt 0 ]; then
-        printf '%scdx: %s process(es) did not exit after 20 seconds: %s%s\n' "$C_RED" "${#survivors[@]}" "${survivors[*]}" "$C_RESET" >&2
-        printf '%s     They were not force-killed; inspect them and rerun cdx status.%s\n' "$C_YELLOW" "$C_RESET" >&2
+    for pid in killed:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    # A real app-server takes its time on SIGTERM — it closes sqlite handles
+    # and tears down client sessions first. Five seconds was not enough and
+    # made 'rename' abort on a perfectly healthy shutdown, so wait 20.
+    waited = 0
+    survivors: list[int] = []
+    for attempt in range(1, 201):
+        survivors = []
+        for pid in killed:
+            try:
+                os.kill(pid, 0)
+                survivors.append(pid)
+            except OSError:
+                pass
+        if not survivors:
+            break
+        time.sleep(0.1)
+        waited = attempt
+    if survivors:
+        sys.stderr.write(f"{C.RED}cdx: {len(survivors)} process(es) did not exit after "
+                         f"20 seconds: {' '.join(str(p) for p in survivors)}{C.RESET}\n")
+        sys.stderr.write(f"{C.YELLOW}     They were not force-killed; inspect them "
+                         f"and rerun cdx status.{C.RESET}\n")
         return 1
-    fi
-    [ "$waited" -lt 10 ] || printf '%s  (waited %ss for a graceful exit)%s\n' "$C_YELLOW" "$((waited / 10))" "$C_RESET"
-    printf '%s  All targeted processes exited.%s\n' "$C_GREEN" "$C_RESET"
-}
+    if waited >= 10:
+        out(f"{C.YELLOW}  (waited {waited // 10}s for a graceful exit){C.RESET}")
+    out(f"{C.GREEN}  All targeted processes exited.{C.RESET}")
+    return 0
 
-# What 'use' reports about the account you just landed on. Switching is
-# usually driven by quota, so the figure belongs at the moment of the switch,
-# not only in a listing you have to go and read. Cache only: activating an
-# account must never wait on, or fail because of, the network.
-#
-# The warning is the point. A listing tells you 'personal' is at 96% if you
-# happen to look; this tells you at the moment it starts costing you, and
-# names the account with room instead of making you go and compare.
-QUOTA_WARN_PERCENT="${CDX_QUOTA_WARN:-90}"
 
-report_quota() {
-    local target="$1"; shift
-    local n used resets state pct best="" best_pct=101 target_pct="" unusable=0
-    local kind acct plan age
-    while IFS=$'\037' read -r n kind acct plan used resets state age _; do
-        pct="$(pct_of "$used" || true)"
-        if [ "$n" = "$target" ]; then
-            target_pct="$pct"
-            case "$state" in
-                relogin)
-                    printf "%s  '%s' was rejected by OpenAI — its refresh token is dead.%s\n" "$C_RED" "$n" "$C_RESET"
-                    printf "%s  Run 'cdx add %s' to sign in again.%s\n" "$C_YELLOW" "$n" "$C_RESET"
-                    return 0
-                    ;;
+# ── use ──────────────────────────────────────────────────────────────────────
+def report_quota(target: str, names: list[str]) -> None:
+    """What 'use' reports about the account you just landed on. Cache only:
+    activating an account must never wait on, or fail because of, the network."""
+    saved = os.environ.get("CDX_USAGE")
+    os.environ["CDX_USAGE"] = "off"
+    try:
+        rows = profile_rows(names)
+    finally:
+        if saved is None:
+            os.environ.pop("CDX_USAGE", None)
+        else:
+            os.environ["CDX_USAGE"] = saved
+
+    best, best_pct, target_pct, unusable = "", 101, None, False
+    for r in rows:
+        pct = pct_of(r.used)
+        if r.name == target:
+            target_pct = pct
+            if r.state == "relogin":
+                out(f"{C.RED}  '{r.name}' was rejected by OpenAI — its refresh "
+                    f"token is dead.{C.RESET}")
+                out(f"{C.YELLOW}  Run 'cdx add {r.name}' to sign in again.{C.RESET}")
+                return
+            if r.state == "spendlimit":
                 # Landing here is exactly when this has to be said: every
                 # rate-limit field reports fine, so the percentage on the next
                 # line would otherwise read as permission to work.
-                spendlimit)
-                    printf "%s  '%s' is over its spend limit and cannot run — the%s\n" "$C_RED" "$n" "$C_RESET"
-                    printf "%s  usage below is its rate limit, which is not what stopped it.%s\n" "$C_RED" "$C_RESET"
-                    unusable=1
-                    ;;
-            esac
-            [ -z "$used" ] || printf '  quota: %s used, resets %s\n' "$used" "$resets"
+                out(f"{C.RED}  '{r.name}' is over its spend limit and cannot run "
+                    f"— the{C.RESET}")
+                out(f"{C.RED}  usage below is its rate limit, which is not what "
+                    f"stopped it.{C.RESET}")
+                unusable = True
+            if r.used:
+                out(f"  quota: {r.used} used, resets {r.resets}")
         # An account that cannot run is not a place to send anyone, however low
         # its percentage reads — and it reads low *because* it cannot run.
-        elif [ -n "$pct" ] && [ "$state" = ok ] && [ "$pct" -lt "$best_pct" ]; then
-            best="$n"; best_pct="$pct"
-        fi
-    done < <(CDX_USAGE=off profile_rows 0 "$@")
-    if [ "$unusable" = 0 ]; then
-        [ -n "$target_pct" ] || return 0
-        [ "$target_pct" -ge "$QUOTA_WARN_PERCENT" ] || return 0
-        printf '%s  %s is nearly out of quota (%s%% used).%s\n' "$C_YELLOW" "$target" "$target_pct" "$C_RESET"
+        elif pct is not None and r.state == "ok" and pct < best_pct:
+            best, best_pct = r.name, pct
+
+    if not unusable:
+        if target_pct is None or target_pct < QUOTA_WARN_PERCENT:
+            return
+        out(f"{C.YELLOW}  {target} is nearly out of quota ({target_pct}% used).{C.RESET}")
         # Only worth naming an alternative that is actually better.
-        [ -n "$best" ] && [ "$best_pct" -lt "$target_pct" ] || return 0
-    fi
-    [ -n "$best" ] || return 0
-    printf "%s  '%s' has the most room (%s%% used) — 'cdx use %s'.%s\n" \
-        "$C_YELLOW" "$best" "$best_pct" "$best" "$C_RESET"
-}
+        if not best or best_pct >= target_pct:
+            return
+    if not best:
+        return
+    out(f"{C.YELLOW}  '{best}' has the most room ({best_pct}% used) — "
+        f"'cdx use {best}'.{C.RESET}")
 
-# Activate an account for every client on this machine at once.
-cmd_use() {
-    local name="${1:-}" restart=1 dry_run=0
-    [ -n "$name" ] || die "use needs a name (try 'cdx' to list)"
-    validate_name "$name"
-    shift || true
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --restart) restart=1 ;;
-            --no-restart) restart=0 ;;
-            --dry-run) dry_run=1 ;;
-            *) die "unknown option to 'use': $1" ;;
-        esac
-        shift
-    done
-    initialized || die "run 'cdx init' first — it makes $CODEX_LINK switchable"
-    local home; home="$(home_of "$name")"
-    [ -d "$home" ] || missing_profile "$name"
-    # Resolve the old target before repointing. Restart it even when the name is
-    # already active: that is how a caller repairs stale cached connections.
-    local old_target=""
-    if [ "$dry_run" = 0 ]; then
-        acquire_switch_lock
-    fi
-    old_target="$(resolve_dir "$CODEX_LINK" || true)"
-    if [ "$dry_run" = 1 ]; then
-        printf '%sDry run:%s would activate %s%s%s (%s -> %s)\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
-        if [ "$restart" = 1 ] && [ -n "$old_target" ]; then
-            stop_bound_to "$old_target" 1
-        else
-            echo "  Existing Codex and remote connections would be left running."
-        fi
+
+def cmd_use(argv: list[str]) -> int:
+    if not argv:
+        die("use needs a name (try 'cdx' to list)")
+    name = argv[0]
+    validate_name(name)
+    restart, dry_run = True, False
+    for arg in argv[1:]:
+        if arg == "--restart":
+            restart = True
+        elif arg == "--no-restart":
+            restart = False
+        elif arg == "--dry-run":
+            dry_run = True
+        else:
+            die(f"unknown option to 'use': {arg}")
+    if not initialized():
+        die(f"run 'cdx init' first — it makes {CODEX_LINK} switchable")
+    home = home_of(name)
+    if not home.is_dir():
+        missing_profile(name)
+    # Resolve the old target before repointing. Restart it even when the name
+    # is already active: that is how a caller repairs stale cached connections.
+    if not dry_run:
+        acquire_switch_lock()
+    old_target = resolve_dir(CODEX_LINK)
+    if dry_run:
+        out(f"{C.YELLOW}Dry run:{C.RESET} would activate {C.CYAN}{name}{C.RESET} "
+            f"({CODEX_LINK} -> {home})")
+        if restart and old_target:
+            stop_bound_to(old_target, dry_run=True)
+        else:
+            out("  Existing Codex and remote connections would be left running.")
         return 0
-    fi
-    secure_all_profiles
-    link_shared "$home"
-    # -n is essential: without it ln (like mv) follows the existing symlink and
-    # drops the new link *inside* the profile directory, silently doing nothing.
-    ln -sfn "$home" "$CODEX_LINK"
-    printf '%s→%s %s%s%s is now active (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
-    [ -f "$home/auth.json" ] || printf "%s  '%s' is not logged in yet — run 'cdx add %s' to authenticate.%s\n" "$C_YELLOW" "$name" "$name" "$C_RESET"
-    local p pairs=()
-    while IFS= read -r p; do pairs+=("$p=$(home_of "$p")"); done < <(profile_names)
-    report_quota "$name" ${pairs[@]+"${pairs[@]}"}
-    if [ "$restart" = 1 ]; then
-        if [ -n "$old_target" ]; then
-            stop_bound_to "$old_target"
-        fi
-    else
-        echo "  Existing Codex and remote connections were left running by request."
-        echo "  They may keep the old account until restarted or reconnected."
-    fi
-}
+    secure_all_profiles()
+    link_shared(home)
+    _replace_symlink(home, CODEX_LINK)
+    out(f"{C.GREEN}→{C.RESET} {C.CYAN}{name}{C.RESET} is now active "
+        f"({CODEX_LINK} -> {home})")
+    if not (home / "auth.json").is_file():
+        out(f"{C.YELLOW}  '{name}' is not logged in yet — run 'cdx add {name}' "
+            f"to authenticate.{C.RESET}")
+    report_quota(name, profile_names())
+    if restart:
+        if old_target:
+            stop_bound_to(old_target)
+    else:
+        out("  Existing Codex and remote connections were left running by request.")
+        out("  They may keep the old account until restarted or reconnected.")
+    return 0
 
-# The browser flow needs a browser on THIS machine: 'codex login' spins up a
-# localhost callback server, so a browser elsewhere cannot complete it. Over
-# SSH or on a display-less box, device auth is the flow that works.
-headless() {
-    [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && return 0
-    [ "$(uname)" = Darwin ] && return 1
-    [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]
-}
 
-cmd_add() {
-    local name="${1:-}"
-    [ -n "$name" ] || die "add needs a name"
-    shift
-    validate_name "$name"
+def _replace_symlink(target: Path, link: Path) -> None:
+    """Repoint `link` at `target` atomically.
+
+    The shell version needed 'ln -sfn' here: without -n, ln follows the
+    existing symlink and drops the new one *inside* the profile directory,
+    silently doing nothing. os.symlink to a temp name plus rename has the same
+    effect and is atomic besides.
+    """
+    tmp = link.with_name(link.name + f".cdx-tmp-{os.getpid()}")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    os.symlink(target, tmp)
+    os.rename(tmp, link)
+
+
+# ── add ──────────────────────────────────────────────────────────────────────
+def headless() -> bool:
+    """The browser flow needs a browser on THIS machine: 'codex login' spins up
+    a localhost callback server, so a browser elsewhere cannot complete it."""
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return True
+    if os.uname().sysname == "Darwin":
+        return False
+    return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def cmd_add(argv: list[str]) -> int:
+    if not argv:
+        die("add needs a name")
+    name, rest = argv[0], argv[1:]
+    validate_name(name)
     # Before 'cdx init', 'main' means ~/.codex itself; afterwards (and perhaps
     # renamed away) it is an ordinary name again.
-    if ! initialized && [ "$name" = main ]; then die "'main' is reserved for $CODEX_LINK"; fi
-    local home; home="$(home_of "$name")"
-    if [ -d "$home" ]; then
-        # A profile with no credentials is a login that never finished (say,
-        # a Ctrl-C'd browser flow) — retry it instead of demanding a new name.
-        [ ! -f "$home/auth.json" ] || die "$name already exists ($home)"
-        echo "→ '$name' exists but is not logged in — retrying login"
-    fi
-    mkdir -p "$home"
-    secure_profile "$home"
-    link_shared "$home"
-    local login_args=("$@")
-    if [ ${#login_args[@]} -eq 0 ] && headless; then
-        login_args=(--device-auth)
-    fi
-    case " ${login_args[*]-} " in
-        *" --device-auth "*)
-            echo "→ logging in to '$name' with device auth (no local browser needed)" ;;
-        *)  echo "→ logging in to '$name' (a browser window will open)" ;;
-    esac
-    CODEX_HOME="$home" codex login ${login_args[@]+"${login_args[@]}"}
-    secure_profile "$home"
-}
+    if not initialized() and name == "main":
+        die(f"'main' is reserved for {CODEX_LINK}")
+    home = home_of(name)
+    if home.is_dir():
+        # A profile with no credentials is a login that never finished (say, a
+        # Ctrl-C'd browser flow) — retry it instead of demanding a new name.
+        if (home / "auth.json").is_file():
+            die(f"{name} already exists ({home})")
+        out(f"→ '{name}' exists but is not logged in — retrying login")
+    home.mkdir(parents=True, exist_ok=True)
+    secure_profile(home)
+    link_shared(home)
+    login_args = list(rest)
+    if not login_args and headless():
+        login_args = ["--device-auth"]
+    if "--device-auth" in login_args:
+        out(f"→ logging in to '{name}' with device auth (no local browser needed)")
+    else:
+        out(f"→ logging in to '{name}' (a browser window will open)")
+    env = dict(os.environ, CODEX_HOME=str(home))
+    subprocess.run(["codex", "login", *login_args], env=env)
+    secure_profile(home)
+    return 0
 
-# Rename a profile. Nothing points *into* a profile once the store exists, so
-# this is a same-filesystem mv plus the active pointer — no link rewriting, and
-# no profile is exempt.
-cmd_rename() {
-    local old="${1:-}" new="${2:-}"
-    [ -n "$old" ] && [ -n "$new" ] || die "usage: cdx rename <old> <new>"
-    validate_name "$old"
-    validate_name "$new"
-    initialized || die "run 'cdx init' first — before that, 'main' is $CODEX_LINK itself"
-    require_store
-    local old_home="$PROFILES/$old" new_home="$PROFILES/$new"
-    [ -d "$old_home" ] || missing_profile "$old"
-    [ ! -e "$new_home" ] || die "$new already exists ($new_home)"
-    acquire_switch_lock
-    local active; active="$(active_profile)"
+
+# ── rename, rm, link ─────────────────────────────────────────────────────────
+def cmd_rename(argv: list[str]) -> int:
+    if len(argv) < 2 or not argv[0] or not argv[1]:
+        die("usage: cdx rename <old> <new>")
+    old, new = argv[0], argv[1]
+    validate_name(old)
+    validate_name(new)
+    if not initialized():
+        die(f"run 'cdx init' first — before that, 'main' is {CODEX_LINK} itself")
+    require_store()
+    old_home, new_home = PROFILES / old, PROFILES / new
+    if not old_home.is_dir():
+        missing_profile(old)
+    if new_home.exists():
+        die(f"{new} already exists ({new_home})")
+    acquire_switch_lock()
+    active = active_profile()
     # Running processes cache the old path (CODEX_HOME strings, log fds); stop
     # the ones holding files under it while fd inspection can still see the
     # pre-rename path. Proxies without such files keep running: the account
     # behind ~/.codex is not changing, only its directory name.
-    stop_bound_to "$old_home" 0 if-stale || die "rename aborted — inspect the survivors and rerun"
-    mv "$old_home" "$new_home"
-    [ "$active" != "$old" ] || ln -sfn "$new_home" "$CODEX_LINK"
-    printf '%s→%s renamed %s%s%s to %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$old" "$C_RESET" "$C_CYAN" "$new" "$C_RESET"
-    [ "$active" != "$old" ] || echo "  It stays the active profile ($CODEX_LINK -> $new_home)."
-}
+    if stop_bound_to(str(old_home), proxy_policy="if-stale") != 0:
+        die("rename aborted — inspect the survivors and rerun")
+    os.rename(old_home, new_home)
+    if active == old:
+        _replace_symlink(new_home, CODEX_LINK)
+    out(f"{C.GREEN}→{C.RESET} renamed {C.CYAN}{old}{C.RESET} to {C.CYAN}{new}{C.RESET}")
+    if active == old:
+        out(f"  It stays the active profile ({CODEX_LINK} -> {new_home}).")
+    return 0
 
-cmd_rm() {
-    local name="${1:-}" assume_yes=0 reply
-    [ -n "$name" ] || die "rm needs a name"
-    shift
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -y|--yes) assume_yes=1 ;;
-            *) die "unknown option to 'rm': $1" ;;
-        esac
-        shift
-    done
-    # No profile-is-load-bearing guard needed: shared data lives in $STORE,
-    # which validate_name cannot name. Deleting any profile costs its
-    # credentials and logs — the history and caches are not inside it.
-    validate_name "$name"
-    local home; home="$(home_of "$name")"
-    [ -d "$home" ] || missing_profile "$name"
+
+def cmd_rm(argv: list[str]) -> int:
+    if not argv:
+        die("rm needs a name")
+    name, rest = argv[0], argv[1:]
+    assume_yes = False
+    for arg in rest:
+        if arg in ("-y", "--yes"):
+            assume_yes = True
+        else:
+            die(f"unknown option to 'rm': {arg}")
+    # No profile-is-load-bearing guard needed: shared data lives in the store,
+    # which validate_name cannot name.
+    validate_name(name)
+    home = home_of(name)
+    if not home.is_dir():
+        missing_profile(name)
     # The guard must not be conditional on 'initialized'. Before 'cdx init',
-    # home_of maps 'main' to $CODEX_LINK itself — the one real copy of every
+    # home_of maps 'main' to CODEX_LINK itself — the one real copy of every
     # profile's config, conversations and caches, none of it yet hoisted into
-    # the store. Skipping the check there turned 'cdx rm main' into an
-    # rm -rf ~/.codex behind a single y/N.
-    if [ "$(resolve_dir "$CODEX_LINK" || true)" = "$(resolve_dir "$home")" ]; then
-        if initialized; then
-            die "refusing to delete the active profile '$name' (switch profiles first)"
-        fi
-        die "refusing to delete '$name' — before 'cdx init' it is $CODEX_LINK itself,
-     which holds the only copy of your config, conversations and caches"
-    fi
-    if [ "$assume_yes" = 0 ]; then
+    # the store.
+    if resolve_dir(CODEX_LINK) == resolve_dir(home):
+        if initialized():
+            die(f"refusing to delete the active profile '{name}' (switch profiles first)")
+        die(f"refusing to delete '{name}' — before 'cdx init' it is {CODEX_LINK} itself,\n"
+            "     which holds the only copy of your config, conversations and caches")
+    if not assume_yes:
         # Same reasoning as 'init': with no terminal nobody can answer, and
-        # letting 'read' hit EOF would abort with no explanation.
-        [ -t 0 ] || die "not a terminal — rerun as 'cdx rm $name -y' to confirm"
-        printf 'delete %s and its credentials? [y/N] ' "$home"
-        read -r reply || reply=""
-        [ "$reply" = y ] || [ "$reply" = Y ] || { echo "cancelled"; return 1; }
-    fi
-    rm -rf "$home"
-    echo "removed $name"
-}
+        # letting a read hit EOF would abort with no explanation.
+        if not sys.stdin.isatty():
+            die(f"not a terminal — rerun as 'cdx rm {name} -y' to confirm")
+        sys.stdout.write(f"delete {home} and its credentials? [y/N] ")
+        sys.stdout.flush()
+        reply = sys.stdin.readline().strip()
+        if reply not in ("y", "Y"):
+            out("cancelled")
+            return 1
+    shutil.rmtree(home)
+    out(f"removed {name}")
+    return 0
 
-# Rebuild every profile's links to the store. This is the repair command: the
-# store path is fixed, so a profile's links are fully derivable and any of them
-# can be recreated after Codex overwrites one, or a rename leaves one stale.
-cmd_link() {
-    local home
-    require_store
-    secure_all_profiles
-    for home in "$PROFILES"/*/; do
-        [ -d "$home" ] || continue
-        link_shared "${home%/}"
-        echo "linked $(basename "$home")"
-    done
-}
 
-# The desktop app defaults to ~/.codex and has no in-app switcher, but macOS
-# can hand it a different one at launch. Two knobs, because the integrated app
-# is two things: CODEX_HOME holds Codex-local state (auth.json), while the
-# ChatGPT login itself lives in the Electron session, hence --user-data-dir.
-cmd_app() {
-    local name="" workspace="" stock=0
+def cmd_link() -> int:
+    """Rebuild every profile's links to the store. This is the repair command:
+    the store path is fixed, so a profile's links are fully derivable."""
+    require_store()
+    secure_all_profiles()
+    if PROFILES.is_dir():
+        for entry in sorted(PROFILES.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                link_shared(entry)
+                out(f"linked {entry.name}")
+    return 0
+
+
+# ── app, ssh, run ────────────────────────────────────────────────────────────
+def cmd_app(argv: list[str]) -> int:
+    """The desktop app defaults to ~/.codex and has no in-app switcher, but
+    macOS can hand it a different one at launch. Two knobs, because the
+    integrated app is two things: CODEX_HOME holds Codex-local state, while the
+    ChatGPT login itself lives in the Electron session."""
+    name = workspace = ""
+    stock = False
     # [dir] is optional, so --stock has to be recognised wherever it lands
-    # rather than at a fixed position: 'cdx app work --stock' used to pass the
-    # flag through as the workspace path and launch non-stock anyway.
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --stock) stock=1 ;;
-            -*) die "unknown option to 'app': $1" ;;
-            *)
-                if [ -z "$name" ]; then name="$1"
-                elif [ -z "$workspace" ]; then workspace="$1"
-                else die "unexpected argument to 'app': $1"
-                fi
-                ;;
-        esac
-        shift
-    done
+    # rather than at a fixed position.
+    for arg in argv:
+        if arg == "--stock":
+            stock = True
+        elif arg.startswith("-"):
+            die(f"unknown option to 'app': {arg}")
+        elif not name:
+            name = arg
+        elif not workspace:
+            workspace = arg
+        else:
+            die(f"unexpected argument to 'app': {arg}")
     # Default to whatever is active, not a hardcoded 'main' — that name is
     # only the initial one and 'cdx rename' may have moved it.
-    [ -n "$name" ] || name="$(active_profile)"
-    [ -n "$workspace" ] || workspace="$PWD"
-    validate_name "$name"
-    [ "$(uname)" = Darwin ] || die "app launching is macOS-only"
-    local home; home="$(home_of "$name")"
-    [ -d "$home" ] || missing_profile "$name"
+    name = name or active_profile()
+    workspace = workspace or os.getcwd()
+    validate_name(name)
+    if os.uname().sysname != "Darwin":
+        die("app launching is macOS-only")
+    home = home_of(name)
+    if not home.is_dir():
+        missing_profile(name)
 
-    local app="${CHATGPT_APP:-}" candidate
-    if [ -z "$app" ]; then
-        for candidate in /Applications/ChatGPT.app /Applications/Codex.app; do
-            [ -d "$candidate" ] && { app="$candidate"; break; }
-        done
-    fi
-    [ -n "$app" ] || die "desktop app not found — set CHATGPT_APP=/path/to/ChatGPT.app"
+    app = os.environ.get("CHATGPT_APP", "")
+    if not app:
+        for candidate in ("/Applications/ChatGPT.app", "/Applications/Codex.app"):
+            if Path(candidate).is_dir():
+                app = candidate
+                break
+    if not app:
+        die("desktop app not found — set CHATGPT_APP=/path/to/ChatGPT.app")
 
-    secure_profile "$home"
-    link_shared "$home"
-    echo "→ $app  (CODEX_HOME=$home)"
-    if [ "$stock" = 1 ]; then
+    secure_profile(home)
+    link_shared(home)
+    out(f"→ {app}  (CODEX_HOME={home})")
+    if stock:
         # Reuse the app's default Electron session — the existing ChatGPT
         # desktop login — rather than giving this profile its own.
-        open -n --env "CODEX_HOME=$home" -a "$app" "$workspace"
-    else
-        mkdir -p "$home/electron"
-        open -n --env "CODEX_HOME=$home" -a "$app" "$workspace" \
-            --args "--user-data-dir=$home/electron"
-    fi
-}
+        subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
+                        "-a", app, workspace])
+    else:
+        (home / "electron").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
+                        "-a", app, workspace,
+                        "--args", f"--user-data-dir={home}/electron"])
+    return 0
 
-# Run cdx on a remote host: 'cdx ssh baram use work' switches baram's account.
-# Each host keeps its own accounts and its own active one; this is just a way
-# to drive them without opening a shell.
-cmd_ssh() {
-    local host="${1:-}"
-    [ -n "$host" ] || die "usage: cdx ssh <host> [cdx args...]"
-    shift
 
-    # Reachability is ssh's business: jump hosts, ports, users and keys all come
-    # from ~/.ssh/config. Add 'ProxyJump' there if a host needs one — that fixes
-    # it for every tool at once, including the desktop app's remote connections.
-    local ssh_cmd=(ssh)
+def cmd_ssh(argv: list[str]) -> int:
+    """Run cdx on a remote host: 'cdx ssh baram use work'. Each host keeps its
+    own accounts and its own active one; this is just a way to drive them
+    without opening a shell."""
+    if not argv:
+        die("usage: cdx ssh <host> [cdx args...]")
+    host, rest = argv[0], argv[1:]
+    # Reachability is ssh's business: jump hosts, ports, users and keys all
+    # come from ~/.ssh/config.
+    ssh_cmd = ["ssh"]
     # A TTY is needed for the prompts in 'use' and 'add', but asking for one
     # when stdin is a pipe just prints a warning, so only do it when useful.
-    [ -t 0 ] && ssh_cmd+=(-t)
-    # Word splitting is the point: CDX_SSH_OPTS holds ssh flags, so
-    # CDX_SSH_OPTS='-p 2222 -v' has to become three arguments, not one.
-    # shellcheck disable=SC2206
-    [ -n "${CDX_SSH_OPTS:-}" ] && ssh_cmd+=($CDX_SSH_OPTS)
-
+    if sys.stdin.isatty():
+        ssh_cmd.append("-t")
+    opts = os.environ.get("CDX_SSH_OPTS", "")
+    if opts:
+        ssh_cmd.extend(opts.split())
     # Ship this script to the host and run it there, instead of requiring an
     # install on every machine. base64 so no quoting survives contact with two
     # shells; stdin stays free, which is what lets -t carry the prompts.
-    local enc args=""
-    enc="$(base64 < "$SELF" | tr -d '\n')"
-    local a
-    for a in "$@"; do args+=" $(printf '%q' "$a")"; done
-
+    enc = base64.b64encode(SELF.read_bytes()).decode()
+    args = "".join(" " + _shell_quote(a) for a in rest)
     # PATH: a non-interactive ssh shell has neither ~/.local/bin nor the codex
     # install dir, and rc files are not sourced, so set it explicitly.
-    "${ssh_cmd[@]}" "$host" "f=\$(mktemp) && printf %s $enc | base64 -d > \$f &&
-        PATH=\"\$HOME/.local/bin:\$PATH\" bash \$f$args; r=\$?; rm -f \$f; exit \$r"
-}
+    remote = (f"f=$(mktemp) && printf %s {enc} | base64 -d > $f && "
+              f'PATH="$HOME/.local/bin:$PATH" python3 $f{args}; '
+              "r=$?; rm -f $f; exit $r")
+    return subprocess.run([*ssh_cmd, host, remote]).returncode
 
-cmd_run() {
-    local name="$1"; shift
-    validate_name "$name"
-    local home; home="$(home_of "$name")"
-    [ -d "$home" ] || missing_profile "$name"
-    secure_profile "$home"
-    link_shared "$home"
-    [ -f "$home/auth.json" ] || echo "cdx: '$name' is not logged in — Codex will prompt." >&2
-    exec env CODEX_HOME="$home" codex "$@"
-}
 
-# Per-command help. 'cdx -h' is a map of the whole tool and stays short by
-# leaving each command's detail out; the detail has to live somewhere, and
-# 'cdx <command> -h' is where anyone looks for it.
-sub_help() {
-    case "$1" in
-        list) cat <<EOF
-cdx [list] [--refresh] [--no-usage]
+def _shell_quote(word: str) -> str:
+    return "'" + word.replace("'", "'\\''") + "'"
+
+
+def cmd_run(argv: list[str]) -> "NoReturn":  # type: ignore[valid-type]
+    name, rest = argv[0], argv[1:]
+    validate_name(name)
+    home = home_of(name)
+    if not home.is_dir():
+        missing_profile(name)
+    secure_profile(home)
+    link_shared(home)
+    if not (home / "auth.json").is_file():
+        sys.stderr.write(f"cdx: '{name}' is not logged in — Codex will prompt.\n")
+    os.execvpe("codex", ["codex", *rest], dict(os.environ, CODEX_HOME=str(home)))
+
+
+# ── help ─────────────────────────────────────────────────────────────────────
+def usage() -> None:
+    out(f"""cdx — switch between Codex accounts.
+
+Every Codex client — CLI, desktop app, VS Code, the app's SSH remote — reads
+{tilde(str(CODEX_LINK))}. cdx makes that a symlink, so switching accounts is just
+re-pointing it and no client needs configuring.
+
+{C.CYAN}Every day{C.RESET}
+  cdx                      list accounts, with how much quota each has left
+  cdx use <name>           make <name> active for every client on this machine
+  cdx <name> [args...]     run one codex command as <name>, without switching
+  cdx status [name]        check an account (the active one by default)
+                           against what is running
+
+{C.CYAN}Managing accounts{C.RESET}
+  cdx add <name>           create <name> and log in
+  cdx rename <old> <new>   rename an account — any of them, 'main' included
+  cdx rm <name>            delete <name> and its credentials
+
+{C.CYAN}Other machines{C.RESET}
+  cdx app <name> [dir]     launch the desktop app as <name> (macOS only)
+  cdx ssh <host> [args...] run cdx on <host>, e.g. 'cdx ssh baram use work'
+                           (cdx ships itself; nothing to install there)
+
+{C.CYAN}Setup and repair{C.RESET}
+  cdx init                 one-time: make {tilde(str(CODEX_LINK))} a switchable link
+  cdx link                 rebuild every account's links to the store
+
+{C.CYAN}Options{C.RESET}
+  --refresh                take a live quota reading instead of the cached one
+  --no-usage               skip quota entirely
+  use --no-restart         leave running clients on the old account
+  use --dry-run            show what would change, and change nothing
+  add <name> [args...]     extra arguments pass through to 'codex login'
+  app <name> [dir] --stock reuse the app's existing ChatGPT desktop login
+  init -y / rm <name> -y   skip the confirmation prompt
+  status <name>            report that account instead of the active one
+  status --json            machine-readable, with the raw quota figures
+
+{C.CYAN}Layout{C.RESET}
+  accounts  {tilde(str(PROFILES))}/<name>
+  shared    {tilde(str(STORE))}
+  An account holds only its credentials and logs. Everything shareable —
+  config, conversations, memories, attachments, caches — lives once in the
+  store and is symlinked into each account, so accounts stay a few hundred KB,
+  'resume' finds your work whichever account is active, and any account can be
+  renamed or deleted. 'cdx link' rebuilds those symlinks if Codex overwrites
+  one.
+
+{C.CYAN}Environment{C.RESET}
+  CODEX_PROFILES           where accounts live
+  CDX_CODEX_LINK           the switchable link, normally {tilde(str(CODEX_LINK))}
+  CDX_USAGE                off never asks OpenAI for quota; auto re-fetches
+                           once the cache is older than CDX_USAGE_TTL seconds
+                           (900). The default only fills an empty cache, so
+                           listing never waits on the network.
+  CDX_QUOTA_WARN           percent at which 'use' warns you (90)
+  CDX_COLOR                auto, always or never (NO_COLOR also disables it)
+  CDX_NO_KILL=1            report which processes would be stopped, stop none""")
+
+
+SUB_HELP = {
+    "list": """cdx [list] [--refresh] [--no-usage]
 
   List accounts, '*' marking the active one, with how much of its rate-limit
   window each has spent and when that window resets. An account that cannot
@@ -1546,11 +1627,8 @@ cdx [list] [--refresh] [--no-usage]
   're-login'); 'cdx status <name>' then gives the long form.
 
   --refresh    ask OpenAI for live figures instead of using the cache
-  --no-usage   skip the quota lookup entirely
-EOF
-        ;;
-        status) cat <<EOF
-cdx status [name] [--json]
+  --no-usage   skip the quota lookup entirely""",
+    "status": """cdx status [name] [--json]
 
   Report an account and check it against what is running on this machine.
   With no name, the active account.
@@ -1564,13 +1642,10 @@ cdx status [name] [--json]
   in a script.
 
   --json       machine-readable, with raw percentages and epochs, plus
-               'reported_profile' alongside 'active_profile'
-EOF
-        ;;
-        use) cat <<EOF
-cdx use <name> [--no-restart] [--dry-run]
+               'reported_profile' alongside 'active_profile'""",
+    "use": """cdx use <name> [--no-restart] [--dry-run]
 
-  Point $(tilde "$CODEX_LINK") at <name>, which switches every Codex client on this
+  Point ~/.codex at <name>, which switches every Codex client on this
   machine at once, then stop the processes still bound to the old account so
   they come back on the new one. SSH remote proxies are disconnected too, so
   the desktop app reconnects rather than holding a dead backend.
@@ -1579,129 +1654,124 @@ cdx use <name> [--no-restart] [--dry-run]
   quota or cannot run at all, naming the account with the most room.
 
   --no-restart  leave running clients on the old account
-  --dry-run     show what would change, change nothing
-EOF
-        ;;
-        add) cat <<EOF
-cdx add <name> [args...]
+  --dry-run     show what would change, change nothing""",
+    "add": """cdx add <name> [args...]
 
   Create <name> and log in. Extra arguments pass through to 'codex login';
   over SSH or without a display, device auth is used automatically. Rerunning
-  it on an account whose login never finished retries that login.
-EOF
-        ;;
-        app) cat <<EOF
-cdx app [name] [dir] [--stock]
+  it on an account whose login never finished retries that login.""",
+    "app": """cdx app [name] [dir] [--stock]
 
   Launch the desktop app as <name> (macOS only), defaulting to the active
   account and the current directory.
 
   --stock      reuse the app's existing ChatGPT desktop login instead of
-               giving this account its own Electron session
-EOF
-        ;;
-        ssh) cat <<EOF
-cdx ssh <host> [args...]
+               giving this account its own Electron session""",
+    "ssh": """cdx ssh <host> [args...]
 
   Run cdx on <host>: 'cdx ssh baram use work'. The script ships itself over
   the connection, so nothing needs installing there. Each host keeps its own
   accounts and its own active one. Reachability — ports, users, ProxyJump —
-  comes from ~/.ssh/config; CDX_SSH_OPTS adds flags for one call.
-EOF
-        ;;
-        rename) cat <<EOF
-cdx rename <old> <new>
+  comes from ~/.ssh/config; CDX_SSH_OPTS adds flags for one call.""",
+    "rename": """cdx rename <old> <new>
 
   Rename an account, 'main' included. Nothing points into an account once the
   store exists, so this is a directory rename plus the active pointer.
-  Processes holding files under the old path are stopped first.
-EOF
-        ;;
-        rm) cat <<EOF
-cdx rm <name> [-y]
+  Processes holding files under the old path are stopped first.""",
+    "rm": """cdx rm <name> [-y]
 
   Delete <name> and its credentials. Shared history, config and caches live in
   the store, so they survive. Refuses to delete the active account, and
-  refuses 'main' before 'cdx init', where it is still $(tilde "$CODEX_LINK") itself.
+  refuses 'main' before 'cdx init', where it is still ~/.codex itself.
 
-  -y           skip the confirmation prompt
-EOF
-        ;;
-        init) cat <<EOF
-cdx init [-y]
+  -y           skip the confirmation prompt""",
+    "init": """cdx init [-y]
 
-  One-time setup: turn $(tilde "$CODEX_LINK") into a symlink so accounts can be switched
-  by re-pointing it. The current account moves to $(tilde "$PROFILES")/main and stays
-  active; shared data is hoisted into the store. A rename on one filesystem,
-  so nothing is copied.
+  One-time setup: turn ~/.codex into a symlink so accounts can be switched
+  by re-pointing it. The current account moves to the accounts directory and
+  stays active; shared data is hoisted into the store. A rename on one
+  filesystem, so nothing is copied.
 
-  -y           skip the confirmation prompt
-EOF
-        ;;
-        link) cat <<EOF
-cdx link
+  -y           skip the confirmation prompt""",
+    "link": """cdx link
 
   Rebuild every account's symlinks into the store. The repair command: run it
   if Codex overwrites a link with a real file, or a link is left pointing
   somewhere stale. An account's own data is never replaced — it is reported
-  and left alone.
-EOF
-        ;;
-    esac
+  and left alone.""",
 }
 
-# 'link' is exempt from both checks because it is the repair command, and the
-# breakage it repairs takes codex off PATH. The launcher at ~/.local/bin/codex
-# is a symlink through the shared packages/ dir, so the moment that dir moves —
-# a hand-run migration, a renamed store — resolving it fails. Demanding codex
-# here would put the only fix on the far side of the thing that needs fixing.
-# cmd_link shells out to neither: it only rewrites symlinks.
-#
-# python3 is checked up front rather than at each use: it decodes the id_token
-# JWT for the account column, ranks the typo suggestion, and emits
-# 'status --json'. Failing here names the missing dependency once, instead of
-# letting the plain 'cdx' listing die inside a heredoc. Any host with codex
-# installed has it.
-case "${1:-}" in
-    link) ;;
-    *)  command -v codex   >/dev/null || die "codex is not on PATH"
-        command -v python3 >/dev/null || die "python3 is not on PATH" ;;
-esac
 
-# Only the word straight after the command counts as a help request: 'cdx add
-# work --help' is asking 'codex login' for its help, not cdx for its own.
-case "${2:-}" in
-    -h|--help)
-        case "${1:-}" in
-            list|ls) sub_help list; exit 0 ;;
-            rename|mv) sub_help rename; exit 0 ;;
-            status|use|add|app|ssh|rm|init|link) sub_help "$1"; exit 0 ;;
-        esac
-        ;;
-esac
+# ── dispatch ─────────────────────────────────────────────────────────────────
+def main(argv: list[str]) -> int:
+    _init_color()
+    _check_endpoint()
 
-case "${1:-}" in
-    "") list_profiles ;;
-    list|ls) shift; list_profiles "$@" ;;
-    # The listing is the default command, so its flags have to work without
-    # naming it — 'cdx --refresh' is what you actually type.
-    --refresh|--no-usage) list_profiles "$@" ;;
-    -h|--help|help) usage ;;
-    add)    shift; cmd_add "$@" ;;
-    init)   shift; cmd_init "$@" ;;
-    use)    shift; cmd_use "$@" ;;
-    app)    shift; cmd_app "$@" ;;
-    status) shift; cmd_status "$@" ;;
-    ssh)    shift; cmd_ssh "$@" ;;
-    rename|mv) shift; cmd_rename "$@" ;;
-    # Removed once every machine had been converted. Kept as a dispatch entry
-    # so muscle memory gets the layout answer instead of "no such profile".
-    migrate)
-        if legacy_layout; then explain_legacy; exit 1; fi
-        echo "cdx: 'migrate' is gone — this install already uses the store ($STORE)"
-        ;;
-    rm)     shift; cmd_rm "$@" ;;
-    link)   shift; cmd_link ;;
-    -*)     die "unknown option $1 (see cdx -h)" ;;
-    *)      cmd_run "$@" ;;
-esac
+    command = argv[0] if argv else ""
+    rest = argv[1:]
+
+    # Only the word straight after the command counts as a help request: 'cdx
+    # add work --help' is asking 'codex login' for its help, not cdx for its
+    # own.
+    if rest and rest[0] in ("-h", "--help"):
+        key = {"ls": "list", "mv": "rename"}.get(command, command)
+        if key in SUB_HELP:
+            out(SUB_HELP[key])
+            return 0
+
+    if command in ("-h", "--help", "help"):
+        usage()
+        return 0
+
+    # 'link' is exempt from the codex check because it is the repair command,
+    # and the breakage it repairs takes codex off PATH. The launcher at
+    # ~/.local/bin/codex is a symlink through the shared packages/ dir, so the
+    # moment that dir moves — a hand-run migration, a renamed store —
+    # resolving it fails. Demanding codex here would put the only fix on the
+    # far side of the thing that needs fixing. cmd_link shells out to nothing.
+    if command != "link" and not shutil.which("codex"):
+        die("codex is not on PATH")
+
+    if command in ("", "list", "ls"):
+        return list_profiles(rest if command else argv)
+    if command in ("--refresh", "--no-usage"):
+        # The listing is the default command, so its flags have to work
+        # without naming it — 'cdx --refresh' is what you actually type.
+        return list_profiles(argv)
+    if command == "add":
+        return cmd_add(rest)
+    if command == "init":
+        return cmd_init(rest)
+    if command == "use":
+        return cmd_use(rest)
+    if command == "app":
+        return cmd_app(rest)
+    if command == "status":
+        return cmd_status(rest)
+    if command == "ssh":
+        return cmd_ssh(rest)
+    if command in ("rename", "mv"):
+        return cmd_rename(rest)
+    if command == "migrate":
+        # Removed once every machine had been converted. Kept as a dispatch
+        # entry so muscle memory gets the layout answer instead of "no such
+        # profile".
+        if legacy_layout():
+            explain_legacy()
+            return 1
+        out(f"cdx: 'migrate' is gone — this install already uses the store ({STORE})")
+        return 0
+    if command == "rm":
+        return cmd_rm(rest)
+    if command == "link":
+        return cmd_link()
+    if command.startswith("-"):
+        die(f"unknown option {command} (see cdx -h)")
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    finally:
+        release_switch_lock()
