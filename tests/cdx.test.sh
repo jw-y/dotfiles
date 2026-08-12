@@ -144,7 +144,7 @@ cdx() {
         ${CDX_USAGE_TTL+CDX_USAGE_TTL="$CDX_USAGE_TTL"} \
         ${CDX_QUOTA_WARN+CDX_QUOTA_WARN="$CDX_QUOTA_WARN"} \
         CODEX_PROFILES="$d/profiles" CDX_CODEX_LINK="$d/codex" \
-        bash "$CDX" "$@" 2>&1
+        "$CDX" "$@" 2>&1
 }
 
 md5of() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
@@ -609,7 +609,7 @@ it "pointer really moved";               assert_link "$D/codex" "$D/profiles/wor
 mkdir -p "$D/profiles/blank"
 it "use warns when not logged in";       assert_contains "$(cdx "$D" use blank --no-restart)" "not logged in yet"
 it "use suggests a near-miss name";      assert_contains "$(cdx "$D" use wrok)" "did you mean 'work'"
-it "unknown profile is an error";        assert_fails env HOME="$D" PATH="$D/bin:/usr/bin:/bin" CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" bash "$CDX" use nope
+it "unknown profile is an error";        assert_fails env HOME="$D" PATH="$D/bin:/usr/bin:/bin" CODEX_PROFILES="$D/profiles" CDX_CODEX_LINK="$D/codex" "$CDX" use nope
 
 # ---------------------------------------------------------- dependencies -----
 # Both are checked before dispatch, so the failure names the missing program
