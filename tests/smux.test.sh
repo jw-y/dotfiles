@@ -78,6 +78,30 @@ grep -q 'beta' <<<"$status" || fail 'status beta'
 grep -q '1R/0P' <<<"$status" || fail 'status job count'
 pass status
 
+# An ERROR column on every row says nothing when the clusters are healthy,
+# which is the usual case; it appears only when a host actually failed.
+grep -q 'ERROR' <<<"$status" && fail 'ERROR column on a healthy listing'
+pass 'no ERROR column when healthy'
+
+mkdir -p "$T/failbin"
+cat > "$T/failbin/ssh" <<'SH'
+#!/usr/bin/env bash
+echo 'ssh: Could not resolve hostname' >&2
+exit 255
+SH
+chmod +x "$T/failbin/ssh"
+down="$(PATH="$T/failbin:/usr/bin:/bin" "$SMUX" status || true)"
+grep -q 'ERROR' <<<"$down" || fail 'ERROR column missing when a host failed'
+grep -q 'error' <<<"$down" || fail 'failed host not marked'
+pass 'ERROR column appears when needed'
+
+# A config of nothing but comments leaves no hosts to probe. It must say so
+# rather than reaching the thread pool, which rejects max_workers=0.
+printf '# only comments\n' > "$T/empty-hosts"
+empty="$(SMUX_HOSTS="$T/empty-hosts" "$SMUX" status 2>&1 || true)"
+grep -q 'no hosts configured' <<<"$empty" || fail "empty config: $empty"
+pass 'empty config is explained'
+
 gpus="$($SMUX gpus)"
 grep -Eq 'alpha +0 +debug +0/81920 MiB +0% +yes' <<<"$gpus" || fail 'gpus idle debug mapping'
 grep -Eq 'alpha +1 +gpu +4096/81920 MiB +75% +no' <<<"$gpus" || fail 'gpus busy mapping'

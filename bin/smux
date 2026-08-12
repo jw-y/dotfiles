@@ -236,6 +236,11 @@ def probe_host(host: str) -> ClusterStatus:
 
 
 def probe_many(hosts: list[str]) -> list[ClusterStatus]:
+    # ThreadPoolExecutor rejects max_workers=0, so an empty list would raise
+    # rather than return nothing. select_hosts() dies before that can happen
+    # today, which is exactly why it is worth pinning here instead.
+    if not hosts:
+        return []
     results: dict[str, ClusterStatus] = {}
     with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as executor:
         futures = {executor.submit(probe_host, host): host for host in hosts}
@@ -300,6 +305,10 @@ def command_status(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps([asdict(status) for status in statuses], indent=2))
         return int(any(status.error for status in statuses))
+    # The ERROR column costs width on every row to say nothing at all when the
+    # clusters are healthy, which is the usual case. Add it only when there is
+    # something to put in it.
+    failed = any(status.error for status in statuses)
     rows: list[list[str]] = []
     for status in statuses:
         if status.error:
@@ -317,8 +326,13 @@ def command_status(args: argparse.Namespace) -> int:
         running = sum(job["state"] == "RUNNING" for job in status.jobs)
         pending = sum(job["state"] == "PENDING" for job in status.jobs)
         rows.append([status.host, status.scheduler, partitions, gpus, f"{running}R/{pending}P", ""])
-    print_table(["HOST", "SCHEDULER", "PARTITIONS", "GPUS", "MY JOBS", "ERROR"], rows)
-    return int(any(status.error for status in statuses))
+    headers = ["HOST", "SCHEDULER", "PARTITIONS", "GPUS", "MY JOBS"]
+    if failed:
+        headers.append("ERROR")
+    else:
+        rows = [row[:-1] for row in rows]
+    print_table(headers, rows)
+    return int(failed)
 
 
 def command_gpus(args: argparse.Namespace) -> int:
