@@ -90,7 +90,9 @@ usage() {
 cdx — switch between Codex accounts.
 
 Usage:
-  cdx                       list profiles ('*' marks the active one)
+  cdx [--refresh]           list profiles ('*' marks the active one) with each
+                            account's quota; --refresh re-asks OpenAI instead of
+                            using the cached figure, --no-usage skips it entirely
   cdx init [-y]             one-time: make $CODEX_LINK a switchable link
   cdx use <name> [--no-restart] [--dry-run]
                                make <name> active; restart stale clients by default
@@ -119,6 +121,9 @@ deleted. 'cdx link' rebuilds those symlinks if Codex overwrites one.
 
 Env: CODEX_PROFILES, CDX_CODEX_LINK override the paths above.
      CDX_COLOR=auto|always|never (NO_COLOR also disables color).
+     CDX_USAGE=off never asks OpenAI for quota, =auto re-fetches once the
+     cached figure is older than CDX_USAGE_TTL seconds (default 900). The
+     default only fills an empty cache, so listing never waits on the network.
      CDX_NO_KILL=1 reports which processes would be stopped, but signals none.
 EOF
 }
@@ -294,6 +299,135 @@ print(f"{mode:8} {who:26} {plan:9} refreshed {(d.get('last_refresh') or '?')[:10
 PY
 }
 
+# Live quota, per account. The number Codex shows in '/status' comes from
+# GET /wham/usage, which the CLI itself polls while it runs; asking for it
+# directly is the only way to get a per-account figure here, because the
+# rate_limits recorded in sessions/ carry no account identity and sessions/
+# is shared by every profile.
+#
+# The call doubles as the only trustworthy health check. Token expiry claims
+# cannot do that job: every id_token on a working install is long expired
+# (Codex refreshes access tokens behind them), so a date column would report
+# alarm on accounts that are fine. A 401 here means the refresh token itself
+# is dead and the account needs 'cdx add' again — that is worth showing.
+USAGE_ENDPOINT="${CDX_USAGE_ENDPOINT:-https://chatgpt.com/backend-api/wham/usage}"
+
+# One process for every profile: the requests run concurrently, so a cold
+# cache costs one timeout rather than one per account, and an offline machine
+# stalls once. Answers are cached per profile so the common 'cdx' listing is
+# a local read. Emits TSV: name, mode, account, plan, used, resets, state.
+profile_rows() {
+    local force="${1:-0}"; shift
+    python3 - "$force" "${CDX_USAGE:-cache}" "$USAGE_ENDPOINT" "${CDX_USAGE_TTL:-900}" "$@" <<'PY'
+import base64, json, os, sys, time, urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+force, mode, endpoint, ttl, *pairs = sys.argv[1:]
+force = force == "1"
+ttl = int(ttl)
+
+def claims(token):
+    try:
+        payload = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except Exception:
+        return {}
+
+# Cached inside the profile, not the store: it is per-account by definition.
+def quota(home, token):
+    cache = os.path.join(home, ".cdx-usage.json")
+    try:
+        with open(cache) as fh: cached = json.load(fh)
+    except Exception:
+        cached = None
+    if mode == "off" or not token:
+        return cached, "cache"
+    # 'cache' (the default) keeps the everyday listing local and predictable:
+    # it never calls out except to fill an empty cache, so the only slow 'cdx'
+    # is the first one on a machine. 'auto' re-fetches once the figure ages
+    # past the TTL, which trades that predictability for freshness.
+    if cached and not force and (mode == "cache"
+                                 or time.time() - cached.get("fetched_at", 0) < ttl):
+        return cached, "cache"
+    req = urllib.request.Request(endpoint, headers={
+        "Authorization": "Bearer " + token, "User-Agent": "cdx"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as fh:
+            body = json.load(fh)
+    except urllib.error.HTTPError as e:
+        # 401/403 is the signal we actually care about: the credentials are
+        # no longer usable, whatever the token dates claim.
+        rec = dict(cached or {})
+        rec["state"] = "relogin" if e.code in (401, 403) else "error"
+        return rec, "live"
+    except Exception:
+        # Offline, DNS failure, timeout: fall back to whatever we knew last.
+        return cached, "offline"
+    window = (body.get("rate_limit") or {}).get("primary_window") or {}
+    rec = {"fetched_at": time.time(), "used": window.get("used_percent"),
+           "reset_at": window.get("reset_at"), "plan": body.get("plan_type"),
+           "email": body.get("email"), "state": "ok"}
+    try:
+        tmp = cache + ".tmp"
+        with open(tmp, "w") as fh: json.dump(rec, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cache)
+    except Exception:
+        pass
+    return rec, "live"
+
+def row(pair):
+    name, home = pair.split("=", 1)
+    try:
+        with open(os.path.join(home, "auth.json")) as fh: auth = json.load(fh)
+    except FileNotFoundError:
+        return (name, "-", "not logged in", "", "", "", "none")
+    except Exception:
+        return (name, "-", "unreadable auth.json", "", "", "", "bad")
+    tokens = auth.get("tokens") or {}
+    kind = auth.get("auth_mode") or ("apikey" if auth.get("OPENAI_API_KEY") else "?")
+    c = claims(tokens.get("id_token") or "")
+    who = c.get("email") or (tokens.get("account_id") or "")[:8] or "?"
+    plan = (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
+    rec, src = quota(home, tokens.get("access_token"))
+    rec = rec or {}
+    used = resets = ""
+    if rec.get("used") is not None:
+        # '~' marks a figure we could not refresh, so a stale number is never
+        # mistaken for a live one.
+        used = f"{round(rec['used'])}%" + ("~" if src == "offline" else "")
+    if rec.get("reset_at"):
+        # Relative, not a date: the question is "wait it out or switch?", and a
+        # day-only date answers it wrong precisely when the reset is close — a
+        # window closing in five hours renders as today's date, which reads as
+        # already reset.
+        left = rec["reset_at"] - time.time()
+        if left <= 0:      rel = "now"
+        elif left < 3600:  rel = f"in {round(left / 60)}m"
+        elif left < 86400: rel = f"in {round(left / 3600)}h"
+        else:              rel = f"in {round(left / 86400)}d"
+        # Wall clock first, countdown in parentheses. A reset that has already
+        # rolled over has no useful clock time left to print, so it is just
+        # 'now'. Last column on the line, so the extra width costs nothing.
+        resets = rel if left <= 0 else \
+            time.strftime("%b %d %H:%M", time.localtime(rec["reset_at"])) + f" ({rel})"
+    # Age of the figure, so the caller can say how old the numbers are rather
+    # than presenting a cached percentage as though it were current.
+    age = ""
+    if rec.get("fetched_at"):
+        age = str(int(time.time() - rec["fetched_at"]))
+    return (name, kind, rec.get("email") or who, rec.get("plan") or plan,
+            used, resets, rec.get("state") or ("none" if not rec else ""), age)
+
+# Unit separator, not tab: tab is an IFS whitespace character, so bash's 'read'
+# collapses runs of them and an empty column would silently shift every later
+# field left — which is exactly how the state ended up in the USED column.
+with ThreadPoolExecutor(max_workers=8) as pool:
+    for r in pool.map(row, pairs):
+        print("\x1f".join(str(x) for x in r))
+PY
+}
+
 # Pre-migration 'main' is ~/.codex and not under $PROFILES; afterwards it
 # is an ordinary profile the glob finds, so only add it in the first case.
 profile_names() {
@@ -347,17 +481,48 @@ missing_profile() {
 }
 
 list_profiles() {
-    local names=() n home active mark
+    local names=() pairs=() n home active mark force=0 relogin=0 oldest=0
+    local kind acct plan used resets state age
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # Quota is cached, so the listing stays a local read; --refresh is
+            # how you ask for a live figure before deciding where to switch.
+            --refresh) force=1 ;;
+            --no-usage) CDX_USAGE=off ;;
+            *) die "unknown option to 'list': $1" ;;
+        esac
+        shift
+    done
     while IFS= read -r n; do names+=("$n"); done < <(profile_names)
     active="$(active_profile)"
-    printf '   %-12s %-8s %-26s %s\n' NAME MODE ACCOUNT PLAN
-    for n in "${names[@]}"; do
-        home="$(home_of "$n")"
+    for n in "${names[@]}"; do pairs+=("$n=$(home_of "$n")"); done
+    printf '   %-12s %-8s %-26s %-9s %-6s %s\n' NAME MODE ACCOUNT PLAN USED RESETS
+    while IFS=$'\037' read -r n kind acct plan used resets state age; do
+        [ -z "$age" ] || [ "$age" -le "$oldest" ] || oldest="$age"
         # A variable, not $(... && echo ' *' || echo '  ') — command
         # substitution strips the trailing space and misaligns the column.
         if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
-        printf '%s %-12s %s\n' "$mark" "$n" "$(describe "$home")"
-    done
+        case "$state" in
+            relogin) used="re-login"; relogin=1 ;;
+        esac
+        printf '%s %-12s %-8s %-26s %-9s %-6s %s\n' \
+            "$mark" "$n" "$kind" "$acct" "$plan" "$used" "$resets"
+    done < <(profile_rows "$force" ${pairs[@]+"${pairs[@]}"})
+    # The default never re-fetches, so the figures have to say how old they are
+    # — an unlabelled percentage reads as current no matter when it was taken.
+    if [ "$oldest" -ge 300 ]; then
+        local ago
+        if   [ "$oldest" -lt 3600 ];  then ago="$((oldest / 60))m"
+        elif [ "$oldest" -lt 86400 ]; then ago="$((oldest / 3600))h"
+        else                               ago="$((oldest / 86400))d"
+        fi
+        printf '%s   quota measured %s ago — %s for live figures%s\n' \
+            "$C_YELLOW" "$ago" "'cdx --refresh'" "$C_RESET"
+    fi
+    if [ "$relogin" = 1 ]; then
+        printf '\n%s(re-login: the account was rejected — its refresh token is dead.%s\n' "$C_YELLOW" "$C_RESET"
+        printf '%s run "cdx add <name>" to sign in again.)%s\n' "$C_YELLOW" "$C_RESET"
+    fi
     if ! initialized; then
         echo "
 ($CODEX_LINK is a plain directory — run 'cdx init' to enable switching)"
@@ -433,6 +598,11 @@ cmd_status() {
     active="$(active_profile)"
     home="$(home_of "$active")"
     account="$(describe "$home")"
+    # Cached figure only: status is a diagnostic that must work offline, and
+    # 'cdx --refresh' is right there when a live number is wanted.
+    local quota=""
+    IFS=$'\037' read -r _ _ _ _ quota _ < <(CDX_USAGE=off profile_rows 0 "$active=$home") || true
+    [ -n "$quota" ] || quota="unknown (run 'cdx --refresh')"
     session_store="$(resolve_dir "$home/sessions" || true)"
     [ -n "$session_store" ] || session_store="missing"
     if [ -L "$home/state_5.sqlite" ]; then
@@ -450,6 +620,7 @@ cmd_status() {
     if [ "$json" = 0 ]; then
         printf '%-20s %s%s%s\n' "Active profile:" "$C_CYAN" "$active" "$C_RESET"
         printf '%-20s %s\n' "Selected account:" "$account"
+        printf '%-20s %s\n' "Quota used:" "$quota"
         printf '%-20s %s\n' "Conversation store:" "$session_store"
         printf '%-20s %s\n' "State index:" "$state_store"
         if stored; then
@@ -493,9 +664,18 @@ cmd_status() {
     fi
 
     if [ "$json" = 1 ]; then
-        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" <<'PY'
-import json, sys
-active, account, sessions, state, rows, proxies, status = sys.argv[1:]
+        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" "$home" <<'PY'
+import json, os, sys
+active, account, sessions, state, rows, proxies, status, home = sys.argv[1:]
+# Straight from the cache file, not the rendered column: a consumer wants the
+# percentage and the epoch, not "42%" and "Aug 18 18:17 (in 6d)".
+try:
+    with open(os.path.join(home, ".cdx-usage.json")) as fh:
+        c = json.load(fh)
+    quota = {"used_percent": c.get("used"), "reset_at": c.get("reset_at"),
+             "measured_at": c.get("fetched_at"), "state": c.get("state")}
+except Exception:
+    quota = None
 servers = []
 for row in rows.splitlines():
     pid, profile = row.split("\t", 1)
@@ -507,6 +687,7 @@ for row in rows.splitlines():
 print(json.dumps({
     "active_profile": active,
     "selected_account": account,
+    "quota": quota,
     "conversation_store": sessions,
     "state_index": state,
     "app_servers": servers,
@@ -1033,7 +1214,11 @@ command -v codex >/dev/null || die "codex is not on PATH"
 command -v python3 >/dev/null || die "python3 is not on PATH"
 
 case "${1:-}" in
-    ""|list|ls) list_profiles ;;
+    "") list_profiles ;;
+    list|ls) shift; list_profiles "$@" ;;
+    # The listing is the default command, so its flags have to work without
+    # naming it — 'cdx --refresh' is what you actually type.
+    --refresh|--no-usage) list_profiles "$@" ;;
     -h|--help|help) usage ;;
     add)    shift; cmd_add "$@" ;;
     init)   shift; cmd_init "$@" ;;

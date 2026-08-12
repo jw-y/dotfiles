@@ -87,7 +87,8 @@ claims = {"email": "tester@example.com",
           "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}}
 b = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
 json.dump({"auth_mode": "chatgpt", "last_refresh": "2026-08-10T00:00:00Z",
-           "tokens": {"account_id": "acct1234xyz", "id_token": f"h.{b}.s"}},
+           "tokens": {"account_id": "acct1234xyz", "id_token": f"h.{b}.s",
+                      "access_token": "stub-access-token"}},
           open(home + "/auth.json", "w"))
 PY
 fi
@@ -127,10 +128,14 @@ legacy_env() {
 }
 
 # Run cdx inside a sandbox. NO_COLOR keeps assertions on plain text.
+# CDX_USAGE=off by default so no test can reach the network; the usage section
+# below opts back in against a file:// endpoint it controls.
 cdx() {
     local d="$1"; shift
     env -i HOME="$d" PATH="$d/bin:/usr/bin:/bin" NO_COLOR=1 TERM=dumb \
-        CDX_NO_KILL=1 \
+        CDX_NO_KILL=1 CDX_USAGE="${CDX_USAGE:-off}" \
+        ${CDX_USAGE_ENDPOINT+CDX_USAGE_ENDPOINT="$CDX_USAGE_ENDPOINT"} \
+        ${CDX_USAGE_TTL+CDX_USAGE_TTL="$CDX_USAGE_TTL"} \
         CODEX_PROFILES="$d/profiles" CDX_CODEX_LINK="$d/codex" \
         bash "$CDX" "$@" 2>&1
 }
@@ -281,6 +286,73 @@ it "use cannot name the store";          assert_contains "$(cdx "$D" use .store)
 it "rename cannot name the store";       assert_contains "$(cdx "$D" rename .store evil)" "reserved for cdx"
 it "store survives those attempts";      assert_eq "$([ -d "$D/profiles/.store" ] && echo intact)" "intact"
 it "rejects a path separator";           assert_contains "$(cdx "$D" add ../escape)" "invalid profile name"
+
+# --------------------------------------------------------------- usage -----
+# Quota comes from a live call, so the endpoint is pointed at a local file:
+# the parsing, the cache and the failure paths are all exercised without ever
+# touching the network (the default CDX_USAGE=off guarantees the rest of the
+# suite cannot either).
+echo "${DIM}usage${OFF}"
+U="$(store_env usage)"
+# reset_at is generated three days out rather than hardcoded: the column is
+# rendered relative to now, so a fixed timestamp would quietly start reading
+# 'now' once that date passed and the assertion would rot.
+python3 -c 'import json,sys,time
+json.dump({"email":"tester@example.com","plan_type":"pro",
+           "rate_limit":{"primary_window":{"used_percent":42,
+                         "reset_at": time.time() + 3*86400}}}, open(sys.argv[1],"w"))' "$U/usage.json"
+export CDX_USAGE=auto CDX_USAGE_ENDPOINT="file://$U/usage.json"
+out="$(cdx "$U" list)"
+it "list shows the quota column";        assert_contains "$out" "USED"
+it "list shows the used percentage";     assert_contains "$out" "42%"
+it "list shows time until the reset";    assert_contains "$out" "(in 3d)"
+it "list shows the wall-clock reset";    assert_contains "$out" "$(python3 -c 'import json,time;print(time.strftime("%b %d %H:%M", time.localtime(json.load(open("'"$U"'/usage.json"))["rate_limit"]["primary_window"]["reset_at"])))')"
+it "live plan wins over the token";      assert_contains "$out" "pro"
+it "the figure is cached per profile";   assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["used"])')" "42"
+it "the cache is not world-readable";    assert_eq "$(stat -c %a "$U/profiles/lab/.cdx-usage.json")" "600"
+
+# An unreadable endpoint must not blank the column or fail the command: the
+# last known figure is shown, marked stale.
+export CDX_USAGE_ENDPOINT="file://$U/gone.json" CDX_USAGE_TTL=0
+out="$(cdx "$U" list)"; rc=$?
+it "offline falls back to the cache";    assert_contains "$out" "42%~"
+it "offline listing still succeeds";     assert_eq "$rc" "0"
+unset CDX_USAGE_TTL
+export CDX_USAGE_ENDPOINT="file://$U/usage.json"
+
+# --no-usage and CDX_USAGE=off must never call out, even with a live endpoint
+# configured — that is what makes the flag usable on a plane.
+rm -f "$U"/profiles/*/.cdx-usage.json
+out="$(cdx "$U" list --no-usage)"
+it "--no-usage skips the lookup";        assert_eq "$(printf %s "$out" | grep -c '42%')" "0"
+it "--no-usage leaves no cache behind";  assert_eq "$(ls "$U"/profiles/*/.cdx-usage.json 2>/dev/null | wc -l)" "0"
+it "--refresh is accepted bare";         assert_contains "$(cdx "$U" --refresh)" "42%"
+it "rejects unknown list options";       assert_contains "$(cdx "$U" list --bogus)" "unknown option to 'list'"
+# status must read the cache rather than call out, so it works offline —
+# and 'main' here was never logged in, so switch to an account that has creds.
+cdx "$U" use lab --no-restart >/dev/null
+it "status reports the cached quota";    assert_contains "$(CDX_USAGE=off cdx "$U" status)" "Quota used:          42%"
+it "status --json carries the quota";    assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_percent"])')" "42"
+it "json quota keeps the raw epoch";     assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(type(json.load(sys.stdin)["quota"]["reset_at"]).__name__)')" "float"
+
+# The default mode fills an empty cache once and then stays local: a stale
+# figure is reused rather than re-fetched, so the everyday listing never waits
+# on the network. 'auto' is what re-fetches on a TTL.
+rm -f "$U"/profiles/*/.cdx-usage.json
+CDX_USAGE=cache cdx "$U" list >/dev/null
+it "the default fills an empty cache";   assert_eq "$([ -f "$U/profiles/lab/.cdx-usage.json" ] && echo cached)" "cached"
+out="$(CDX_USAGE=cache CDX_USAGE_TTL=0 CDX_USAGE_ENDPOINT="file://$U/gone.json" cdx "$U" list)"
+it "the default never re-fetches";       assert_contains "$out" "42%"
+it "so it is never marked stale";        assert_eq "$(printf %s "$out" | grep -c '42%~')" "0"
+out="$(CDX_USAGE=auto CDX_USAGE_TTL=0 CDX_USAGE_ENDPOINT="file://$U/gone.json" cdx "$U" list)"
+it "'auto' does re-fetch on the TTL";    assert_contains "$out" "42%~"
+
+# An unlabelled percentage reads as current however old it is.
+python3 -c 'import json,sys,time
+p = sys.argv[1]; d = json.load(open(p)); d["fetched_at"] = time.time() - 7200
+json.dump(d, open(p, "w"))' "$U/profiles/lab/.cdx-usage.json"
+it "old figures state their age";        assert_contains "$(CDX_USAGE=cache cdx "$U" list)" "quota measured 2h ago"
+unset CDX_USAGE CDX_USAGE_ENDPOINT
 
 # ---------------------------------------------------------------- app -----
 # Launching is macOS-only, but the argument parsing is not: [dir] is optional,
