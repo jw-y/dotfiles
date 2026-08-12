@@ -301,10 +301,15 @@ U="$(store_env usage)"
 python3 -c 'import json,sys,time
 json.dump({"email":"tester@example.com","plan_type":"pro",
            "rate_limit":{"primary_window":{"used_percent":42,
+                         "limit_window_seconds": 604800,
                          "reset_at": time.time() + 3*86400}}}, open(sys.argv[1],"w"))' "$U/usage.json"
 export CDX_USAGE=auto CDX_USAGE_ENDPOINT="file://$U/usage.json"
 out="$(cdx "$U" list)"
 it "list shows the quota column";        assert_contains "$out" "USED"
+# Widths follow the content, so a long account name must not be truncated and
+# must not leave the columns ragged: every row is the same length as the header.
+it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/chatgpt/{print index($0,"chatgpt")}' | sort -u | wc -l)" "1"
+it "the window is labelled";            assert_contains "$out" "42% wk"
 it "list shows the used percentage";     assert_contains "$out" "42%"
 it "list shows time until the reset";    assert_contains "$out" "(in 3d)"
 it "list shows the wall-clock reset";    assert_contains "$out" "$(python3 -c 'import json,time;print(time.strftime("%b %d %H:%M", time.localtime(json.load(open("'"$U"'/usage.json"))["rate_limit"]["primary_window"]["reset_at"])))')"
@@ -332,7 +337,12 @@ it "rejects unknown list options";       assert_contains "$(cdx "$U" list --bogu
 # status must read the cache rather than call out, so it works offline —
 # and 'main' here was never logged in, so switch to an account that has creds.
 cdx "$U" use lab --no-restart >/dev/null
-it "status reports the cached quota";    assert_contains "$(CDX_USAGE=off cdx "$U" status)" "Quota used:          42%"
+it "status reports the cached quota";    assert_contains "$(CDX_USAGE=off cdx "$U" status)" "quota         42% of the weekly limit"
+out="$(CDX_USAGE=off cdx "$U" status)"
+it "status groups its facts";            assert_eq "$(printf %s "$out" | grep -c '^\(Account\|Storage\|Clients\)$')" "3"
+it "status calls shared data shared";    assert_contains "$out" "conversations shared"
+it "status shortens paths to ~";         assert_contains "$out" "~/profiles/.store"
+it "status still keeps full paths in json"; assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" "$U/profiles/.store/sessions"
 it "status --json carries the quota";    assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_percent"])')" "42"
 it "json quota keeps the raw epoch";     assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(type(json.load(sys.stdin)["quota"]["reset_at"]).__name__)')" "float"
 

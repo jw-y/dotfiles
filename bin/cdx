@@ -70,7 +70,7 @@ SHARED_DIRS=(packages plugins cache skills rules sessions archived_sessions
 
 # Color is interactive-only by default. NO_COLOR always wins; JSON never uses it.
 COLOR_MODE="${CDX_COLOR:-auto}"
-C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN=""
+C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_DIM=""
 if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
     case "$COLOR_MODE" in
         auto) [ -t 1 ] && COLOR_MODE=always || COLOR_MODE=never ;;
@@ -84,49 +84,69 @@ if [ "$COLOR_MODE" = always ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb
     C_GREEN=$'\033[32m'
     C_YELLOW=$'\033[33m'
     C_CYAN=$'\033[36m'
+    C_DIM=$'\033[2m'
 fi
+# Grouped by what you came here to do. The flat alphabetical list this
+# replaced put 'init' (run once, ever) above 'use' (run daily), and buried
+# each command's flags in the paragraph describing it.
 usage() {
     cat <<EOF
 cdx — switch between Codex accounts.
 
-Usage:
-  cdx [--refresh]           list profiles ('*' marks the active one) with each
-                            account's quota; --refresh re-asks OpenAI instead of
-                            using the cached figure, --no-usage skips it entirely
-  cdx init [-y]             one-time: make $CODEX_LINK a switchable link
-  cdx use <name> [--no-restart] [--dry-run]
-                               make <name> active, reporting its quota and
-                               warning when it is nearly spent (CDX_QUOTA_WARN,
-                               default 90); restart stale clients by default
-                               (including SSH remote proxies, so they reconnect)
-                               pass --no-restart to leave clients running
-  cdx <name> [args...]      run codex as <name> once, without changing active
-  cdx add <name> [args...]  create <name> and log in (extra args pass through
-                            to 'codex login'; over SSH or without a display the
-                            device-auth flow is used; rerun to retry a login)
-  cdx app <name> [dir] [--stock]
-                            launch the desktop app as <name> (macOS); --stock
-                            reuses the app's existing ChatGPT desktop login
-  cdx ssh <host> [args...]  run cdx on <host> (no install needed there),
-                            e.g. 'cdx ssh baram use work'
-  cdx status [--json]       verify selected account, app server, and remotes
-  cdx rename <old> <new>    rename a profile — any of them, 'main' included
-  cdx rm <name> [-y]        delete <name> and its credentials
-  cdx link                  rebuild every profile's links to the store (repair)
-  cdx -h                    this help
+Every Codex client — CLI, desktop app, VS Code, the app's SSH remote — reads
+$(tilde "$CODEX_LINK"). cdx makes that a symlink, so switching accounts is just
+re-pointing it and no client needs configuring.
 
-Layout: each account is $PROFILES/<name> and holds only its credentials and
-logs. Everything else — config, conversations, memories, attachments, caches —
-lives once in $STORE and is symlinked in, so accounts stay small, 'resume'
-finds your work whichever one is active, and any of them can be renamed or
-deleted. 'cdx link' rebuilds those symlinks if Codex overwrites one.
+${C_CYAN}Every day${C_RESET}
+  cdx                      list accounts, with how much quota each has left
+  cdx use <name>           make <name> active for every client on this machine
+  cdx <name> [args...]     run one codex command as <name>, without switching
+  cdx status               check the active account against what is running
 
-Env: CODEX_PROFILES, CDX_CODEX_LINK override the paths above.
-     CDX_COLOR=auto|always|never (NO_COLOR also disables color).
-     CDX_USAGE=off never asks OpenAI for quota, =auto re-fetches once the
-     cached figure is older than CDX_USAGE_TTL seconds (default 900). The
-     default only fills an empty cache, so listing never waits on the network.
-     CDX_NO_KILL=1 reports which processes would be stopped, but signals none.
+${C_CYAN}Managing accounts${C_RESET}
+  cdx add <name>           create <name> and log in
+  cdx rename <old> <new>   rename an account — any of them, 'main' included
+  cdx rm <name>            delete <name> and its credentials
+
+${C_CYAN}Other machines${C_RESET}
+  cdx app <name> [dir]     launch the desktop app as <name> (macOS only)
+  cdx ssh <host> [args...] run cdx on <host>, e.g. 'cdx ssh baram use work'
+                           (cdx ships itself; nothing to install there)
+
+${C_CYAN}Setup and repair${C_RESET}
+  cdx init                 one-time: make $(tilde "$CODEX_LINK") a switchable link
+  cdx link                 rebuild every account's links to the store
+
+${C_CYAN}Options${C_RESET}
+  --refresh                take a live quota reading instead of the cached one
+  --no-usage               skip quota entirely
+  use --no-restart         leave running clients on the old account
+  use --dry-run            show what would change, and change nothing
+  add <name> [args...]     extra arguments pass through to 'codex login'
+  app <name> [dir] --stock reuse the app's existing ChatGPT desktop login
+  init -y / rm <name> -y   skip the confirmation prompt
+  status --json            machine-readable, with the raw quota figures
+
+${C_CYAN}Layout${C_RESET}
+  accounts  $(tilde "$PROFILES")/<name>
+  shared    $(tilde "$STORE")
+  An account holds only its credentials and logs. Everything shareable —
+  config, conversations, memories, attachments, caches — lives once in the
+  store and is symlinked into each account, so accounts stay a few hundred KB,
+  'resume' finds your work whichever account is active, and any account can be
+  renamed or deleted. 'cdx link' rebuilds those symlinks if Codex overwrites
+  one.
+
+${C_CYAN}Environment${C_RESET}
+  CODEX_PROFILES           where accounts live
+  CDX_CODEX_LINK           the switchable link, normally $(tilde "$CODEX_LINK")
+  CDX_USAGE                off never asks OpenAI for quota; auto re-fetches
+                           once the cache is older than CDX_USAGE_TTL seconds
+                           (900). The default only fills an empty cache, so
+                           listing never waits on the network.
+  CDX_QUOTA_WARN           percent at which 'use' warns you (90)
+  CDX_COLOR                auto, always or never (NO_COLOR also disables it)
+  CDX_NO_KILL=1            report which processes would be stopped, stop none
 EOF
 }
 
@@ -365,10 +385,27 @@ def quota(home, token):
     except Exception:
         # Offline, DNS failure, timeout: fall back to whatever we knew last.
         return cached, "offline"
-    window = (body.get("rate_limit") or {}).get("primary_window") or {}
-    rec = {"fetched_at": time.time(), "used": window.get("used_percent"),
-           "reset_at": window.get("reset_at"), "plan": body.get("plan_type"),
-           "email": body.get("email"), "state": "ok"}
+    # 'primary' is not a fixed window: on some plans it is the weekly quota, on
+    # others the 5-hour one with the week in 'secondary'. Reporting whichever
+    # sits in 'primary' made the column mean different things per account, so
+    # take the window closest to its limit — that is the one that stops you —
+    # and label it, since 16% of a week and 16% of five hours are not the same
+    # news. The others are kept so nothing is lost.
+    limits = body.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = limits.get(key) or {}
+        if w.get("used_percent") is not None:
+            windows.append({"used": w["used_percent"], "reset_at": w.get("reset_at"),
+                            "seconds": w.get("limit_window_seconds")})
+    head = max(windows, key=lambda w: w["used"]) if windows else {}
+    rec = {"fetched_at": time.time(), "used": head.get("used"),
+           "reset_at": head.get("reset_at"), "window": head.get("seconds"),
+           "windows": windows, "plan": body.get("plan_type"),
+           "email": body.get("email"),
+           # 'allowed' false means this account is refusing work right now,
+           # which a percentage alone does not say.
+           "state": "blocked" if limits.get("limit_reached") else "ok"}
     try:
         tmp = cache + ".tmp"
         with open(tmp, "w") as fh: json.dump(rec, fh)
@@ -398,6 +435,11 @@ def row(pair):
         # '~' marks a figure we could not refresh, so a stale number is never
         # mistaken for a live one.
         used = f"{round(rec['used'])}%" + ("~" if src == "offline" else "")
+        span = rec.get("window")
+        if span:
+            used += " " + ("wk" if span >= 604800 else
+                           f"{round(span / 86400)}d" if span >= 86400 else
+                           f"{round(span / 3600)}h")
     if rec.get("reset_at"):
         # Relative, not a date: the question is "wait it out or switch?", and a
         # day-only date answers it wrong precisely when the reset is close — a
@@ -498,18 +540,54 @@ list_profiles() {
     while IFS= read -r n; do names+=("$n"); done < <(profile_names)
     active="$(active_profile)"
     for n in "${names[@]}"; do pairs+=("$n=$(home_of "$n")"); done
-    printf '   %-12s %-8s %-26s %-9s %-6s %s\n' NAME MODE ACCOUNT PLAN USED RESETS
+
+    # Buffered, not streamed, so the columns can be sized to the content: fixed
+    # widths either truncate a long account or leave a gutter of blanks for
+    # everyone who has short ones. No borders — this output gets piped and
+    # grepped, and box drawing costs more there than the neatness is worth.
+    local rows=() row wn=4 wk=4 wa=7 wp=4 wu=4
     while IFS=$'\037' read -r n kind acct plan used resets state age; do
         [ -z "$age" ] || [ "$age" -le "$oldest" ] || oldest="$age"
-        # A variable, not $(... && echo ' *' || echo '  ') — command
-        # substitution strips the trailing space and misaligns the column.
-        if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
         case "$state" in
             relogin) used="re-login"; relogin=1 ;;
         esac
-        printf '%s %-12s %-8s %-26s %-9s %-6s %s\n' \
-            "$mark" "$n" "$kind" "$acct" "$plan" "$used" "$resets"
+        [ ${#n} -le $wn ] || wn=${#n}
+        [ ${#kind} -le $wk ] || wk=${#kind}
+        [ ${#acct} -le $wa ] || wa=${#acct}
+        [ ${#plan} -le $wp ] || wp=${#plan}
+        [ ${#used} -le $wu ] || wu=${#used}
+        rows+=("$n"$'\037'"$kind"$'\037'"$acct"$'\037'"$plan"$'\037'"$used"$'\037'"$resets"$'\037'"$state")
     done < <(profile_rows "$force" ${pairs[@]+"${pairs[@]}"})
+
+    printf '%s   %-*s  %-*s  %-*s  %-*s  %*s  %s%s\n' "$C_DIM" \
+        $wn NAME $wk MODE $wa ACCOUNT $wp PLAN $wu USED RESETS "$C_RESET"
+    local color pct pad
+    for row in "${rows[@]}"; do
+        IFS=$'\037' read -r n kind acct plan used resets state <<< "$row"
+        # A variable, not $(... && echo ' *' || echo '  ') — command
+        # substitution strips the trailing space and misaligns the column.
+        if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
+        # Colour tracks how close the account is to its limit, so a full one is
+        # visible without reading the numbers. Padding is applied before the
+        # escapes are wrapped around it: printf counts those invisible bytes as
+        # width and would misalign every later column.
+        pct="${used%\~*}"; pct="${pct%%\%*}"
+        color=""
+        case "$state" in
+            relogin|blocked) color="$C_RED" ;;
+            *) case "$pct" in
+                   ''|*[!0-9]*) ;;
+                   *) if   [ "$pct" -ge "$QUOTA_WARN_PERCENT" ]; then color="$C_RED"
+                      elif [ "$pct" -ge 60 ]; then color="$C_YELLOW"
+                      else color="$C_GREEN"; fi ;;
+               esac ;;
+        esac
+        printf -v pad '%*s' $wu "$used"
+        printf '%s %-*s  %-*s  %-*s  %s%-*s%s  %s%s%s  %s%s%s\n' \
+            "$mark" $wn "$n" $wk "$kind" $wa "$acct" \
+            "$C_DIM" $wp "$plan" "$C_RESET" \
+            "$color" "$pad" "$C_RESET" "$C_DIM" "$resets" "$C_RESET"
+    done
     # The default never re-fetches, so the figures have to say how old they are
     # — an unlabelled percentage reads as current no matter when it was taken.
     if [ "$oldest" -ge 300 ]; then
@@ -585,6 +663,16 @@ app_server_profile() {
     echo unknown
 }
 
+# Presentation helpers for 'status'. Grouping the facts under headings beats
+# one flat column of twenty-character labels: the three questions it answers —
+# who am I, where is the data, what is running — are what you scan for.
+section() { printf '\n%s%s%s\n' "$C_CYAN" "$1" "$C_RESET"; }
+row()     { printf '  %-13s %s\n' "$1" "$2"; }
+
+# Paths here are long and mostly $HOME. Shortening keeps the value column from
+# wrapping, which is what made the old output hard to read on a narrow window.
+tilde()   { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
 # Read-only check of account selection versus long-running remote machinery.
 cmd_status() {
     local json=0
@@ -602,9 +690,25 @@ cmd_status() {
     account="$(describe "$home")"
     # Cached figure only: status is a diagnostic that must work offline, and
     # 'cdx --refresh' is right there when a live number is wanted.
-    local quota=""
-    IFS=$'\037' read -r _ _ _ _ quota _ < <(CDX_USAGE=off profile_rows 0 "$active=$home") || true
-    [ -n "$quota" ] || quota="unknown (run 'cdx --refresh')"
+    local quota="" who="" kind="" plan="" resets="" refreshed=""
+    IFS=$'\037' read -r _ kind who plan quota resets _ \
+        < <(CDX_USAGE=off profile_rows 0 "$active=$home") || true
+    # The listing's compact '43% wk' is a column heading's worth of context;
+    # here there is room for the sentence it stands for.
+    if [ -n "$quota" ]; then
+        local span="${quota#* }"; quota="${quota%% *}"
+        case "$span" in
+            wk) span=" of the weekly limit" ;;
+            "$quota"|"") span="" ;;
+            *)  span=" of the ${span/h/-hour} limit" ;;
+        esac
+        quota="$quota$span, resets $resets"
+    else
+        quota="unknown — run 'cdx --refresh'"
+    fi
+    # describe() pads its fields for the listing it was written for; status
+    # wants a sentence, so take the one field the rows do not carry.
+    refreshed="${account##*refreshed }"
     session_store="$(resolve_dir "$home/sessions" || true)"
     [ -n "$session_store" ] || session_store="missing"
     if [ -L "$home/state_5.sqlite" ]; then
@@ -615,25 +719,25 @@ cmd_status() {
         state_store="missing"
     fi
 
+    # Display forms only — the JSON keeps the full paths, since a consumer has
+    # no way to expand 'shared' back into one. What a reader needs to know is
+    # whether the data is the shared copy or this profile's own.
+    local session_disp="$session_store" state_disp="$state_store"
+    case "$session_store" in "$STORE"/*) session_disp="shared" ;;
+        *) session_disp="$(tilde "$session_store")" ;; esac
+    case "$state_store" in "shared -> $STORE"/*) state_disp="shared" ;;
+        *) state_disp="$(tilde "$state_store")" ;; esac
+
     server_pids="$(pgrep -u "$(id -un)" -f '[cC]odex.*app-server.*--listen[ =]unix://' 2>/dev/null || true)"
     proxy_pids="$(pgrep -u "$(id -un)" -f '(^|/)codex app-server proxy( |$)' 2>/dev/null || true)"
     for pid in $proxy_pids; do proxy_count=$((proxy_count + 1)); done
 
-    if [ "$json" = 0 ]; then
-        printf '%-20s %s%s%s\n' "Active profile:" "$C_CYAN" "$active" "$C_RESET"
-        printf '%-20s %s\n' "Selected account:" "$account"
-        printf '%-20s %s\n' "Quota used:" "$quota"
-        printf '%-20s %s\n' "Conversation store:" "$session_store"
-        printf '%-20s %s\n' "State index:" "$state_store"
-        if stored; then
-            printf '%-20s %s\n' "Shared store:" "$STORE"
-        else
-            printf '%-20s %s%s%s\n' "Shared store:" "$C_YELLOW" "none — predates the store; run any command for the fix" "$C_RESET"
-        fi
-    fi
-
+    # The app-server scan drives the mismatch verdict, so it runs either way;
+    # its lines are collected rather than printed, to keep the sections below
+    # in a readable order instead of the order the work happens in.
+    local server_lines=""
     if [ -z "$server_pids" ]; then
-        [ "$json" = 1 ] || printf '%-20s %s\n' "App server:" "not running"
+        server_lines="$(row "app server" "not running")"$'\n'
         [ "$proxy_count" -eq 0 ] || mismatch=1
     else
         while IFS= read -r pid; do
@@ -642,16 +746,33 @@ cmd_status() {
             profile="$(app_server_profile "$pid")"
             server_rows+="$pid"$'\t'"$profile"$'\n'
             if [ "$profile" = "$active" ]; then
-                [ "$json" = 1 ] || printf '%-20s PID %s, profile %s %s(matches)%s\n' "App server:" "$pid" "$profile" "$C_GREEN" "$C_RESET"
+                server_lines+="$(row "app server" "PID $pid — $profile $C_GREEN(matches)$C_RESET")"$'\n'
             else
-                [ "$json" = 1 ] || printf '%-20s PID %s, profile %s %s(MISMATCH)%s\n' "App server:" "$pid" "$profile" "$C_RED" "$C_RESET"
+                server_lines+="$(row "app server" "PID $pid — $profile $C_RED(MISMATCH)$C_RESET")"$'\n'
                 mismatch=1
             fi
         done <<< "$server_pids"
     fi
+
     if [ "$json" = 0 ]; then
-        printf '%-20s %s\n' "SSH remote proxies:" "$proxy_count"
-        printf '%-20s %s\n' "Desktop account:" "not observable from this host"
+        section Account
+        row profile "$C_CYAN$active$C_RESET"
+        row "signed in" "$who${kind:+ — $kind}${plan:+, $plan}"
+        row quota "$quota"
+        row refreshed "$refreshed"
+        section Storage
+        if stored; then
+            row store "$(tilde "$STORE")"
+        else
+            row store "${C_YELLOW}none — predates the store; run any command for the fix$C_RESET"
+        fi
+        row conversations "$session_disp"
+        row "state index" "$state_disp"
+        section Clients
+        printf '%s' "$server_lines"
+        row "ssh proxies" "$proxy_count"
+        row desktop "not observable from this host"
+        echo
     fi
 
     if [ "$mismatch" = 1 ]; then
