@@ -888,31 +888,67 @@ def open_paths(pid: int) -> list[str]:
 def app_server_profile(pid: int) -> str:
     """Inspect open control-socket descriptors instead of trusting CODEX_HOME:
     a long-running process may have inherited the moving ~/.codex symlink."""
-    for target in open_paths(pid):
+    for target in PROCS.open_paths(pid):
         owner = profile_from_control_path(target)
         if owner:
             return owner
     return "unknown"
 
 
-def pgrep(pattern: str) -> list[int]:
-    proc = subprocess.run(["pgrep", "-u", _username(), "-f", pattern],
-                          capture_output=True, text=True)
-    return [int(p) for p in proc.stdout.split() if p.isdigit()]
+class Processes:
+    """Everything cdx knows about other processes, in one place.
 
+    Which PIDs to signal is the only decision here that cannot be sandboxed by
+    an environment variable — pgrep sees the whole user's process table, so a
+    mistake in the path filter reaches real Codex sessions however isolated the
+    profiles are. CDX_NO_KILL exists for exactly that reason and is the reason
+    no test has ever run the signalling path.
 
-def _username() -> str:
-    proc = subprocess.run(["id", "-un"], capture_output=True, text=True)
-    return proc.stdout.strip()
+    Behind this seam the selection logic can be handed a process table that
+    does not exist: a proxy that is not bound, a server holding a file under
+    the old profile, a PID that exits mid-scan. Nothing else about the class
+    matters — it is four thin wrappers.
+    """
 
-
-def _cmdline(pid: int) -> str:
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
-    except OSError:
-        proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+    def matching(self, pattern: str) -> list[int]:
+        proc = subprocess.run(["pgrep", "-u", self.username(), "-f", pattern],
                               capture_output=True, text=True)
+        return [int(p) for p in proc.stdout.split() if p.isdigit()]
+
+    def username(self) -> str:
+        proc = subprocess.run(["id", "-un"], capture_output=True, text=True)
         return proc.stdout.strip()
+
+    def cmdline(self, pid: int) -> str:
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except OSError:
+            proc = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                  capture_output=True, text=True)
+            return proc.stdout.strip()
+
+    def open_paths(self, pid: int) -> list[str]:
+        return open_paths(pid)
+
+    def terminate(self, pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+PROCS = Processes()
+
+
+def pgrep(pattern: str) -> list[int]:
+    return PROCS.matching(pattern)
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -1261,14 +1297,15 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
     killed: list[int] = []
     proxies: list[int] = []
     remote_proxies = 0
-    for pid in pgrep("[cC]odex"):
+    for pid in PROCS.matching("[cC]odex"):
         matched = False
-        cmd = _cmdline(pid)
+        cmd = PROCS.cmdline(pid)
         remote_proxy = "codex app-server proxy" in cmd
         if remote_proxy and proxy_policy == "always":
             matched = True
         if not matched:
-            matched = any(target.startswith(old + "/") for target in open_paths(pid))
+            matched = any(target.startswith(old + "/")
+                          for target in PROCS.open_paths(pid))
         if matched:
             killed.append(pid)
             if remote_proxy:
@@ -1308,23 +1345,14 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
         out(f"{C.YELLOW}  CDX_NO_KILL=1 — signalling nothing.{C.RESET}")
         return 0
     for pid in killed:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        PROCS.terminate(pid)
     # A real app-server takes its time on SIGTERM — it closes sqlite handles
     # and tears down client sessions first. Five seconds was not enough and
     # made 'rename' abort on a perfectly healthy shutdown, so wait 20.
     waited = 0
     survivors: list[int] = []
     for attempt in range(1, 201):
-        survivors = []
-        for pid in killed:
-            try:
-                os.kill(pid, 0)
-                survivors.append(pid)
-            except OSError:
-                pass
+        survivors = [pid for pid in killed if PROCS.alive(pid)]
         if not survivors:
             break
         time.sleep(0.1)

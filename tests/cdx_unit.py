@@ -191,6 +191,139 @@ check("and a percentage nothing can beat",
 check("ignores an account with no figure",
       cdx.roomiest(rows(("a", "", "ok"), ("b", "50% wk", "ok")), "")[0], "b")
 
+# ── stop_bound_to ────────────────────────────────────────────────────────────
+# The one decision that cannot be sandboxed by an environment variable: pgrep
+# sees the whole user's process table, so a mistake in the path filter reaches
+# real sessions. Every end-to-end test therefore runs with CDX_NO_KILL=1, which
+# means the signalling path has never executed under test. Behind the seam it
+# can be handed a table that does not exist.
+print("stop_bound_to")
+
+OLD = "/home/u/.codex-profiles/old"
+
+
+class FakeProcesses:
+    def __init__(self, table):
+        # pid -> (cmdline, [open paths])
+        self.table = table
+        self.signalled: list[int] = []
+        self.stubborn: set[int] = set()
+
+    def matching(self, pattern):
+        return sorted(self.table)
+
+    def username(self):
+        return "u"
+
+    def cmdline(self, pid):
+        return self.table[pid][0]
+
+    def open_paths(self, pid):
+        return self.table[pid][1]
+
+    def terminate(self, pid):
+        self.signalled.append(pid)
+
+    def alive(self, pid):
+        return pid in self.stubborn
+
+
+def run_stop(table, **kw):
+    """stop_bound_to against a synthetic table, returning (rc, output, fake)."""
+    import io
+    import contextlib
+    fake = FakeProcesses(table)
+    real, cdx.PROCS = cdx.PROCS, fake
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cdx.stop_bound_to(OLD, **kw)
+    finally:
+        cdx.PROCS = real
+    return rc, buf.getvalue(), fake
+
+
+BOUND = ("codex app-server --listen unix://x", [f"{OLD}/app-server-control/sock"])
+ELSEWHERE = ("codex app-server --listen unix://y", ["/home/u/.codex-profiles/other/log"])
+PROXY = ("ssh host codex app-server proxy", [])
+
+rc, text, fake = run_stop({100: BOUND})
+check("a bound process is signalled", fake.signalled, [100])
+check("and said so", "Stopping 1 process(es)" in text, True)
+check("and exits clean", rc, 0)
+
+rc, text, fake = run_stop({100: ELSEWHERE})
+check("a process bound elsewhere is spared", fake.signalled, [])
+check("and the run says nothing happened",
+      "No running processes were bound" in text, True)
+
+# 'use' changes the account, so every cached remote connection is stale
+# whether or not anything else was stopped.
+rc, text, fake = run_stop({100: ELSEWHERE, 200: PROXY})
+check("'always' takes proxies regardless", fake.signalled, [200])
+check("and counts the disconnect", "Would disconnect" in text or
+      "Disconnecting 1 SSH remote proxy" in text, True)
+
+# 'rename' does not change the account: an idle machine keeps its sessions.
+rc, text, fake = run_stop({100: ELSEWHERE, 200: PROXY}, proxy_policy="if-stale")
+check("'if-stale' spares an idle proxy", fake.signalled, [])
+
+# ...but once something it could be fronting dies, it is a dead end.
+rc, text, fake = run_stop({100: BOUND, 200: PROXY}, proxy_policy="if-stale")
+check("'if-stale' escalates when something died", fake.signalled, [100, 200])
+check("without listing the proxy twice", len(fake.signalled), 2)
+
+rc, text, fake = run_stop({100: BOUND}, dry_run=True)
+check("a dry run signals nothing", fake.signalled, [])
+check("but names what it would stop", "Would stop 1 process(es): 100" in text, True)
+
+# A path that merely starts with the same characters is a different profile:
+# '/…/old-backup' must not match '/…/old'.
+rc, text, fake = run_stop({100: ("codex", [f"{OLD}-backup/app-server-control/s"])})
+check("a prefix is not a parent", fake.signalled, [])
+
+# A process that ignores SIGTERM is reported rather than force-killed, and the
+# command fails so 'rename' aborts instead of moving a directory underneath it.
+import os as _os
+_os.environ["CDX_USAGE"] = "off"
+fake = FakeProcesses({100: BOUND})
+fake.stubborn = {100}
+# The wait is 20 real seconds by design — an app-server closes sqlite handles
+# and tears down sessions before it goes. Nothing here is testing the clock,
+# so the sleep is stubbed rather than served.
+_slept, cdx.time.sleep = cdx.time.sleep, lambda _s: None
+real, cdx.PROCS = cdx.PROCS, fake
+import io as _io
+import contextlib as _ctx
+_buf = _io.StringIO()
+try:
+    with _ctx.redirect_stdout(_buf), _ctx.redirect_stderr(_io.StringIO()):
+        rc = cdx.stop_bound_to(OLD)
+finally:
+    cdx.PROCS = real
+    cdx.time.sleep = _slept
+check("a survivor makes the command fail", rc, 1)
+check("and it waited the full run", len(fake.signalled), 1)
+
+# CDX_NO_KILL is what makes the end-to-end suite safe to run at all: pgrep
+# sees the whole user's process table, so without it a test that stops "the
+# old profile's" processes reaches live sessions. It belongs here, against a
+# fake, and not in a live experiment — checking whether the guard was
+# load-bearing by removing it and running the real suite terminated nine of
+# this machine's processes, which is precisely what it guards against.
+_saved = _os.environ.get("CDX_NO_KILL")
+_os.environ["CDX_NO_KILL"] = "1"
+try:
+    rc, text, fake = run_stop({100: BOUND})
+finally:
+    if _saved is None:
+        _os.environ.pop("CDX_NO_KILL", None)
+    else:
+        _os.environ["CDX_NO_KILL"] = _saved
+check("CDX_NO_KILL signals nothing", fake.signalled, [])
+check("and says why", "signalling nothing" in text, True)
+check("while still reporting the selection", "Stopping 1 process(es)" in text, True)
+
 print()
 print(f"{PASS} passed" if not FAIL else f"{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
