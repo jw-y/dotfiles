@@ -543,6 +543,14 @@ cmd_init() {
         return 0
     fi
     [ -d "$CODEX_LINK" ] || die "$CODEX_LINK does not exist — nothing to set up"
+    # 'mv dir existing-dir/' moves it *inside*, so without this the real home
+    # lands at $PROFILES/main/.codex and the pointer ends up on a stale 'main'
+    # — no data lost, but the wrong account is silently active. Reachable
+    # whenever the symlink is gone while its profile is not (Codex recreates
+    # ~/.codex after the link is deleted; an interrupted setup leaves both).
+    [ ! -e "$PROFILES/main" ] || die "$PROFILES/main already exists, but $CODEX_LINK is a real
+     directory. Move one aside — if that profile is the account you want, delete
+     or rename $CODEX_LINK and 'ln -s $PROFILES/main $CODEX_LINK' instead"
 
     if [ "${1:-}" != "-y" ]; then
         # Without a terminal there is nobody to answer, and silently doing
@@ -618,12 +626,19 @@ explain_legacy() {
         echo
         echo "       # 2. move the shared data into the store (same filesystem: instant)"
         echo "       mkdir -p $STORE && chmod 700 $STORE"
-        if [ ${#items[@]} -gt 0 ]; then
+        if [ ${#items[@]} -gt 1 ]; then
+            # Brace expansion needs a comma: '{sessions}' stays literal, so a
+            # single leftover item has to be printed as a plain path.
             printf '       mv %s \\\n' "$legacy/{$(IFS=,; echo "${items[*]}")}"
             echo "          $STORE/"
-            echo "       mv $legacy/*.sqlite-wal $legacy/*.sqlite-shm $STORE/ 2>/dev/null"
+        elif [ ${#items[@]} -eq 1 ]; then
+            printf '       mv %s \\\n' "$legacy/${items[0]}"
+            echo "          $STORE/"
         else
             echo "       # (nothing left to move — 'main' holds no unshared originals)"
+        fi
+        if [ ${#items[@]} -gt 0 ]; then
+            echo "       mv $legacy/*.sqlite-wal $legacy/*.sqlite-shm $STORE/ 2>/dev/null"
         fi
         echo
         echo "       # 3. re-point every profile at the store"
@@ -920,20 +935,33 @@ cmd_link() {
 # is two things: CODEX_HOME holds Codex-local state (auth.json), while the
 # ChatGPT login itself lives in the Electron session, hence --user-data-dir.
 cmd_app() {
+    local name="" workspace="" stock=0
+    # [dir] is optional, so --stock has to be recognised wherever it lands
+    # rather than at a fixed position: 'cdx app work --stock' used to pass the
+    # flag through as the workspace path and launch non-stock anyway.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --stock) stock=1 ;;
+            -*) die "unknown option to 'app': $1" ;;
+            *)
+                if [ -z "$name" ]; then name="$1"
+                elif [ -z "$workspace" ]; then workspace="$1"
+                else die "unexpected argument to 'app': $1"
+                fi
+                ;;
+        esac
+        shift
+    done
     # Default to whatever is active, not a hardcoded 'main' — that name is
     # only the initial one and 'cdx rename' may have moved it.
-    local name="${1:-$(active_profile)}" workspace="${2:-$PWD}" stock=0
-    case "${3:-}" in
-        "") ;;
-        --stock) stock=1 ;;
-        *) die "unknown option to 'app': $3" ;;
-    esac
+    [ -n "$name" ] || name="$(active_profile)"
+    [ -n "$workspace" ] || workspace="$PWD"
     validate_name "$name"
     [ "$(uname)" = Darwin ] || die "app launching is macOS-only"
     local home; home="$(home_of "$name")"
     [ -d "$home" ] || missing_profile "$name"
 
-    local app="${CHATGPT_APP:-}"
+    local app="${CHATGPT_APP:-}" candidate
     if [ -z "$app" ]; then
         for candidate in /Applications/ChatGPT.app /Applications/Codex.app; do
             [ -d "$candidate" ] && { app="$candidate"; break; }

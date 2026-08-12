@@ -165,6 +165,19 @@ it "init hoists data out of main";        assert_eq "$(md5of "$D/profiles/.store
 it "every profile shares one dataset";    assert_eq "$(cdx "$D" add other >/dev/null; md5of "$D/profiles/other/sessions/s1.jsonl")" "$(md5of "$D/profiles/.store/sessions/s1.jsonl")"
 it "no link points into a profile";       assert_eq "$(find "$D/profiles" -type l -exec readlink {} \; | grep -cv '/\.store/')" "0"
 
+# A real ~/.codex next to an existing 'main' is not a fresh machine: it happens
+# when the symlink is deleted (Codex recreates the directory) or setup was
+# interrupted. 'mv' would bury the real home at profiles/main/.codex and leave
+# the stale profile active, so init must refuse instead.
+D="$(new_env clash)"
+mkdir -p "$D/profiles/main"; echo 'stale-creds' > "$D/profiles/main/auth.json"
+out="$(cdx "$D" init -y)"
+it "init refuses to bury a real ~/.codex"; assert_contains "$out" "$D/profiles/main already exists"
+it "the real home stays put";              assert_eq "$(cat "$D/codex/config.toml")" 'model="gpt-5"'
+it "nothing was nested inside main";       assert_eq "$([ -e "$D/profiles/main/.codex" ] && echo nested || echo clean)" "clean"
+it "the pointer was not created";          assert_eq "$([ -L "$D/codex" ] && echo linked || echo untouched)" "untouched"
+it "the stale profile is untouched";       assert_eq "$(cat "$D/profiles/main/auth.json")" "stale-creds"
+
 # ---------------------------------------------------- legacy detection -----
 # cdx carries no converter for installs that predate the store. It must instead
 # recognise one and print instructions precise enough to follow by hand.
@@ -180,6 +193,14 @@ it "instructions move the real items";    assert_contains "$out" "sessions"
 it "instructions handle sqlite sidecars"; assert_contains "$out" "sqlite-wal"
 it "instructions finish with cdx link";   assert_contains "$out" "cdx link"
 it "instructions stop Codex first";       assert_contains "$out" "app-server"
+
+# Brace expansion needs a comma, so a lone leftover must be printed as a plain
+# path — '{sessions}' would be copied out of the terminal and fail.
+E="$(legacy_env one)"
+for f in config.toml AGENTS.md state_5.sqlite packages; do rm -rf "$E/profiles/main/$f"; done
+out="$(cdx "$E" init)"
+it "single leftover is a usable path";    assert_contains "$out" "mv $E/profiles/main/sessions"
+it "no unexpandable braces are printed";  assert_eq "$(printf %s "$out" | grep -c '{')" "0"
 
 it "rename refuses on legacy layout";     assert_contains "$(cdx "$D" rename main school)" "predates the shared store"
 it "link refuses on legacy layout";       assert_contains "$(cdx "$D" link)" "predates the shared store"
@@ -260,6 +281,20 @@ it "use cannot name the store";          assert_contains "$(cdx "$D" use .store)
 it "rename cannot name the store";       assert_contains "$(cdx "$D" rename .store evil)" "reserved for cdx"
 it "store survives those attempts";      assert_eq "$([ -d "$D/profiles/.store" ] && echo intact)" "intact"
 it "rejects a path separator";           assert_contains "$(cdx "$D" add ../escape)" "invalid profile name"
+
+# ---------------------------------------------------------------- app -----
+# Launching is macOS-only, but the argument parsing is not: [dir] is optional,
+# so '--stock' must be recognised in either position. It used to be read only
+# as the third word, which made 'cdx app work --stock' pass the flag through
+# as the workspace path — and launch non-stock anyway.
+echo "${DIM}app${OFF}"
+APP="$(store_env app)"
+# Reaching the macOS check means the words were parsed as flag/name, not
+# rejected as a bad profile name or swallowed as the workspace path.
+it "--stock is a flag, not a name";      assert_contains "$(cdx "$APP" app --stock)" "macOS-only"
+it "--stock is a flag, not a workspace"; assert_contains "$(cdx "$APP" app lab --stock)" "macOS-only"
+it "still rejects unknown options";      assert_contains "$(cdx "$APP" app lab --bogus)" "unknown option to 'app'"
+it "rejects a third positional";         assert_contains "$(cdx "$APP" app lab /tmp extra)" "unexpected argument"
 
 # ----------------------------------------------------------------- add -----
 echo "${DIM}add${OFF}"
