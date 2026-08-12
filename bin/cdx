@@ -95,7 +95,9 @@ Usage:
                             using the cached figure, --no-usage skips it entirely
   cdx init [-y]             one-time: make $CODEX_LINK a switchable link
   cdx use <name> [--no-restart] [--dry-run]
-                               make <name> active; restart stale clients by default
+                               make <name> active, reporting its quota and
+                               warning when it is nearly spent (CDX_QUOTA_WARN,
+                               default 90); restart stale clients by default
                                (including SSH remote proxies, so they reconnect)
                                pass --no-restart to leave clients running
   cdx <name> [args...]      run codex as <name> once, without changing active
@@ -939,6 +941,46 @@ stop_bound_to() {
     printf '%s  All targeted processes exited.%s\n' "$C_GREEN" "$C_RESET"
 }
 
+# What 'use' reports about the account you just landed on. Switching is
+# usually driven by quota, so the figure belongs at the moment of the switch,
+# not only in a listing you have to go and read. Cache only: activating an
+# account must never wait on, or fail because of, the network.
+#
+# The warning is the point. A listing tells you 'personal' is at 96% if you
+# happen to look; this tells you at the moment it starts costing you, and
+# names the account with room instead of making you go and compare.
+QUOTA_WARN_PERCENT="${CDX_QUOTA_WARN:-90}"
+
+report_quota() {
+    local target="$1"; shift
+    local n used resets state pct best="" best_pct=101 target_pct=""
+    local kind acct plan age
+    while IFS=$'\037' read -r n kind acct plan used resets state age; do
+        pct="${used%\~}"; pct="${pct%\%}"
+        case "$pct" in ''|*[!0-9]*) pct="" ;; esac
+        if [ "$n" = "$target" ]; then
+            target_pct="$pct"
+            case "$state" in
+                relogin)
+                    printf "%s  '%s' was rejected by OpenAI — its refresh token is dead.%s\n" "$C_RED" "$n" "$C_RESET"
+                    printf "%s  Run 'cdx add %s' to sign in again.%s\n" "$C_YELLOW" "$n" "$C_RESET"
+                    return 0
+                    ;;
+            esac
+            [ -z "$used" ] || printf '  quota: %s used, resets %s\n' "$used" "$resets"
+        elif [ -n "$pct" ] && [ "$state" != relogin ] && [ "$pct" -lt "$best_pct" ]; then
+            best="$n"; best_pct="$pct"
+        fi
+    done < <(CDX_USAGE=off profile_rows 0 "$@")
+    [ -n "$target_pct" ] || return 0
+    [ "$target_pct" -ge "$QUOTA_WARN_PERCENT" ] || return 0
+    printf '%s  %s is nearly out of quota (%s%% used).%s\n' "$C_YELLOW" "$target" "$target_pct" "$C_RESET"
+    if [ -n "$best" ] && [ "$best_pct" -lt "$target_pct" ]; then
+        printf "%s  '%s' has the most room (%s%% used) — 'cdx use %s'.%s\n" \
+            "$C_YELLOW" "$best" "$best_pct" "$best" "$C_RESET"
+    fi
+}
+
 # Activate an account for every client on this machine at once.
 cmd_use() {
     local name="${1:-}" restart=1 dry_run=0
@@ -980,6 +1022,9 @@ cmd_use() {
     ln -sfn "$home" "$CODEX_LINK"
     printf '%s→%s %s%s%s is now active (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$C_CYAN" "$name" "$C_RESET" "$CODEX_LINK" "$home"
     [ -f "$home/auth.json" ] || printf "%s  '%s' is not logged in yet — run 'cdx add %s' to authenticate.%s\n" "$C_YELLOW" "$name" "$name" "$C_RESET"
+    local p pairs=()
+    while IFS= read -r p; do pairs+=("$p=$(home_of "$p")"); done < <(profile_names)
+    report_quota "$name" ${pairs[@]+"${pairs[@]}"}
     if [ "$restart" = 1 ]; then
         if [ -n "$old_target" ]; then
             stop_bound_to "$old_target"

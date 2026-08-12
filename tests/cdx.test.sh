@@ -136,6 +136,7 @@ cdx() {
         CDX_NO_KILL=1 CDX_USAGE="${CDX_USAGE:-off}" \
         ${CDX_USAGE_ENDPOINT+CDX_USAGE_ENDPOINT="$CDX_USAGE_ENDPOINT"} \
         ${CDX_USAGE_TTL+CDX_USAGE_TTL="$CDX_USAGE_TTL"} \
+        ${CDX_QUOTA_WARN+CDX_QUOTA_WARN="$CDX_QUOTA_WARN"} \
         CODEX_PROFILES="$d/profiles" CDX_CODEX_LINK="$d/codex" \
         bash "$CDX" "$@" 2>&1
 }
@@ -353,6 +354,31 @@ p = sys.argv[1]; d = json.load(open(p)); d["fetched_at"] = time.time() - 7200
 json.dump(d, open(p, "w"))' "$U/profiles/lab/.cdx-usage.json"
 it "old figures state their age";        assert_contains "$(CDX_USAGE=cache cdx "$U" list)" "quota measured 2h ago"
 unset CDX_USAGE CDX_USAGE_ENDPOINT
+
+# Switching is driven by quota, so 'use' reports where you landed — from the
+# cache, since activating an account must never wait on the network. The cache
+# files are written directly here: that is the format cdx itself writes, and
+# it lets each account be pinned to a known figure.
+write_quota() {  # <profile> <used_percent> [state]
+    python3 -c 'import json,sys,time
+json.dump({"fetched_at": time.time(), "used": int(sys.argv[2]),
+           "reset_at": time.time() + 86400, "state": sys.argv[3]},
+          open(sys.argv[1] + "/.cdx-usage.json", "w"))' \
+        "$U/profiles/$1" "$2" "${3:-ok}"
+}
+write_quota lab 95; write_quota personal 12; write_quota main 40
+out="$(CDX_USAGE=off cdx "$U" use personal --no-restart)"
+it "use reports the new account's quota"; assert_contains "$out" "quota: 12% used"
+it "a healthy account draws no warning";  assert_eq "$(printf %s "$out" | grep -c 'nearly out')" "0"
+out="$(CDX_USAGE=off cdx "$U" use lab --no-restart)"
+it "use warns near the limit";            assert_contains "$out" "lab is nearly out of quota (95% used)"
+it "use names the roomiest account";      assert_contains "$out" "'personal' has the most room (12% used)"
+it "the warning threshold is tunable";    assert_eq "$(CDX_QUOTA_WARN=99 CDX_USAGE=off cdx "$U" use lab --no-restart | grep -c 'nearly out')" "0"
+write_quota personal 12 relogin
+it "use refuses to stay quiet on a dead token"; assert_contains "$(CDX_USAGE=off cdx "$U" use personal --no-restart)" "refresh token is dead"
+it "and says how to fix it";              assert_contains "$(CDX_USAGE=off cdx "$U" use personal --no-restart)" "cdx add personal"
+rm -f "$U"/profiles/*/.cdx-usage.json
+it "no cached figure means no noise";     assert_eq "$(CDX_USAGE=off cdx "$U" use lab --no-restart | grep -c quota)" "0"
 
 # ---------------------------------------------------------------- app -----
 # Launching is macOS-only, but the argument parsing is not: [dir] is optional,
