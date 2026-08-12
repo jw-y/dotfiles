@@ -356,7 +356,16 @@ out="$(cdx "$U" list)"
 it "list shows the quota column";        assert_contains "$out" "USED"
 # Widths follow the content, so a long account name must not be truncated and
 # must not leave the columns ragged: every row is the same length as the header.
-it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/chatgpt/{print index($0,"chatgpt")}' | sort -u | wc -l)" "1"
+it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/tester@/{print index($0,"tester@")}' | sort -u | wc -l)" "1"
+# How you signed in is 'chatgpt' on every ordinary account, so it earns no
+# column — but it still has to be visible when it is something else, or an
+# API-key profile would look like a ChatGPT one.
+it "no MODE column";                    assert_eq "$(printf %s "$out" | grep -c 'MODE')" "0"
+mkdir -p "$U/profiles/apikey-acct"
+printf '{"OPENAI_API_KEY": "sk-test"}\n' > "$U/profiles/apikey-acct/auth.json"
+it "an API-key login says so";          assert_contains "$(CDX_USAGE=off cdx "$U" list)" "(apikey)"
+it "and does not claim to be chatgpt";  assert_eq "$(CDX_USAGE=off cdx "$U" list | grep -c 'chatgpt')" "0"
+rm -rf "$U/profiles/apikey-acct"
 it "the window is labelled";            assert_contains "$out" "42% wk"
 it "list shows the used percentage";     assert_contains "$out" "42%"
 it "list shows time until the reset";    assert_contains "$out" "(in 3d)"
@@ -421,6 +430,21 @@ out="$(CDX_USAGE=off cdx "$U" use lab --no-restart)"
 it "use refuses to stay quiet";          assert_contains "$out" "'lab' is over its spend limit and cannot run"
 it "use marks the figure as not the cause"; assert_contains "$out" "which is not what stopped it"
 it "status names the real limit";        assert_contains "$(CDX_USAGE=off cdx "$U" status)" "over its spend limit"
+# The listing has room for one figure and shows whichever binds; status has
+# room for every window the endpoint reported. This account is at 0% of five
+# hours and 16% of the week — one number cannot say that.
+out="$(CDX_USAGE=off cdx "$U" status)"
+it "status breaks the windows out";      assert_contains "$out" "5h"
+it "with a bar per window";              assert_contains "$out" "░"
+it "the idle window reads zero";         assert_contains "$out" "0%"
+it "and the weekly one sixteen";         assert_contains "$out" "16%"
+it "the binding window is marked";       assert_eq "$(printf %s "$out" | grep -c '  <$')" "1"
+# A single-window account gets no breakdown: it would just repeat the line
+# above it.
+it "one window means no breakdown";      assert_eq "$(CDX_USAGE_ENDPOINT="file://$U/usage.json" CDX_USAGE_TTL=0 cdx "$U" list >/dev/null; CDX_USAGE=off cdx "$U" status | grep -c '░')" "0"
+# That fetch replaced the cache these fixtures set up; put the spend-limited
+# figure back for the assertions below.
+CDX_USAGE_ENDPOINT="file://$U/spendlimit.json" CDX_USAGE_TTL=0 cdx "$U" list >/dev/null
 it "json carries the state";             assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["state"])')" "spendlimit"
 # An individual limit does carry numbers; a workspace-level one never does.
 python3 -c 'import json,sys,time
@@ -555,6 +579,26 @@ it "use refuses to stay quiet on a dead token"; assert_contains "$(CDX_USAGE=off
 it "and says how to fix it";              assert_contains "$(CDX_USAGE=off cdx "$U" use personal --no-restart)" "cdx add personal"
 rm -f "$U"/profiles/*/.cdx-usage.json
 it "no cached figure means no noise";     assert_eq "$(CDX_USAGE=off cdx "$U" use lab --no-restart | grep -c quota)" "0"
+
+# The listing answers "where should I work?", so it says something only when
+# the account you are on cannot answer it. A healthy active account gets
+# silence — the same rule the columns follow.
+write_quota lab 10; write_quota personal 20; write_quota main 30
+cdx "$U" use lab --no-restart >/dev/null
+it "a healthy account is not nagged";    assert_eq "$(CDX_USAGE=off cdx "$U" list | grep -c 'most room')" "0"
+# Recommending somewhere fuller than where you already are is worse than
+# saying nothing: this is what the listing did the moment it grew its own
+# copy of the search instead of sharing one with 'use'.
+write_quota lab 95; write_quota personal 99; write_quota main 98
+it "never sends you somewhere fuller";   assert_contains "$(CDX_USAGE=off cdx "$U" list)" "no other account has room"
+write_quota personal 12
+it "names the roomiest when there is one"; assert_contains "$(CDX_USAGE=off cdx "$U" list)" "'personal' has the most room (12% used)"
+it "and gives the command";              assert_contains "$(CDX_USAGE=off cdx "$U" list)" "'cdx use personal'"
+# A bar in front of the figure, so fullness reads without parsing digits. It
+# is plain block characters, not escapes, so it survives NO_COLOR and a pipe.
+it "the listing draws a bar";            assert_contains "$(CDX_USAGE=off cdx "$U" list)" "░"
+it "and keeps the figure intact";        assert_contains "$(CDX_USAGE=off cdx "$U" list)" "12%"
+rm -f "$U"/profiles/*/.cdx-usage.json
 
 # ---------------------------------------------------------------- app -----
 # Launching is macOS-only, but the argument parsing is not: [dir] is optional,

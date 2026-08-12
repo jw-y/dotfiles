@@ -522,6 +522,52 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
 _quota.force = False  # type: ignore[attr-defined]
 
 
+def span_label(seconds: float) -> str:
+    """'wk', '3d', '5h' — the window a percentage belongs to.
+
+    16% of a week and 16% of five hours are not the same news, so the label
+    travels with the number everywhere it is shown.
+    """
+    if seconds >= 604800:
+        return "wk"
+    if seconds >= 86400:
+        return f"{round(seconds / 86400)}d"
+    return f"{round(seconds / 3600)}h"
+
+
+def reset_phrase(epoch: float) -> str:
+    """Wall clock first, countdown in parentheses.
+
+    Relative rather than a bare date: the question is "wait it out or switch?",
+    and a day-only date answers it wrong precisely when the reset is close — a
+    window closing in five hours renders as today's date, which reads as
+    already reset. One that has rolled over has no useful clock time left, so
+    it is just 'now'.
+    """
+    left = epoch - time.time()
+    if left <= 0:
+        return "now"
+    if left < 3600:
+        rel = f"in {round(left / 60)}m"
+    elif left < 86400:
+        rel = f"in {round(left / 3600)}h"
+    else:
+        rel = f"in {round(left / 86400)}d"
+    return time.strftime("%b %d %H:%M", time.localtime(epoch)) + f" ({rel})"
+
+
+BLOCKS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
+
+
+def bar(ratio: float, width: int = 10) -> str:
+    """Filled-block bar with eighth-block partials, so a 10-wide bar still
+    resolves to about 1% rather than snapping to the nearest tenth. Plain
+    characters, not escapes: this has to survive NO_COLOR and a pipe."""
+    eighths = int(max(0.0, min(1.0, ratio)) * width * 8)
+    full, rem = divmod(eighths, 8)
+    return "█" * full + BLOCKS[rem] + "░" * (width - full - (1 if rem else 0))
+
+
 @dataclass
 class Row:
     """One account's line. A record rather than a delimited string: the shell
@@ -539,6 +585,11 @@ class Row:
     refreshed: str = ""
     note: str = ""
     allowance: str = ""
+    # Every window the endpoint reported, not just the binding one. The
+    # listing has room for a single figure and shows whichever is closest to
+    # its limit; 'status' has room for all of them, and an account can be at
+    # 0% of five hours and 84% of the week at the same time.
+    windows: list = field(default_factory=list)
 
 
 def _row(name: str, home: Path) -> Row:
@@ -561,27 +612,10 @@ def _row(name: str, home: Path) -> Row:
         # '~' marks a figure we could not refresh, so a stale number is never
         # mistaken for a live one.
         used = f"{round(rec['used'])}%" + ("~" if src == "offline" else "")
-        span = rec.get("window")
-        if span:
-            used += " " + ("wk" if span >= 604800 else
-                           f"{round(span / 86400)}d" if span >= 86400 else
-                           f"{round(span / 3600)}h")
+        if rec.get("window"):
+            used += " " + span_label(rec["window"])
     if rec.get("reset_at"):
-        # Relative, not a date: the question is "wait it out or switch?", and a
-        # day-only date answers it wrong precisely when the reset is close — a
-        # window closing in five hours renders as today's date, which reads as
-        # already reset.
-        left = rec["reset_at"] - time.time()
-        if left <= 0:
-            rel = "now"
-        elif left < 3600:
-            rel = f"in {round(left / 60)}m"
-        elif left < 86400:
-            rel = f"in {round(left / 3600)}h"
-        else:
-            rel = f"in {round(left / 86400)}d"
-        resets = rel if left <= 0 else \
-            time.strftime("%b %d %H:%M", time.localtime(rec["reset_at"])) + f" ({rel})"
+        resets = reset_phrase(rec["reset_at"])
 
     age = int(time.time() - rec["fetched_at"]) if rec.get("fetched_at") else None
     cr = rec.get("credits") or {}
@@ -629,7 +663,8 @@ def _row(name: str, home: Path) -> Row:
 
     return Row(name, kind, rec.get("email") or who, rec.get("plan") or plan,
                used, resets, state, age,
-               (auth.get("last_refresh") or "?")[:10], note, allowance)
+               (auth.get("last_refresh") or "?")[:10], note, allowance,
+               rec.get("windows") or [])
 
 
 def profile_rows(names: list[str], *, force: bool = False) -> list[Row]:
@@ -640,6 +675,21 @@ def profile_rows(names: list[str], *, force: bool = False) -> list[Row]:
         return []
     with ThreadPoolExecutor(max_workers=8) as pool:
         return list(pool.map(lambda n: _row(n, home_of(n)), names))
+
+
+def roomiest(rows: list["Row"], exclude: str) -> tuple[str, int]:
+    """The usable account with the most room left, ignoring `exclude`.
+
+    Only accounts in state 'ok' qualify: one that cannot run is not a place to
+    send anyone, however low its percentage reads — and it reads low precisely
+    *because* it cannot run.
+    """
+    best, best_pct = "", 101
+    for r in rows:
+        pct = pct_of(r.used)
+        if r.name != exclude and r.state == "ok" and pct is not None and pct < best_pct:
+            best, best_pct = r.name, pct
+    return best, best_pct
 
 
 def pct_of(used: str) -> int | None:
@@ -678,15 +728,44 @@ def list_profiles(argv: list[str]) -> int:
         if r.state in ("relogin", "blocked", "spendlimit"):
             r.used = r.note
 
+    # How you signed in is 'chatgpt' on every ordinary account, so a column
+    # for it is a constant — nine characters saying nothing. It only carries
+    # information when it is something else, and then it belongs next to the
+    # account it describes rather than in a column of its own. 'not logged in'
+    # already says so in the ACCOUNT cell, so a bare '-' adds nothing either.
+    for r in rows:
+        if r.kind not in ("chatgpt", "-", "", None):
+            r.account += f" ({r.kind})"
+
+    # A bar in front of the figure, so relative fullness reads without parsing
+    # numbers — the same trick gmon uses for GPU memory, and the reason status
+    # gained one per window. Accounts stopped by something a percentage cannot
+    # express ('spend limit') keep the words and get blank space where the bar
+    # would be, so the column still lines up.
+    # Built alongside the row, never written back into it: r.used stays the
+    # figure, and everything downstream keeps parsing data rather than a
+    # rendered cell. Writing the bar into r.used broke the recommendation
+    # below within minutes of being added — the same mistake, twice in one
+    # file, is what pct_of() exists to stop.
+    BAR_W = 6
+    cells: dict[str, str] = {}
+    for r in rows:
+        pct = pct_of(r.used)
+        if pct is not None:
+            cells[r.name] = f"{bar(pct / 100, BAR_W)} {r.used}"
+        elif r.used:
+            cells[r.name] = f"{' ' * BAR_W} {r.used}"
+        else:
+            cells[r.name] = ""
+
     # Widths follow the content: fixed ones either truncate a long account or
     # leave a gutter of blanks for everyone who has short ones.
     wn = max([len("NAME")] + [len(r.name) for r in rows])
-    wk = max([len("MODE")] + [len(r.kind) for r in rows])
     wa = max([len("ACCOUNT")] + [len(r.account) for r in rows])
     wp = max([len("PLAN")] + [len(r.plan) for r in rows])
-    wu = max([len("USED")] + [len(r.used) for r in rows])
+    wu = max([len("USED")] + [len(c) for c in cells.values()])
 
-    out(f"{C.DIM}   {'NAME':<{wn}}  {'MODE':<{wk}}  {'ACCOUNT':<{wa}}  "
+    out(f"{C.DIM}   {'NAME':<{wn}}  {'ACCOUNT':<{wa}}  "
         f"{'PLAN':<{wp}}  {'USED':>{wu}}  RESETS{C.RESET}")
     for r in rows:
         mark = " *" if r.name == active else "  "
@@ -705,8 +784,8 @@ def list_profiles(argv: list[str]) -> int:
             color = C.YELLOW
         else:
             color = C.GREEN
-        out(f"{mark} {r.name:<{wn}}  {r.kind:<{wk}}  {r.account:<{wa}}  "
-            f"{C.DIM}{r.plan:<{wp}}{C.RESET}  {color}{r.used:>{wu}}{C.RESET}  "
+        out(f"{mark} {r.name:<{wn}}  {r.account:<{wa}}  "
+            f"{C.DIM}{r.plan:<{wp}}{C.RESET}  {color}{cells[r.name]:>{wu}}{C.RESET}  "
             f"{C.DIM}{r.resets}{C.RESET}")
 
     # The default never re-fetches, so the figures have to say how old they are
@@ -716,6 +795,29 @@ def list_profiles(argv: list[str]) -> int:
                f"{oldest // 3600}h" if oldest < 86400 else f"{oldest // 86400}d")
         out(f"{C.YELLOW}   quota measured {ago} ago — 'cdx --refresh' "
             f"for live figures{C.RESET}")
+    # The listing exists to answer "where should I work?", and that question
+    # only has an answer worth printing when the account you are on cannot do
+    # it. Silence means the active account is fine — the same rule the columns
+    # follow, so a healthy listing stays four lines.
+    here = next((r for r in rows if r.name == active), None)
+    if here is not None:
+        here_pct = pct_of(here.used)
+        stuck = here.state in ("relogin", "blocked", "spendlimit")
+        if stuck or (here_pct is not None and here_pct >= QUOTA_WARN_PERCENT):
+            best, best_pct = roomiest(rows, active)
+            # Somewhere fuller than where you already are is not a
+            # recommendation. An account that cannot run at all is the
+            # exception: anything usable beats it.
+            if best and not stuck and here_pct is not None and best_pct >= here_pct:
+                best = ""
+            why = here.note if stuck else f"{here_pct}% used"
+            if best:
+                out(f"{C.YELLOW}   {active} is at {why} — '{best}' has the most "
+                    f"room ({best_pct}% used): 'cdx use {best}'{C.RESET}")
+            else:
+                out(f"{C.YELLOW}   {active} is at {why}, and no other account "
+                    f"has room{C.RESET}")
+
     if relogin:
         out(f"\n{C.YELLOW}(re-login: the account was rejected — its refresh "
             f"token is dead.{C.RESET}")
@@ -868,9 +970,10 @@ def cmd_status(argv: list[str]) -> int:
         quota = "unknown — run 'cdx --refresh'"
     # The rate limit is not always what stopped the account, so say which one
     # it is rather than letting the percentage answer for both.
+    verdict = ""
     if r.state == "spendlimit":
-        quota += (f"\n                {C.RED}over its spend limit — cannot run "
-                  f"regardless of the above{C.RESET}")
+        verdict = (f"{C.RED}over its spend limit — cannot run regardless "
+                   f"of the above{C.RESET}")
     elif r.state == "blocked":
         quota += f" {C.RED}(rate limited now){C.RESET}"
     refreshed = r.refreshed or "never"
@@ -923,6 +1026,25 @@ def cmd_status(argv: list[str]) -> int:
         row("signed in", r.account + (f" — {r.kind}" if r.kind else "")
                          + (f", {r.plan}" if r.plan else ""))
         row("quota", quota)
+        # Every window, not just the binding one. An account can sit at 0% of
+        # its five-hour window and 84% of its week at the same time, and the
+        # single figure above can only report one of them. Only worth the
+        # lines when there is more than one to compare.
+        if len(r.windows) > 1:
+            # The one the headline figure came from — the closest to its
+            # limit, which is the one that will stop you first.
+            binding = max(r.windows, key=lambda w: w.get("used") or 0)
+            for w in sorted(r.windows, key=lambda w: w.get("seconds") or 0):
+                pct = w.get("used")
+                if pct is None:
+                    continue
+                label = span_label(w.get("seconds") or 0)
+                when = reset_phrase(w["reset_at"]) if w.get("reset_at") else ""
+                mark = "  <" if w is binding else ""
+                out(f"  {'':<13} {label:<4} {bar(pct / 100)} {round(pct):>3}%"
+                    f"  {C.DIM}{when}{C.RESET}{mark}")
+        if verdict:
+            out(f"  {'':<13} {verdict}")
         # 'allowance' rather than 'credits': the same line carries a credit
         # balance, a spend budget, or the fact that neither is reported.
         if r.allowance:
@@ -1218,11 +1340,11 @@ def report_quota(target: str, names: list[str]) -> None:
         else:
             os.environ["CDX_USAGE"] = saved
 
-    best, best_pct, target_pct, unusable = "", 101, None, False
+    best, best_pct = roomiest(rows, target)
+    target_pct, unusable = None, False
     for r in rows:
-        pct = pct_of(r.used)
         if r.name == target:
-            target_pct = pct
+            target_pct = pct_of(r.used)
             if r.state == "relogin":
                 out(f"{C.RED}  '{r.name}' was rejected by OpenAI — its refresh "
                     f"token is dead.{C.RESET}")
@@ -1239,10 +1361,6 @@ def report_quota(target: str, names: list[str]) -> None:
                 unusable = True
             if r.used:
                 out(f"  quota: {r.used} used, resets {r.resets}")
-        # An account that cannot run is not a place to send anyone, however low
-        # its percentage reads — and it reads low *because* it cannot run.
-        elif pct is not None and r.state == "ok" and pct < best_pct:
-            best, best_pct = r.name, pct
 
     if not unusable:
         if target_pct is None or target_pct < QUOTA_WARN_PERCENT:
