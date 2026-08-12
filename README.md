@@ -7,7 +7,7 @@ Personal terminal and development configuration for macOS and Linux.
 - **Shell:** Zsh, Oh My Zsh, a custom theme, autosuggestions, and syntax highlighting
 - **Terminal:** Ghostty, tmux, TPM, and Catppuccin
 - **Editor:** Neovim with LSP, Treesitter, Telescope, Mason, and completion
-- **CLI tools:** `gmon`, `cdx`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
+- **CLI tools:** `gmon`, `smux`, `cdx`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
 - **Development:** Git, Python debugger/linter settings, and VS Code keybindings
 
 ## Quick start

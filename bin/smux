@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""smux — operate several independent Slurm controllers over SSH."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+CONFIG_FILE = Path(os.environ.get("SMUX_HOSTS", "~/.config/smux/hosts")).expanduser()
+STATE_FILE = Path(os.environ.get("SMUX_STATE", "~/.local/state/smux/jobs.jsonl")).expanduser()
+SSH_TIMEOUT = 12
+
+PROBE_SCRIPT = r'''set -u
+printf '__SMUX_SCHEDULER__\n'
+if command -v sbatch >/dev/null 2>&1; then
+    sbatch --version 2>/dev/null || true
+else
+    printf 'absent\n'
+fi
+printf '__SMUX_PARTITIONS__\n'
+if command -v sinfo >/dev/null 2>&1; then
+    sinfo -h -o '%P|%a|%l|%D|%G' 2>/dev/null || true
+fi
+printf '__SMUX_GPUS__\n'
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi \
+        --query-gpu=index,name,memory.used,memory.total,utilization.gpu,compute_cap,driver_version \
+        --format=csv,noheader,nounits 2>/dev/null | sed 's/, /|/g' || true
+fi
+printf '__SMUX_GRES_MAP__\n'
+for gres_file in /etc/slurm/gres.conf /etc/slurm-llnl/gres.conf; do
+    if [ -r "$gres_file" ]; then
+        awk '
+            $0 !~ /^[[:space:]]*#/ && $0 ~ /Name=gpu/ && $0 ~ /File=\/dev\/nvidia[0-9]+/ {
+                type = "generic"
+                file = ""
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Type=/) { type = $i; sub(/^Type=/, "", type) }
+                    if ($i ~ /^File=/) { file = $i; sub(/^File=/, "", file) }
+                }
+                gpu_index = file
+                sub(/^.*nvidia/, "", gpu_index)
+                if (gpu_index ~ /^[0-9]+$/) print gpu_index "|" type
+            }
+        ' "$gres_file"
+        break
+    fi
+done
+printf '__SMUX_JOBS__\n'
+if command -v squeue >/dev/null 2>&1; then
+    squeue -h -u "$(id -un)" -o '%i|%P|%j|%T|%M|%R' 2>/dev/null || true
+fi
+'''
+
+
+class SmuxError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ClusterStatus:
+    host: str
+    scheduler: str
+    partitions: list[dict[str, str]]
+    gpus: list[dict[str, str]]
+    gres_map: list[dict[str, str]]
+    jobs: list[dict[str, str]]
+    error: str | None = None
+
+
+def die(message: str) -> None:
+    print(f"smux: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load_hosts(*, required: bool = True) -> list[str]:
+    if not CONFIG_FILE.exists():
+        if required:
+            die(f"host config not found: {CONFIG_FILE} (run 'smux init')")
+        return []
+    hosts: list[str] = []
+    for number, raw in enumerate(CONFIG_FILE.read_text(encoding="utf-8").splitlines(), 1):
+        host = raw.split("#", 1)[0].strip()
+        if not host:
+            continue
+        if any(char.isspace() for char in host):
+            die(f"invalid host on {CONFIG_FILE}:{number}: aliases cannot contain whitespace")
+        if host in hosts:
+            die(f"duplicate host in {CONFIG_FILE}: {host}")
+        hosts.append(host)
+    if required and not hosts:
+        die(f"no hosts configured in {CONFIG_FILE}")
+    return hosts
+
+
+def select_hosts(requested: list[str]) -> list[str]:
+    configured = load_hosts()
+    if not requested:
+        return configured
+    unknown = [host for host in requested if host not in configured]
+    if unknown:
+        die(f"unknown host(s): {', '.join(unknown)}")
+    return requested
+
+
+def ssh_options() -> list[str]:
+    return [
+        "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+        "-o", "ServerAliveInterval=30",
+    ]
+
+
+def run_shell(host: str, script: str, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    if host == "local":
+        command = ["sh", "-lc", script]
+    else:
+        command = ["ssh", *ssh_options(), host, script]
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise SmuxError(f"{host}: timed out") from exc
+
+
+def run_command(
+    host: str,
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if host == "local":
+        try:
+            return subprocess.run(
+                command,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SmuxError(f"{host}: timed out") from exc
+
+    remote = shlex.join(command)
+    if cwd:
+        remote = f"cd {shlex.quote(cwd)} && {remote}"
+    try:
+        return subprocess.run(
+            ["ssh", *ssh_options(), host, remote],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SmuxError(f"{host}: timed out") from exc
+
+
+def parse_sections(output: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {
+        "scheduler": [],
+        "partitions": [],
+        "gpus": [],
+        "gres_map": [],
+        "jobs": [],
+    }
+    marker_map = {
+        "__SMUX_SCHEDULER__": "scheduler",
+        "__SMUX_PARTITIONS__": "partitions",
+        "__SMUX_GPUS__": "gpus",
+        "__SMUX_GRES_MAP__": "gres_map",
+        "__SMUX_JOBS__": "jobs",
+    }
+    current: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line in marker_map:
+            current = marker_map[line]
+        elif current is not None and line:
+            sections[current].append(line)
+    return sections
+
+
+def split_fields(line: str, names: list[str]) -> dict[str, str]:
+    values = line.split("|", len(names) - 1)
+    values += [""] * (len(names) - len(values))
+    return dict(zip(names, values))
+
+
+def probe_host(host: str) -> ClusterStatus:
+    try:
+        result = run_shell(host, PROBE_SCRIPT, timeout=SSH_TIMEOUT)
+    except SmuxError as exc:
+        return ClusterStatus(host, "unknown", [], [], [], [], str(exc))
+    if result.returncode != 0 and not result.stdout.strip():
+        error = result.stderr.strip() or f"command exited {result.returncode}"
+        return ClusterStatus(host, "unknown", [], [], [], [], error)
+    sections = parse_sections(result.stdout)
+    scheduler = sections["scheduler"][0] if sections["scheduler"] else "unknown"
+    partitions = [
+        split_fields(line, ["partition", "availability", "time_limit", "nodes", "gres"])
+        for line in sections["partitions"]
+    ]
+    gpus = [
+        split_fields(
+            line,
+            [
+                "index", "name", "memory_used_mib", "memory_mib", "utilization_pct",
+                "compute_capability", "driver_version",
+            ],
+        )
+        for line in sections["gpus"]
+    ]
+    gres_map = [
+        split_fields(line, ["index", "type"])
+        for line in sections["gres_map"]
+    ]
+    jobs = [
+        split_fields(line, ["job_id", "partition", "name", "state", "elapsed", "reason"])
+        for line in sections["jobs"]
+    ]
+    return ClusterStatus(host, scheduler, partitions, gpus, gres_map, jobs)
+
+
+def probe_many(hosts: list[str]) -> list[ClusterStatus]:
+    results: dict[str, ClusterStatus] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as executor:
+        futures = {executor.submit(probe_host, host): host for host in hosts}
+        for future in as_completed(futures):
+            host = futures[future]
+            try:
+                results[host] = future.result()
+            except Exception as exc:  # defensive: one host must not hide the others
+                results[host] = ClusterStatus(host, "unknown", [], [], [], [], str(exc))
+    return [results[host] for host in hosts]
+
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def command_init(args: argparse.Namespace) -> int:
+    if CONFIG_FILE.exists() and not args.force:
+        die(f"config already exists: {CONFIG_FILE} (use --force to replace it)")
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    CONFIG_FILE.write_text(
+        "# One SSH alias per line. Use 'local' for this machine.\n"
+        "# gpu-a\n"
+        "# gpu-b\n"
+        "local\n",
+        encoding="utf-8",
+    )
+    os.chmod(CONFIG_FILE, 0o600)
+    print(f"created {CONFIG_FILE}")
+    return 0
+
+
+def command_edit(_args: argparse.Namespace) -> int:
+    if not CONFIG_FILE.exists():
+        command_init(argparse.Namespace(force=False))
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        die("set VISUAL or EDITOR before running 'smux edit'")
+    return subprocess.run([*shlex.split(editor), str(CONFIG_FILE)], check=False).returncode
+
+
+def command_hosts(args: argparse.Namespace) -> int:
+    hosts = load_hosts()
+    if args.json:
+        print(json.dumps({"config": str(CONFIG_FILE), "hosts": hosts}, indent=2))
+    else:
+        print(f"config: {CONFIG_FILE}")
+        for host in hosts:
+            print(host)
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    statuses = probe_many(select_hosts(args.hosts))
+    if args.json:
+        print(json.dumps([asdict(status) for status in statuses], indent=2))
+        return int(any(status.error for status in statuses))
+    rows: list[list[str]] = []
+    for status in statuses:
+        if status.error:
+            rows.append([status.host, "error", "-", "-", "-", status.error])
+            continue
+        partitions = ", ".join(item["partition"] for item in status.partitions) or "-"
+        gpu_groups: dict[tuple[str, str], int] = {}
+        for gpu in status.gpus:
+            key = (gpu["name"], gpu["memory_mib"])
+            gpu_groups[key] = gpu_groups.get(key, 0) + 1
+        gpus = ", ".join(
+            f"{count}x {name} ({memory_mib} MiB)"
+            for (name, memory_mib), count in gpu_groups.items()
+        ) or "-"
+        running = sum(job["state"] == "RUNNING" for job in status.jobs)
+        pending = sum(job["state"] == "PENDING" for job in status.jobs)
+        rows.append([status.host, status.scheduler, partitions, gpus, f"{running}R/{pending}P", ""])
+    print_table(["HOST", "SCHEDULER", "PARTITIONS", "GPUS", "MY JOBS", "ERROR"], rows)
+    return int(any(status.error for status in statuses))
+
+
+def command_gpus(args: argparse.Namespace) -> int:
+    """Show physical occupancy together with Slurm's per-index GRES type."""
+    statuses = probe_many(select_hosts(args.hosts))
+    if args.json:
+        payload: list[dict[str, Any]] = []
+        for status in statuses:
+            gres_by_index = {item["index"]: item["type"] for item in status.gres_map}
+            for gpu in status.gpus:
+                payload.append({
+                    "host": status.host,
+                    **gpu,
+                    "gres_type": gres_by_index.get(gpu["index"], "unknown"),
+                    "idle": _gpu_is_idle(gpu),
+                })
+        print(json.dumps(payload, indent=2))
+        return int(any(status.error for status in statuses))
+    rows: list[list[str]] = []
+    for status in statuses:
+        gres_by_index = {item["index"]: item["type"] for item in status.gres_map}
+        for gpu in status.gpus:
+            rows.append([
+                status.host,
+                gpu["index"],
+                gres_by_index.get(gpu["index"], "unknown"),
+                f'{gpu["memory_used_mib"]}/{gpu["memory_mib"]} MiB',
+                f'{gpu["utilization_pct"]}%',
+                "yes" if _gpu_is_idle(gpu) else "no",
+                gpu["name"],
+            ])
+    if rows:
+        print_table(["HOST", "GPU", "SLURM TYPE", "MEMORY", "UTIL", "IDLE", "MODEL"], rows)
+    else:
+        print("no GPUs found")
+    for status in statuses:
+        if status.error:
+            print(f"smux: {status.host}: {status.error}", file=sys.stderr)
+    return int(any(status.error for status in statuses))
+
+
+def _gpu_is_idle(gpu: dict[str, str]) -> bool:
+    try:
+        return float(gpu["memory_used_mib"]) < 256 and float(gpu["utilization_pct"]) == 0
+    except (KeyError, ValueError):
+        return False
+
+
+def command_jobs(args: argparse.Namespace) -> int:
+    statuses = probe_many(select_hosts(args.hosts))
+    if args.json:
+        payload = [
+            {"host": status.host, **job}
+            for status in statuses
+            for job in status.jobs
+        ]
+        print(json.dumps(payload, indent=2))
+        return int(any(status.error for status in statuses))
+    rows = [
+        [status.host, job["job_id"], job["partition"], job["state"], job["elapsed"], job["name"], job["reason"]]
+        for status in statuses
+        for job in status.jobs
+    ]
+    if rows:
+        print_table(["HOST", "JOB", "PARTITION", "STATE", "ELAPSED", "NAME", "REASON"], rows)
+    else:
+        print("no jobs")
+    for status in statuses:
+        if status.error:
+            print(f"smux: {status.host}: {status.error}", file=sys.stderr)
+    return int(any(status.error for status in statuses))
+
+
+def ensure_host(host: str) -> None:
+    if host not in load_hosts():
+        die(f"unknown host: {host}")
+
+
+def append_state(payload: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def command_submit(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    command = ["sbatch", "--parsable", *args.sbatch_arg, args.script, *args.script_args]
+    try:
+        result = run_command(args.host, command, cwd=args.chdir, timeout=SSH_TIMEOUT)
+    except SmuxError as exc:
+        die(str(exc))
+    if result.returncode != 0:
+        die(f"{args.host}: sbatch failed: {result.stderr.strip() or result.stdout.strip()}")
+    response = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    job_id = response.split(";", 1)[0]
+    if not job_id or not all(char.isdigit() or char in "_+." for char in job_id):
+        die(f"{args.host}: could not parse sbatch job id from {response!r}")
+    record = {
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "host": args.host,
+        "job_id": job_id,
+        "script": args.script,
+        "chdir": args.chdir,
+        "sbatch_args": args.sbatch_arg,
+        "script_args": args.script_args,
+    }
+    append_state(record)
+    if args.json:
+        print(json.dumps(record, indent=2))
+    else:
+        print(f"{args.host}:{job_id}")
+    return 0
+
+
+def validate_job_id(job_id: str) -> None:
+    if not job_id or not all(char.isdigit() or char in "_+." for char in job_id):
+        die(f"invalid Slurm job id: {job_id}")
+
+
+def command_show(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    validate_job_id(args.job_id)
+    result = run_command(
+        args.host,
+        ["scontrol", "show", "job", "-o", args.job_id],
+        timeout=SSH_TIMEOUT,
+    )
+    if result.returncode != 0:
+        die(f"{args.host}:{args.job_id}: {result.stderr.strip() or 'scontrol failed'}")
+    print(result.stdout.rstrip())
+    return 0
+
+
+def job_state(host: str, job_id: str) -> tuple[bool, str]:
+    queued = run_command(host, ["squeue", "-h", "-j", job_id, "-o", "%T"], timeout=SSH_TIMEOUT)
+    if queued.returncode == 0 and queued.stdout.strip():
+        return False, queued.stdout.strip().splitlines()[0]
+    accounting = run_command(
+        host,
+        ["sacct", "-n", "-X", "-j", job_id, "--format=State", "--parsable2"],
+        timeout=SSH_TIMEOUT,
+    )
+    state = accounting.stdout.strip().split("|", 1)[0].strip() if accounting.returncode == 0 else ""
+    return True, state or "LEFT_QUEUE"
+
+
+def command_wait(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    validate_job_id(args.job_id)
+    started = time.monotonic()
+    previous = None
+    while True:
+        try:
+            finished, state = job_state(args.host, args.job_id)
+        except SmuxError as exc:
+            die(str(exc))
+        if state != previous:
+            print(f"{args.host}:{args.job_id} {state}", flush=True)
+            previous = state
+        if finished:
+            return 0 if state.startswith("COMPLETED") else 1
+        if args.timeout is not None and time.monotonic() - started >= args.timeout:
+            die(f"timed out waiting for {args.host}:{args.job_id}")
+        time.sleep(args.interval)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="smux",
+        description="Operate several independent Slurm controllers over SSH.",
+    )
+    parser.add_argument("--version", action="version", version="smux 0.2.0")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init", help="create a private local host config")
+    init_parser.add_argument("--force", action="store_true")
+    init_parser.set_defaults(func=command_init)
+
+    edit_parser = subparsers.add_parser("edit", help="edit the private host config")
+    edit_parser.set_defaults(func=command_edit)
+
+    hosts_parser = subparsers.add_parser("hosts", help="list configured aliases")
+    hosts_parser.add_argument("--json", action="store_true")
+    hosts_parser.set_defaults(func=command_hosts)
+
+    status_parser = subparsers.add_parser(
+        "status", help="probe Slurm and GPUs, then summarize your jobs"
+    )
+    status_parser.add_argument("hosts", nargs="*")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.set_defaults(func=command_status)
+
+    jobs_parser = subparsers.add_parser("jobs", help="aggregate your queues")
+    jobs_parser.add_argument("hosts", nargs="*")
+    jobs_parser.add_argument("--json", action="store_true")
+    jobs_parser.set_defaults(func=command_jobs)
+
+    gpus_parser = subparsers.add_parser(
+        "gpus", help="show physical GPU occupancy and Slurm GRES type by index"
+    )
+    gpus_parser.add_argument("hosts", nargs="*")
+    gpus_parser.add_argument("--json", action="store_true")
+    gpus_parser.set_defaults(func=command_gpus)
+
+    submit_parser = subparsers.add_parser("submit", help="submit an existing script on one host")
+    submit_parser.add_argument("host")
+    submit_parser.add_argument("script", help="path as seen on the selected host")
+    submit_parser.add_argument("script_args", nargs="*")
+    submit_parser.add_argument("--chdir", help="remote working directory")
+    submit_parser.add_argument(
+        "--sbatch-arg",
+        action="append",
+        default=[],
+        help="extra sbatch option; repeat as needed (use --sbatch-arg=--partition=gpu)",
+    )
+    submit_parser.add_argument("--json", action="store_true")
+    submit_parser.set_defaults(func=command_submit)
+
+    show_parser = subparsers.add_parser("show", help="show one job through scontrol")
+    show_parser.add_argument("host")
+    show_parser.add_argument("job_id")
+    show_parser.set_defaults(func=command_show)
+
+    wait_parser = subparsers.add_parser("wait", help="wait for one job to leave its queue")
+    wait_parser.add_argument("host")
+    wait_parser.add_argument("job_id")
+    wait_parser.add_argument("--interval", type=float, default=10.0)
+    wait_parser.add_argument("--timeout", type=float)
+    wait_parser.set_defaults(func=command_wait)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if shutil.which("ssh") is None and any(host != "local" for host in load_hosts(required=False)):
+        die("ssh is required for remote hosts")
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nsmux: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
