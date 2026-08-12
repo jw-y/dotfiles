@@ -18,7 +18,12 @@
 #   2. --no-restart on every 'cdx use'. 'use' disconnects every proxy it sees
 #      by command name regardless of path, which is correct in production
 #      (a changed account makes cached connections stale) and unwanted here.
+# Assertions compare against cdx's rendered output, which contains a literal
+# '~' where it has shortened $HOME. Expanding it is exactly what must not
+# happen, so the check that warns about unexpanded tildes is off for this file.
+# shellcheck disable=SC2088
 set -uo pipefail
+
 
 CDX="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/cdx"
 [ -x "$CDX" ] || { echo "cannot find bin/cdx next to tests/" >&2; exit 1; }

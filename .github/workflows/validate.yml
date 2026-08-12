@@ -14,16 +14,29 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # 'bash -n a b c' parses only 'a' — b and c become its positional
+      # parameters, so a syntax error in them passes silently. One file at a
+      # time is the only form that checks them all.
       - name: Check shell scripts
         run: |
-          bash -n install.sh update.sh claude/statusline-command.sh
-          shellcheck --severity=warning install.sh update.sh claude/statusline-command.sh
+          for f in install.sh update.sh bin/cdx tests/*.test.sh; do
+            bash -n "$f"
+          done
+          shellcheck --severity=warning install.sh update.sh bin/cdx tests/*.test.sh
       - name: Check Python syntax
-        run: python3 -c "compile(open('bin/gmon').read(), 'bin/gmon', 'exec')"
+        run: |
+          for f in bin/gmon bin/smux; do
+            python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f"
+          done
       - name: Check JSON
         run: |
           python3 -m json.tool claude/settings.json >/dev/null
           python3 -m json.tool nvim/lazy-lock.json >/dev/null
+      # The suites sandbox themselves: each builds a throwaway CODEX_PROFILES
+      # tree with a stub 'codex' on PATH, and CDX_NO_KILL=1 stops the
+      # process-matching tests from signalling anything real.
+      - name: Run tests
+        run: make test
       - name: Check dry-run safety
         run: |
           HOME="$RUNNER_TEMP/dotfiles-dry-home" DRY_RUN=true ./update.sh

@@ -1345,6 +1345,9 @@ cmd_ssh() {
     # A TTY is needed for the prompts in 'use' and 'add', but asking for one
     # when stdin is a pipe just prints a warning, so only do it when useful.
     [ -t 0 ] && ssh_cmd+=(-t)
+    # Word splitting is the point: CDX_SSH_OPTS holds ssh flags, so
+    # CDX_SSH_OPTS='-p 2222 -v' has to become three arguments, not one.
+    # shellcheck disable=SC2206
     [ -n "${CDX_SSH_OPTS:-}" ] && ssh_cmd+=($CDX_SSH_OPTS)
 
     # Ship this script to the host and run it there, instead of requiring an
