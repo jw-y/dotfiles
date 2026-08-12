@@ -109,6 +109,7 @@ new_env() {
     echo 'model="gpt-5"'  > "$d/codex/config.toml"
     echo 'agents-content' > "$d/codex/AGENTS.md"
     echo 'state-db'       > "$d/codex/state_5.sqlite"
+    echo 'memories-db'    > "$d/codex/memories_1.sqlite"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
     echo "$d"
@@ -208,7 +209,11 @@ it "instructions stop Codex first";       assert_contains "$out" "app-server"
 # Brace expansion needs a comma, so a lone leftover must be printed as a plain
 # path — '{sessions}' would be copied out of the terminal and fail.
 E="$(legacy_env one)"
-for f in config.toml AGENTS.md state_5.sqlite packages; do rm -rf "$E/profiles/main/$f"; done
+# Every shareable item but one — the list has to stay in step with the fixture,
+# since a second leftover puts the braces back and the case goes untested.
+for f in config.toml AGENTS.md state_5.sqlite memories_1.sqlite packages; do
+    rm -rf "$E/profiles/main/$f"
+done
 out="$(cdx "$E" init)"
 it "single leftover is a usable path";    assert_contains "$out" "mv $E/profiles/main/sessions"
 it "no unexpandable braces are printed";  assert_eq "$(printf %s "$out" | grep -c '{')" "0"
@@ -234,6 +239,31 @@ it "data survived the manual path";       assert_eq "$(cat "$D/profiles/personal
 it "listing stops warning";               assert_eq "$(cdx "$D" list | grep -c 'no shared store')" "0"
 it "'migrate' says it is gone";           assert_contains "$(cdx "$D" migrate)" "already uses the store"
 
+# ------------------------------------------- link without codex on PATH -----
+# A real install launches codex through ~/.local/bin/codex, a symlink into the
+# shared packages/ dir by way of the active profile. So the moment a profile's
+# packages link goes stale — which is precisely what a hand-run migration
+# leaves behind — codex stops resolving. 'link' is the command that re-points
+# it, so requiring codex on PATH would strand the fix behind the breakage.
+echo "${DIM}link without codex on PATH${OFF}"
+D="$(store_env nolauncher)"
+chmod +x "$D/profiles/.store/packages/codex-bin"
+ln -sf "$D/codex/packages/codex-bin" "$D/bin/codex"
+it "launcher resolves while linked";      assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "yes"
+
+# What a migration leaves: the store moved, the profile still points at the old
+# path, and every hop through the active profile now dangles.
+ln -sfn "$D/profiles/.store/packages-old" "$D/profiles/main/packages"
+it "a stale link breaks the launcher";    assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "no"
+it "other commands still demand codex";   assert_contains "$(cdx "$D" list)" "not on PATH"
+it "so does running a profile";           assert_contains "$(cdx "$D" personal)" "not on PATH"
+
+out="$(cdx "$D" link)"
+it "link runs without codex on PATH";     assert_contains "$out" "linked main"
+it "link re-pointed the stale link";      assert_link "$D/profiles/main/packages" "$D/profiles/.store/packages"
+it "the launcher resolves again";         assert_eq "$([ -x "$D/bin/codex" ] && echo yes || echo no)" "yes"
+it "and codex is demanded once more";     assert_eq "$(cdx "$D" list | grep -c 'not on PATH')" "0"
+
 # ------------------------------------------------------- link (repair) -----
 echo "${DIM}link — reconstruction${OFF}"
 D="$(store_env rep)"
@@ -255,6 +285,19 @@ mv "$D/profiles/personal/state_5.sqlite.tmp" "$D/profiles/personal/state_5.sqlit
 out="$(cdx "$D" link)"
 it "refuses to clobber private history"; assert_contains "$out" "is this profile's own"
 it "private history survives link";      assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
+
+# memories_1.sqlite is the exception among the sqlite files: Codex rewrites it
+# atomically, so a real file here is the app-server having clobbered the link,
+# not private data. Guarding it the way state_5.sqlite is guarded left the
+# profile permanently unlinked, since the next app-server recreated the file.
+echo 'clobbered-by-codex' > "$D/profiles/personal/memories_1.sqlite.tmp"
+rm -f "$D/profiles/personal/memories_1.sqlite"
+mv "$D/profiles/personal/memories_1.sqlite.tmp" "$D/profiles/personal/memories_1.sqlite"
+out="$(cdx "$D" link)"
+it "relinks a clobbered memories db";    assert_link "$D/profiles/personal/memories_1.sqlite" "$S/memories_1.sqlite"
+it "and says nothing about it";          assert_eq "$(printf %s "$out" | grep -c 'memories_1')" "0"
+it "the shared memories db is intact";   assert_eq "$([ -f "$S/memories_1.sqlite" ] && [ ! -L "$S/memories_1.sqlite" ] && echo real)" "real"
+it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
 
 # -------------------------------------------------------------- rename -----
 echo "${DIM}rename${OFF}"

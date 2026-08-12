@@ -40,8 +40,16 @@ shared_src() {
 
 # Config, shared so settings live in one place, not N copies. Safe to replace
 # with a link if a profile has its own: nothing here is unrecoverable.
+#
+# memories_1.sqlite sits here rather than with the history below because Codex
+# rewrites it the same way it rewrites config.toml — atomically, temp file
+# renamed over the target, which destroys the symlink. Treating it as history
+# meant link_shared saw a real file, assumed private conversations, and
+# refused; the app-server then recreated it after every relink, so the profile
+# could never rejoin the store. It holds a job queue (stage1_outputs, jobs)
+# that Codex rebuilds, not anything a user typed.
 SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
-        custom-instructions.md models_cache.json)
+        custom-instructions.md models_cache.json memories_1.sqlite)
 
 # Same idea, but these hold irreplaceable history, so a real file is never
 # overwritten to make room for the link. state_5.sqlite is the index 'resume'
@@ -54,7 +62,7 @@ SHARED_FILES=(config.toml AGENTS.md AGENTS.override.md instructions.md
 # files. state_5.sqlite carries auto-generated titles but leaves its 'name'
 # column empty, so leaving these per-profile split your own thread names by
 # whichever account happened to be active when you set them.
-SHARED_DATA=(state_5.sqlite memories_1.sqlite session_index.jsonl history.jsonl)
+SHARED_DATA=(state_5.sqlite session_index.jsonl history.jsonl)
 
 # Version-keyed download caches, identical for every account: the Codex binary
 # (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
@@ -1642,12 +1650,23 @@ EOF
     esac
 }
 
-command -v codex >/dev/null || die "codex is not on PATH"
-# Checked up front rather than at each use: python3 decodes the id_token JWT
-# for the account column, ranks the typo suggestion, and emits 'status --json'.
-# Failing here names the missing dependency once, instead of letting the plain
-# 'cdx' listing die inside a heredoc. Any host with codex installed has it.
-command -v python3 >/dev/null || die "python3 is not on PATH"
+# 'link' is exempt from both checks because it is the repair command, and the
+# breakage it repairs takes codex off PATH. The launcher at ~/.local/bin/codex
+# is a symlink through the shared packages/ dir, so the moment that dir moves —
+# a hand-run migration, a renamed store — resolving it fails. Demanding codex
+# here would put the only fix on the far side of the thing that needs fixing.
+# cmd_link shells out to neither: it only rewrites symlinks.
+#
+# python3 is checked up front rather than at each use: it decodes the id_token
+# JWT for the account column, ranks the typo suggestion, and emits
+# 'status --json'. Failing here names the missing dependency once, instead of
+# letting the plain 'cdx' listing die inside a heredoc. Any host with codex
+# installed has it.
+case "${1:-}" in
+    link) ;;
+    *)  command -v codex   >/dev/null || die "codex is not on PATH"
+        command -v python3 >/dev/null || die "python3 is not on PATH" ;;
+esac
 
 # Only the word straight after the command counts as a help request: 'cdx add
 # work --help' is asking 'codex login' for its help, not cdx for its own.
