@@ -12,15 +12,15 @@ help:
 	@echo ""
 	@echo "Env vars:"
 	@echo "  DRY_RUN=true        Preview mode for any target"
-	@echo "  MINIMAL=true        Shell-only install (same as 'make minimal')"
+	@echo "  PROFILE=<name>      Which install profile to run: full (default) or minimal"
 	@echo "  WITH_GITCONFIG=true Also wire up gitconfig during install"
 	@echo "  UPGRADE_NVIM=true   Force nvim re-download during install"
 
 install:
-	@./install.sh
+	@PROFILE=$(PROFILE) ./install.sh
 
 minimal:
-	@MINIMAL=true ./install.sh
+	@PROFILE=minimal ./install.sh
 
 update:
 	@./update.sh
@@ -32,7 +32,7 @@ gitconfig:
 	@WITH_GITCONFIG=true ./install.sh
 
 test:
-	@bash tests/cdx.test.sh
+	@for t in tests/*.test.sh; do bash "$$t" || exit 1; done
 
 dry-run:
 	@echo "=== DRY RUN ==="

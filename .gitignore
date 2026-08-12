@@ -24,3 +24,4 @@ Thumbs.db
 *.sh.download
 Miniconda*.sh
 /bin/nvim
+bin/__pycache__/

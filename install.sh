@@ -7,7 +7,15 @@ cd "$(dirname "$0")"
 DRY_RUN=${DRY_RUN:-false}
 WITH_GITCONFIG=${WITH_GITCONFIG:-false}
 UPGRADE_NVIM=${UPGRADE_NVIM:-false}
-MINIMAL=${MINIMAL:-false}
+# Which set of steps to run. 'minimal' and 'full' were always profiles — named
+# lists of steps, with full composing minimal — but they used to be selected by
+# a MINIMAL=true boolean, which could express exactly two. Adding one now costs
+# a single profile_<name> function and nothing else.
+#
+# Note before adding one: install_mac_tools and install_linux_tools already
+# skip themselves on the wrong OS, so a profile is only worth writing when the
+# difference is something other than the platform.
+PROFILE=${PROFILE:-full}
 
 TPM_PATH="$HOME/.tmux/plugins/tpm"
 
@@ -377,7 +385,14 @@ bootstrap_gitconfig() {
     fi
 }
 
-install_minimal() {
+# A profile_<name> function is a profile; install_<name> is a single step.
+# Separating the namespaces is what lets the list be derived rather than kept
+# in step by hand — matching on install_* swept up install_nvm and install_uv.
+profiles() {
+    declare -F | sed -n 's/^declare -f profile_\([a-z]*\)$/\1/p' | sort | tr '\n' ' '
+}
+
+profile_minimal() {
     local errors=0
 
     install_oh_my_zsh    || (( ++errors ))
@@ -388,12 +403,12 @@ install_minimal() {
     return $errors
 }
 
-install_full() {
+profile_full() {
     local errors=0
 
     install_mac_tools    || (( ++errors ))
     install_linux_tools  || (( ++errors ))
-    install_minimal      || (( errors += $? ))
+    profile_minimal      || (( errors += $? ))
     install_nvm          || (( ++errors ))
     install_extra_tools  || (( ++errors ))
     install_uv           || (( ++errors ))
@@ -411,12 +426,13 @@ install() {
         return 1
     fi
 
-    if [ "$MINIMAL" = "true" ]; then
-        echo "Running minimal install (shell config only)..."
-        install_minimal || (( errors += $? ))
-    else
-        install_full || (( errors += $? ))
+    # Naming the profile wrong should say so, not quietly install everything.
+    if ! declare -F "profile_$PROFILE" >/dev/null; then
+        echo "  ERROR: unknown profile '$PROFILE' (available: $(profiles))"
+        return 1
     fi
+    echo "Running $PROFILE install..."
+    "profile_$PROFILE" || (( errors += $? ))
 
     if [ "$WITH_GITCONFIG" = "true" ]; then
         bootstrap_gitconfig || (( ++errors ))

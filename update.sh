@@ -17,6 +17,15 @@ FILES=(
     ".ipdb"
 )
 
+# bin/<name> linked to ~/.local/bin/<name>. Listed rather than globbed, so a
+# half-written script in bin/ cannot install itself onto $PATH; anything here
+# but unlisted is reported at the end instead.
+TOOLS=(
+    gmon
+    cdx
+    smux
+)
+
 backup_path() {
     local target=$1
     local backup="${target}.dotfiles-backup-${BACKUP_STAMP}"
@@ -77,5 +86,22 @@ sync_file "jungwoo.zsh-theme" "$THEME_PATH"
 echo "checking Claude settings"
 sync_file "claude/settings.json" "$HOME/.claude"
 
-link_path "$DOTFILES_DIR/bin/gmon" "$HOME/.local/bin/gmon" "gmon"
-link_path "$DOTFILES_DIR/bin/cdx" "$HOME/.local/bin/cdx" "cdx"
+for tool in "${TOOLS[@]}"; do
+    if [ ! -f "$DOTFILES_DIR/bin/$tool" ]; then
+        echo "  WARNING: TOOLS lists '$tool' but bin/$tool does not exist"
+        continue
+    fi
+    link_path "$DOTFILES_DIR/bin/$tool" "$HOME/.local/bin/$tool" "$tool"
+done
+
+# Naming a tool is the deliberate step, so forgetting it is the likely mistake.
+# Say so rather than installing it: silence would leave a tool that works in the
+# repo and is missing on every machine.
+for path in "$DOTFILES_DIR"/bin/*; do
+    [ -f "$path" ] && [ -x "$path" ] || continue
+    tool="$(basename "$path")"
+    case " ${TOOLS[*]} " in
+        *" $tool "*) ;;
+        *) echo "  note: bin/$tool is executable but not listed in TOOLS — not installed" ;;
+    esac
+done
