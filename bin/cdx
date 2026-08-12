@@ -1524,12 +1524,142 @@ cmd_run() {
     exec env CODEX_HOME="$home" codex "$@"
 }
 
+# Per-command help. 'cdx -h' is a map of the whole tool and stays short by
+# leaving each command's detail out; the detail has to live somewhere, and
+# 'cdx <command> -h' is where anyone looks for it.
+sub_help() {
+    case "$1" in
+        list) cat <<EOF
+cdx [list] [--refresh] [--no-usage]
+
+  List accounts, '*' marking the active one, with how much of its rate-limit
+  window each has spent and when that window resets. An account that cannot
+  run says why in place of the percentage ('spend limit', 'rate limited',
+  're-login'); 'cdx status <name>' then gives the long form.
+
+  --refresh    ask OpenAI for live figures instead of using the cache
+  --no-usage   skip the quota lookup entirely
+EOF
+        ;;
+        status) cat <<EOF
+cdx status [name] [--json]
+
+  Report an account and check it against what is running on this machine.
+  With no name, the active account.
+
+  The Account section follows the name you give. Storage, Clients and the
+  verdict always describe this machine, so they do not change when you ask
+  about another account — a non-active account is marked as such.
+
+  Quota comes from the cache, so this works offline; 'cdx --refresh' takes a
+  live reading. Exits non-zero on a mismatch, which is what makes it usable
+  in a script.
+
+  --json       machine-readable, with raw percentages and epochs, plus
+               'reported_profile' alongside 'active_profile'
+EOF
+        ;;
+        use) cat <<EOF
+cdx use <name> [--no-restart] [--dry-run]
+
+  Point $(tilde "$CODEX_LINK") at <name>, which switches every Codex client on this
+  machine at once, then stop the processes still bound to the old account so
+  they come back on the new one. SSH remote proxies are disconnected too, so
+  the desktop app reconnects rather than holding a dead backend.
+
+  Reports where you landed, and warns when that account is nearly out of
+  quota or cannot run at all, naming the account with the most room.
+
+  --no-restart  leave running clients on the old account
+  --dry-run     show what would change, change nothing
+EOF
+        ;;
+        add) cat <<EOF
+cdx add <name> [args...]
+
+  Create <name> and log in. Extra arguments pass through to 'codex login';
+  over SSH or without a display, device auth is used automatically. Rerunning
+  it on an account whose login never finished retries that login.
+EOF
+        ;;
+        app) cat <<EOF
+cdx app [name] [dir] [--stock]
+
+  Launch the desktop app as <name> (macOS only), defaulting to the active
+  account and the current directory.
+
+  --stock      reuse the app's existing ChatGPT desktop login instead of
+               giving this account its own Electron session
+EOF
+        ;;
+        ssh) cat <<EOF
+cdx ssh <host> [args...]
+
+  Run cdx on <host>: 'cdx ssh baram use work'. The script ships itself over
+  the connection, so nothing needs installing there. Each host keeps its own
+  accounts and its own active one. Reachability — ports, users, ProxyJump —
+  comes from ~/.ssh/config; CDX_SSH_OPTS adds flags for one call.
+EOF
+        ;;
+        rename) cat <<EOF
+cdx rename <old> <new>
+
+  Rename an account, 'main' included. Nothing points into an account once the
+  store exists, so this is a directory rename plus the active pointer.
+  Processes holding files under the old path are stopped first.
+EOF
+        ;;
+        rm) cat <<EOF
+cdx rm <name> [-y]
+
+  Delete <name> and its credentials. Shared history, config and caches live in
+  the store, so they survive. Refuses to delete the active account, and
+  refuses 'main' before 'cdx init', where it is still $(tilde "$CODEX_LINK") itself.
+
+  -y           skip the confirmation prompt
+EOF
+        ;;
+        init) cat <<EOF
+cdx init [-y]
+
+  One-time setup: turn $(tilde "$CODEX_LINK") into a symlink so accounts can be switched
+  by re-pointing it. The current account moves to $(tilde "$PROFILES")/main and stays
+  active; shared data is hoisted into the store. A rename on one filesystem,
+  so nothing is copied.
+
+  -y           skip the confirmation prompt
+EOF
+        ;;
+        link) cat <<EOF
+cdx link
+
+  Rebuild every account's symlinks into the store. The repair command: run it
+  if Codex overwrites a link with a real file, or a link is left pointing
+  somewhere stale. An account's own data is never replaced — it is reported
+  and left alone.
+EOF
+        ;;
+    esac
+}
+
 command -v codex >/dev/null || die "codex is not on PATH"
 # Checked up front rather than at each use: python3 decodes the id_token JWT
 # for the account column, ranks the typo suggestion, and emits 'status --json'.
 # Failing here names the missing dependency once, instead of letting the plain
 # 'cdx' listing die inside a heredoc. Any host with codex installed has it.
 command -v python3 >/dev/null || die "python3 is not on PATH"
+
+# Only the word straight after the command counts as a help request: 'cdx add
+# work --help' is asking 'codex login' for its help, not cdx for its own.
+case "${2:-}" in
+    -h|--help)
+        case "${1:-}" in
+            list|ls) sub_help list; exit 0 ;;
+            rename|mv) sub_help rename; exit 0 ;;
+            status|use|add|app|ssh|rm|init|link) sub_help "$1"; exit 0 ;;
+        esac
+        ;;
+esac
 
 case "${1:-}" in
     "") list_profiles ;;

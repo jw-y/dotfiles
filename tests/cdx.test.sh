@@ -439,6 +439,29 @@ it "status still keeps full paths in json"; assert_contains "$(CDX_USAGE=off cdx
 it "status --json carries the quota";    assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_percent"])')" "42"
 it "json quota keeps the raw epoch";     assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(type(json.load(sys.stdin)["quota"]["reset_at"]).__name__)')" "float"
 
+# Asking about an account you are not on is the point: deciding whether to
+# switch should not require switching first. Everything below the Account
+# section still describes the machine, so the mismatch verdict is unchanged.
+write_quota personal 7 >/dev/null 2>&1 || true
+out="$(CDX_USAGE=off cdx "$U" status personal)"
+it "status can report another account";  assert_contains "$out" "profile       personal"
+it "and says it is not the active one";  assert_contains "$out" "(not active — 'lab' is)"
+it "the active one says nothing extra";  assert_eq "$(CDX_USAGE=off cdx "$U" status | grep -c 'not active')" "0"
+it "json names the reported profile";    assert_eq "$(CDX_USAGE=off cdx "$U" status personal --json | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["reported_profile"], d["active_profile"])')" "personal lab"
+it "an unknown name is an error";        assert_contains "$(CDX_USAGE=off cdx "$U" status nope)" "no such profile"
+it "a near-miss is suggested";           assert_contains "$(CDX_USAGE=off cdx "$U" status personl)" "did you mean 'personal'"
+it "two names are refused";              assert_contains "$(CDX_USAGE=off cdx "$U" status lab personal)" "takes one profile name"
+it "unknown flags are refused";          assert_contains "$(CDX_USAGE=off cdx "$U" status --bogus)" "unknown option to 'status'"
+
+# Per-command help. 'cdx -h' is a map of the whole tool; the detail for one
+# command has to live where anyone would look for it.
+it "status has its own help";            assert_contains "$(cdx "$U" status -h)" "cdx status [name] [--json]"
+it "help does not run the command";      assert_eq "$(cdx "$U" status -h | grep -c '^Account$')" "0"
+it "every command has help";             assert_eq "$(for c in list status use add app ssh rename rm init link; do cdx "$U" "$c" --help | head -1; done | grep -c '^cdx ')" "10"
+# 'cdx add work --help' is asking codex login for its help, not cdx for its
+# own, so only the word straight after the command counts.
+it "help is positional";                 assert_eq "$(cdx "$U" add work --help | grep -c '^cdx add')" "0"
+
 # The default mode fills an empty cache once and then stays local: a stale
 # figure is reused rather than re-fetched, so the everyday listing never waits
 # on the network. 'auto' is what re-fetches on a TTL.
