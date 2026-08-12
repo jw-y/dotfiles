@@ -322,6 +322,94 @@ it "live plan wins over the token";      assert_contains "$out" "pro"
 it "the figure is cached per profile";   assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["used"])')" "42"
 it "the cache is not world-readable";    assert_eq "$(stat -c %a "$U/profiles/lab/.cdx-usage.json")" "600"
 
+# Credits. A subscription reports 'has_credits: false' with a zero balance
+# attached — it means "this account does not use credits", NOT "the balance is
+# spent". Reading it as exhaustion marked every working account empty, so the
+# balance is now recorded and only stated when the payload states one. Until
+# the field carrying a real balance is identified, no account is called spent.
+python3 -c 'import json,sys,time
+json.dump({"email":"tester@example.com","plan_type":"plus",
+           "rate_limit":{"primary_window":{"used_percent":16,
+                         "limit_window_seconds": 604800,
+                         "reset_at": time.time() + 3*86400},
+                         "credits":{"has_credits":False,"unlimited":False,
+                                    "balance":"0"}}}, open(sys.argv[1],"w"))' "$U/subscription.json"
+out="$(CDX_USAGE_ENDPOINT="file://$U/subscription.json" CDX_USAGE_TTL=0 cdx "$U" list)"
+it "a subscription is never 'spent'";    assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["state"])')" "ok"
+it "and shows no balance at all";        assert_eq "$(printf %s "$out" | grep -c NOTE)" "0"
+# The spelled-out credit line belongs to 'status' alone. It reached the NOTE
+# column once, because 'read' packs every remaining field into its last
+# variable — so a new column upstream silently lands inside the previous one.
+# 'main' is still active here and was never logged in, so ask about the profile
+# these fixtures actually wrote to.
+cdx "$U" use lab --no-restart >/dev/null
+it "status spells the credits out";      assert_contains "$(CDX_USAGE=off cdx "$U" status)" "allowance     not used on this plan"
+it "the listing does not";               assert_eq "$(printf %s "$out" | grep -c 'not used on this plan')" "0"
+it "the raw credits are kept anyway";    assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["credits"]["has_credits"])')" "False"
+it "the percentage is unaffected";       assert_contains "$out" "16% wk"
+# Spend control: an admin-set budget is the third exhaustion axis, and the only
+# one that stops an account while every rate-limit field reports fine. This
+# fixture is the real payload from an account that could not run: allowed true,
+# limit_reached false, 0% on the 5h window and 16% on the week, has_credits
+# true with a null balance — nothing but spend_control.reached says so.
+python3 -c 'import json,sys,time
+json.dump({"email":"tester@example.com","plan_type":"education",
+           "rate_limit":{"allowed":True,"limit_reached":False,
+                         "primary_window":{"used_percent":0,
+                          "limit_window_seconds":18000,
+                          "reset_at": time.time() + 3600},
+                         "secondary_window":{"used_percent":16,
+                          "limit_window_seconds":604800,
+                          "reset_at": time.time() + 3*86400},
+                         "credits":{"has_credits":True,"unlimited":False,
+                                    "balance":None}},
+           "spend_control":{"individual_limit":None,"reached":True}},
+          open(sys.argv[1],"w"))' "$U/spendlimit.json"
+out="$(CDX_USAGE_ENDPOINT="file://$U/spendlimit.json" CDX_USAGE_TTL=0 cdx "$U" list)"
+it "a reached spend limit is a state";   assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["state"])')" "spendlimit"
+it "the listing says so";                assert_contains "$out" "spend limit"
+# The cell says what stopped the account rather than a percentage that did
+# not; the percentage is still there in 'status', which has room for both.
+it "the cell drops the percentage";      assert_eq "$(printf %s "$out" | grep -c '16% wk')" "0"
+it "status still has both";              assert_contains "$(CDX_USAGE=off cdx "$U" status)" "16% of the weekly limit"
+it "the binding window is the weekly one"; assert_eq "$(printf %s "$out" | grep -c '0% 5h')" "0"
+it "a null balance prints no number";    assert_eq "$(printf %s "$out" | grep -c 'None')" "0"
+out="$(CDX_USAGE=off cdx "$U" use lab --no-restart)"
+it "use refuses to stay quiet";          assert_contains "$out" "'lab' is over its spend limit and cannot run"
+it "use marks the figure as not the cause"; assert_contains "$out" "which is not what stopped it"
+it "status names the real limit";        assert_contains "$(CDX_USAGE=off cdx "$U" status)" "over its spend limit"
+it "json carries the state";             assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["state"])')" "spendlimit"
+# An individual limit does carry numbers; a workspace-level one never does.
+python3 -c 'import json,sys,time
+json.dump({"email":"tester@example.com","plan_type":"business",
+           "rate_limit":{"primary_window":{"used_percent":16,
+                         "limit_window_seconds":604800,
+                         "reset_at": time.time() + 3*86400}},
+           "spend_control":{"reached":False,
+                            "individual_limit":{"limit":"7000",
+                             "remaining_percent":12,
+                             "resets_at": time.time() + 9*86400}}},
+          open(sys.argv[1],"w"))' "$U/budget.json"
+out="$(CDX_USAGE_ENDPOINT="file://$U/budget.json" CDX_USAGE_TTL=0 cdx "$U" list)"
+it "an individual budget shows numbers"; assert_contains "$(CDX_USAGE=off cdx "$U" status)" "12% of the spend budget left (limit 7000)"
+it "a budget with room is not a block";  assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["state"])')" "ok"
+it "and does not crowd the listing";     assert_contains "$out" "16% wk"
+
+# A stated balance is shown; 'unlimited' says so rather than printing a number.
+python3 -c 'import json,sys,time
+json.dump({"email":"tester@example.com","plan_type":"enterprise",
+           "rate_limit":{"primary_window":{"used_percent":16,
+                         "limit_window_seconds": 604800,
+                         "reset_at": time.time() + 3*86400},
+                         "credits":{"has_credits":True,"unlimited":True,
+                                    "balance":"0"}}}, open(sys.argv[1],"w"))' "$U/unlimited.json"
+out="$(CDX_USAGE_ENDPOINT="file://$U/unlimited.json" CDX_USAGE_TTL=0 cdx "$U" list)"
+it "unlimited is not a number";          assert_contains "$(CDX_USAGE=off cdx "$U" status)" "allowance     unlimited"
+it "unlimited is not spent";             assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["state"])')" "ok"
+# Put the 42% figure back: these fixtures wrote through the same per-profile
+# cache the sections below read as their 'last known' value.
+CDX_USAGE_ENDPOINT="file://$U/usage.json" CDX_USAGE_TTL=0 cdx "$U" list >/dev/null
+
 # An unreadable endpoint must not blank the column or fail the command: the
 # last known figure is shown, marked stale.
 export CDX_USAGE_ENDPOINT="file://$U/gone.json" CDX_USAGE_TTL=0
@@ -374,16 +462,23 @@ unset CDX_USAGE CDX_USAGE_ENDPOINT
 # cache, since activating an account must never wait on the network. The cache
 # files are written directly here: that is the format cdx itself writes, and
 # it lets each account be pinned to a known figure.
-write_quota() {  # <profile> <used_percent> [state]
+#
+# 'window' is not optional here. A cache written by cdx itself always carries
+# it, and it is what turns the rendered figure into '95% wk' — the form that
+# broke the percentage parse in 'use' while a window-less fixture kept every
+# assertion green. A fixture that cannot produce the real string cannot catch
+# the real bug.
+write_quota() {  # <profile> <used_percent> [state] [window_seconds]
     python3 -c 'import json,sys,time
 json.dump({"fetched_at": time.time(), "used": int(sys.argv[2]),
-           "reset_at": time.time() + 86400, "state": sys.argv[3]},
+           "reset_at": time.time() + 86400, "state": sys.argv[3],
+           "window": int(sys.argv[4])},
           open(sys.argv[1] + "/.cdx-usage.json", "w"))' \
-        "$U/profiles/$1" "$2" "${3:-ok}"
+        "$U/profiles/$1" "$2" "${3:-ok}" "${4:-604800}"
 }
 write_quota lab 95; write_quota personal 12; write_quota main 40
 out="$(CDX_USAGE=off cdx "$U" use personal --no-restart)"
-it "use reports the new account's quota"; assert_contains "$out" "quota: 12% used"
+it "use reports the new account's quota"; assert_contains "$out" "quota: 12% wk used"
 it "a healthy account draws no warning";  assert_eq "$(printf %s "$out" | grep -c 'nearly out')" "0"
 out="$(CDX_USAGE=off cdx "$U" use lab --no-restart)"
 it "use warns near the limit";            assert_contains "$out" "lab is nearly out of quota (95% used)"
@@ -415,9 +510,27 @@ D="$(new_env add)"; cdx "$D" init -y >/dev/null
 out="$(cdx "$D" add work)"
 it "add logs in";                        assert_contains "$out" "logging in to 'work'"
 it "add links the new profile";          assert_link "$D/profiles/work/sessions" "$D/profiles/.store/sessions"
+
+# The window label is what the percentage has to survive, so vary it: a 5-hour
+# window renders '95% 5h', and the warning has to fire on that too. Both the
+# listing and 'use' read the same rendered cell, and they used to parse it
+# differently — the listing correctly, 'use' not at all.
+write_quota lab 95 ok 18000; write_quota personal 12 ok 18000
+out="$(CDX_USAGE=off cdx "$U" use lab --no-restart)"
+it "warns on a five-hour window too";     assert_contains "$out" "lab is nearly out of quota (95% used)"
+it "and labels the window it reports";    assert_contains "$out" "quota: 95% 5h used"
+it "the listing agrees on the figure";    assert_contains "$(CDX_USAGE=off cdx "$U" list)" "95% 5h"
+it "status spells the window out";        assert_contains "$(CDX_USAGE=off cdx "$U" status)" "of the 5-hour limit"
+
 it "add refuses a logged-in profile";    assert_contains "$(cdx "$D" add work)" "already exists"
 rm -f "$D/profiles/work/auth.json"
 it "add retries an unfinished login";    assert_contains "$(cdx "$D" add work)" "not logged in — retrying login"
+# Credentials are attached to this request, so the destination is checked
+# before anything is sent: a plain-http endpoint would put the token on the
+# wire in clear.
+it "refuses a cleartext endpoint";        assert_contains "$(CDX_USAGE_ENDPOINT=http://example.invalid/u cdx "$U" list)" "refusing to send credentials"
+it "refuses a non-http scheme";           assert_contains "$(CDX_USAGE_ENDPOINT=ftp://example.invalid/u cdx "$U" list)" "refusing to send credentials"
+
 it "add passes flags to codex login";    assert_eq "$(cdx "$D" add other --device-auth >/dev/null; cat "$D/profiles/other/.login-args")" "--device-auth"
 
 # ---------------------------------------------------------------- list -----

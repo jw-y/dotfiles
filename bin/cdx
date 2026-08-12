@@ -101,7 +101,8 @@ ${C_CYAN}Every day${C_RESET}
   cdx                      list accounts, with how much quota each has left
   cdx use <name>           make <name> active for every client on this machine
   cdx <name> [args...]     run one codex command as <name>, without switching
-  cdx status               check the active account against what is running
+  cdx status [name]        check an account (the active one by default)
+                           against what is running
 
 ${C_CYAN}Managing accounts${C_RESET}
   cdx add <name>           create <name> and log in
@@ -125,6 +126,7 @@ ${C_CYAN}Options${C_RESET}
   add <name> [args...]     extra arguments pass through to 'codex login'
   app <name> [dir] --stock reuse the app's existing ChatGPT desktop login
   init -y / rm <name> -y   skip the confirmation prompt
+  status <name>            report that account instead of the active one
   status --json            machine-readable, with the raw quota figures
 
 ${C_CYAN}Layout${C_RESET}
@@ -293,32 +295,19 @@ link_shared() {
     done
 }
 
-# Who a profile is logged in as. The id_token is a JWT whose payload carries
-# the account email and plan; it is decoded locally (no verification needed
-# for display) and the token itself is never printed. Falls back to the
-# account_id prefix when there is no id_token (API-key logins).
-describe() {
-    local auth="$1/auth.json"
-    [ -f "$auth" ] || { echo "not logged in"; return; }
-    python3 - "$auth" <<'PY'
-import base64, json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    print("unreadable auth.json"); sys.exit()
-t = d.get("tokens") or {}
-mode = d.get("auth_mode") or ("apikey" if d.get("OPENAI_API_KEY") else "?")
-who = (t.get("account_id") or "")[:8]
-plan = ""
-try:
-    payload = t["id_token"].split(".")[1]
-    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-    who = claims.get("email") or who
-    plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
-except Exception:
-    pass
-print(f"{mode:8} {who:26} {plan:9} refreshed {(d.get('last_refresh') or '?')[:10]}")
-PY
+# The percentage out of a rendered USED cell. The cell carries more than the
+# number — a '~' when the figure could not be refreshed, and the window it
+# belongs to ('96%~ wk') — so both ends have to be trimmed, and every caller
+# has to trim them the same way. They did not: 'use' anchored its strip at the
+# end of the string, which silently yielded nothing as soon as the window
+# label was appended, and its quota warning could never fire. One rule, one
+# place. Prints the bare integer, or nothing if there is no usable figure.
+pct_of() {
+    local pct="${1%%\%*}"
+    case "$pct" in
+        ''|*[!0-9]*) return 1 ;;
+        *) printf '%s' "$pct" ;;
+    esac
 }
 
 # Live quota, per account. The number Codex shows in '/status' comes from
@@ -333,15 +322,25 @@ PY
 # alarm on accounts that are fine. A 401 here means the refresh token itself
 # is dead and the account needs 'cdx add' again — that is worth showing.
 USAGE_ENDPOINT="${CDX_USAGE_ENDPOINT:-https://chatgpt.com/backend-api/wham/usage}"
+# The request carries a live access token, so the destination is checked before
+# it is sent anywhere: 'http://' would put the token on the wire in clear, and
+# any other scheme is a typo worth catching. 'file://' is how the tests point
+# it at a fixture, and reads nothing over the network.
+case "$USAGE_ENDPOINT" in
+    https://*|file://*) ;;
+    *) die "refusing to send credentials to CDX_USAGE_ENDPOINT=$USAGE_ENDPOINT (https:// or file:// only)" ;;
+esac
 
 # One process for every profile: the requests run concurrently, so a cold
 # cache costs one timeout rather than one per account, and an offline machine
 # stalls once. Answers are cached per profile so the common 'cdx' listing is
-# a local read. Emits TSV: name, mode, account, plan, used, resets, state.
+# a local read. Emits one US-separated row per profile:
+#   name, mode, account, plan, used, resets, state, age, refreshed, note,
+#   credits (spelled out, for 'status')
 profile_rows() {
     local force="${1:-0}"; shift
     python3 - "$force" "${CDX_USAGE:-cache}" "$USAGE_ENDPOINT" "${CDX_USAGE_TTL:-900}" "$@" <<'PY'
-import base64, json, os, sys, time, urllib.error, urllib.request
+import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 force, mode, endpoint, ttl, *pairs = sys.argv[1:]
@@ -354,6 +353,20 @@ def claims(token):
         return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     except Exception:
         return {}
+
+# urllib replays the original headers on a 30x — it drops only content-length
+# and content-type — so a redirect off chatgpt.com would hand the access token
+# to whatever host answered. Keep it on redirects that stay on the same host,
+# strip it otherwise.
+class SameHostAuth(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != \
+                urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+opener = urllib.request.build_opener(SameHostAuth)
 
 # Cached inside the profile, not the store: it is per-account by definition.
 def quota(home, token):
@@ -374,7 +387,7 @@ def quota(home, token):
     req = urllib.request.Request(endpoint, headers={
         "Authorization": "Bearer " + token, "User-Agent": "cdx"})
     try:
-        with urllib.request.urlopen(req, timeout=5) as fh:
+        with opener.open(req, timeout=5) as fh:
             body = json.load(fh)
     except urllib.error.HTTPError as e:
         # 401/403 is the signal we actually care about: the credentials are
@@ -399,13 +412,36 @@ def quota(home, token):
             windows.append({"used": w["used_percent"], "reset_at": w.get("reset_at"),
                             "seconds": w.get("limit_window_seconds")})
     head = max(windows, key=lambda w: w["used"]) if windows else {}
+    # A percentage measures rate limiting — how fast a rolling window is being
+    # spent. It says nothing about a credit balance, which is what a
+    # credit-based plan runs out of, and the two disagree by construction: an
+    # account with nothing left sits at a LOW percentage precisely because it
+    # cannot spend. So the balance is captured whole, and kept.
+    #
+    # What it is NOT used for is a verdict. 'has_credits: false' reads like
+    # 'spent' and actually means 'this account does not use credits at all' —
+    # it is what the subscriptions report. Deriving exhaustion from it marked
+    # every working account empty and left the one genuinely out of credits
+    # as unknown. Until the field carrying a real balance is identified, this
+    # records what the endpoint said and claims nothing about it.
+    credits = limits.get("credits") or body.get("credits") or {}
+    # The third axis, and the only one that catches an admin-set budget. An
+    # account over its monthly credit allowance reports allowed=true,
+    # limit_reached=false and a low percentage — every rate-limit field says
+    # 'fine' — while refusing to run. spend_control.reached is the one field
+    # that says so, and individual_limit stays null when the budget is set on
+    # the organisation rather than the user.
+    spend = body.get("spend_control") or {}
     rec = {"fetched_at": time.time(), "used": head.get("used"),
            "reset_at": head.get("reset_at"), "window": head.get("seconds"),
            "windows": windows, "plan": body.get("plan_type"),
            "email": body.get("email"),
+           "credits": credits or None, "spend_control": spend or None,
            # 'allowed' false means this account is refusing work right now,
            # which a percentage alone does not say.
-           "state": "blocked" if limits.get("limit_reached") else "ok"}
+           "state": "spendlimit" if spend.get("reached") else
+                    "blocked" if limits.get("limit_reached")
+                                 or limits.get("allowed") is False else "ok"}
     try:
         tmp = cache + ".tmp"
         with open(tmp, "w") as fh: json.dump(rec, fh)
@@ -419,10 +455,12 @@ def row(pair):
     name, home = pair.split("=", 1)
     try:
         with open(os.path.join(home, "auth.json")) as fh: auth = json.load(fh)
+    # Every return has to carry the full field count: bash reads these
+    # positionally, so a short row shifts every later column left.
     except FileNotFoundError:
-        return (name, "-", "not logged in", "", "", "", "none")
+        return (name, "-", "not logged in", "", "", "", "none", "", "", "", "")
     except Exception:
-        return (name, "-", "unreadable auth.json", "", "", "", "bad")
+        return (name, "-", "unreadable auth.json", "", "", "", "bad", "", "", "", "")
     tokens = auth.get("tokens") or {}
     kind = auth.get("auth_mode") or ("apikey" if auth.get("OPENAI_API_KEY") else "?")
     c = claims(tokens.get("id_token") or "")
@@ -460,8 +498,55 @@ def row(pair):
     age = ""
     if rec.get("fetched_at"):
         age = str(int(time.time() - rec["fetched_at"]))
+    # One cell for whatever qualifies the percentage, since the percentage on
+    # its own is not the whole story: an account can be at 16% and unusable.
+    # Blank unless there is something to say, which is what keeps the column
+    # off an install where every account is simply fine.
+    #
+    # A stated balance is shown as-is; a subscription reports
+    # 'has_credits: false' with a zero balance attached, and printing that
+    # zero would read as 'spent' on an account that does not use credits.
+    cr = rec.get("credits") or {}
+    # Codex models a spend limit as {limit, remaining_percent, resets_at}, but
+    # only fills it in for a limit set on the individual. A budget set on the
+    # workspace arrives as the bare 'reached' boolean — no numbers exist to
+    # show, on this endpoint or any other the CLI knows.
+    ind = (rec.get("spend_control") or {}).get("individual_limit") or {}
+    state = rec.get("state") or ""
+    if state == "relogin":      note = "re-login"
+    elif state == "spendlimit": note = "spend limit"
+    elif state == "blocked":    note = "rate limited"
+    elif ind.get("remaining_percent") is not None:
+        note = f"{round(ind['remaining_percent'])}% budget"
+    elif cr.get("unlimited"):   note = "unlimited"
+    elif cr.get("has_credits") is True and cr.get("balance") is not None:
+        note = str(cr["balance"])
+    else:                       note = ""
+    # When the credentials were last renewed. Carried here rather than decoded
+    # a second time by 'status', which used to run a whole separate helper to
+    # slice this one date off the end of a formatted line.
+    # Spelled out for 'status' only. The listing stays silent when there is no
+    # balance to show; a diagnostic is the one place where "the endpoint
+    # reports none" beats an empty cell you have to interpret.
+    if ind.get("remaining_percent") is not None:
+        # An individual spend budget is the one allowance that comes with real
+        # numbers, so it wins the line when it exists.
+        credit_desc = f"{round(ind['remaining_percent'])}% of the spend budget left"
+        if ind.get("limit"):
+            credit_desc += f" (limit {ind['limit']})"
+    elif not cr:                     credit_desc = "not reported"
+    elif cr.get("unlimited"):        credit_desc = "unlimited"
+    elif cr.get("has_credits") is False:
+        credit_desc = "not used on this plan"
+    elif cr.get("balance") is not None:
+        credit_desc = str(cr["balance"])
+    else:
+        # has_credits true with no balance: the account spends credits but the
+        # figure is held by the workspace, not this endpoint.
+        credit_desc = "used, but the balance is not exposed here"
     return (name, kind, rec.get("email") or who, rec.get("plan") or plan,
-            used, resets, rec.get("state") or ("none" if not rec else ""), age)
+            used, resets, state or ("none" if not rec else ""), age,
+            (auth.get("last_refresh") or "?")[:10], note, credit_desc)
 
 # Unit separator, not tab: tab is an IFS whitespace character, so bash's 'read'
 # collapses runs of them and an empty column would silently shift every later
@@ -545,11 +630,18 @@ list_profiles() {
     # widths either truncate a long account or leave a gutter of blanks for
     # everyone who has short ones. No borders — this output gets piped and
     # grepped, and box drawing costs more there than the neatness is worth.
-    local rows=() row wn=4 wk=4 wa=7 wp=4 wu=4
-    while IFS=$'\037' read -r n kind acct plan used resets state age; do
+    local rows=() row wn=4 wk=4 wa=7 wp=4 wu=4 note
+    # The trailing '_' is load-bearing: 'read' packs every remaining field into
+    # its last variable, so without it the next column added upstream lands
+    # inside the previous one rather than being ignored.
+    while IFS=$'\037' read -r n kind acct plan used resets state age _ note _; do
         [ -z "$age" ] || [ "$age" -le "$oldest" ] || oldest="$age"
+        # An account that cannot run takes over the USED cell rather than
+        # earning a column of its own: the percentage is not what stopped it,
+        # so it is not the thing to read. 'status' still gives both.
         case "$state" in
-            relogin) used="re-login"; relogin=1 ;;
+            relogin) relogin=1 ;;&
+            relogin|blocked|spendlimit) used="$note" ;;
         esac
         [ ${#n} -le $wn ] || wn=${#n}
         [ ${#kind} -le $wk ] || wk=${#kind}
@@ -567,14 +659,18 @@ list_profiles() {
         # A variable, not $(... && echo ' *' || echo '  ') — command
         # substitution strips the trailing space and misaligns the column.
         if [ "$n" = "$active" ]; then mark=" *"; else mark="  "; fi
-        # Colour tracks how close the account is to its limit, so a full one is
-        # visible without reading the numbers. Padding is applied before the
-        # escapes are wrapped around it: printf counts those invisible bytes as
-        # width and would misalign every later column.
-        pct="${used%\~*}"; pct="${pct%%\%*}"
+        # Colour tracks whichever limit actually stops this account, which is
+        # not always the percentage: a spent balance sits at a LOW percentage
+        # precisely because it cannot spend, so colouring that cell green would
+        # advertise room on an account that can do nothing. Green means "you
+        # can work here" and has to keep meaning exactly that.
+        pct="$(pct_of "$used" || true)"
         color=""
         case "$state" in
-            relogin|blocked) color="$C_RED" ;;
+            # Unusable for a reason the percentage cannot express, so the cell
+            # says the reason instead, in red. Green has to keep meaning "you
+            # can work here" — an account over its spend limit sits at 16%.
+            relogin|blocked|spendlimit) color="$C_RED" ;;
             *) case "$pct" in
                    ''|*[!0-9]*) ;;
                    *) if   [ "$pct" -ge "$QUOTA_WARN_PERCENT" ]; then color="$C_RED"
@@ -582,11 +678,14 @@ list_profiles() {
                       else color="$C_GREEN"; fi ;;
                esac ;;
         esac
+        # Padding is applied before the escapes are wrapped around it: printf
+        # counts those invisible bytes as width and would misalign every later
+        # column.
         printf -v pad '%*s' $wu "$used"
-        printf '%s %-*s  %-*s  %-*s  %s%-*s%s  %s%s%s  %s%s%s\n' \
+        printf '%s %-*s  %-*s  %-*s  %s%-*s%s  %s%s%s' \
             "$mark" $wn "$n" $wk "$kind" $wa "$acct" \
-            "$C_DIM" $wp "$plan" "$C_RESET" \
-            "$color" "$pad" "$C_RESET" "$C_DIM" "$resets" "$C_RESET"
+            "$C_DIM" $wp "$plan" "$C_RESET" "$color" "$pad" "$C_RESET"
+        printf '  %s%s%s\n' "$C_DIM" "$resets" "$C_RESET"
     done
     # The default never re-fetches, so the figures have to say how old they are
     # — an unlabelled percentage reads as current no matter when it was taken.
@@ -675,24 +774,42 @@ tilde()   { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s
 
 # Read-only check of account selection versus long-running remote machinery.
 cmd_status() {
-    local json=0
-    case "${1:-}" in
-        "") ;;
-        --json) json=1; shift ;;
-        *) die "status accepts only --json" ;;
-    esac
-    [ $# -eq 0 ] || die "status accepts only --json"
+    local json=0 subject=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1 ;;
+            -*) die "unknown option to 'status': $1" ;;
+            # An account you are not on is exactly the one you want to inspect
+            # before switching — 'is snu still over its limit?' should not
+            # require switching to snu to find out.
+            *) [ -z "$subject" ] || die "status takes one profile name"
+               subject="$1" ;;
+        esac
+        shift
+    done
     local active home account session_store state_store status_word status_message status_color
     local server_pids proxy_pids pid profile server_rows=""
     local server_count=0 proxy_count=0 mismatch=0
     active="$(active_profile)"
-    home="$(home_of "$active")"
-    account="$(describe "$home")"
+    # The Clients section and the verdict are always about the active profile:
+    # they describe what is running on this machine, which does not change
+    # because you asked about another account.
+    if [ -n "$subject" ]; then
+        validate_name "$subject"
+        home="$(home_of "$subject")"
+        [ -d "$home" ] || missing_profile "$subject"
+    else
+        subject="$active"
+        home="$(home_of "$active")"
+    fi
     # Cached figure only: status is a diagnostic that must work offline, and
     # 'cdx --refresh' is right there when a live number is wanted.
-    local quota="" who="" kind="" plan="" resets="" refreshed=""
-    IFS=$'\037' read -r _ kind who plan quota resets _ \
-        < <(CDX_USAGE=off profile_rows 0 "$active=$home") || true
+    local quota="" who="" kind="" plan="" resets="" refreshed="" state="" credits=""
+    IFS=$'\037' read -r _ kind who plan quota resets state _ refreshed _ credits \
+        < <(CDX_USAGE=off profile_rows 0 "$subject=$home") || true
+    # What the JSON calls the selected account. One line assembled from the
+    # row rather than a second pass over auth.json.
+    account="$who${kind:+ ($kind)}${plan:+ $plan}"
     # The listing's compact '43% wk' is a column heading's worth of context;
     # here there is room for the sentence it stands for.
     if [ -n "$quota" ]; then
@@ -706,9 +823,14 @@ cmd_status() {
     else
         quota="unknown — run 'cdx --refresh'"
     fi
-    # describe() pads its fields for the listing it was written for; status
-    # wants a sentence, so take the one field the rows do not carry.
-    refreshed="${account##*refreshed }"
+    # The rate limit is not always what stopped the account, so say which one
+    # it is rather than letting the percentage answer for both.
+    case "$state" in
+        spendlimit) quota="$quota
+                ${C_RED}over its spend limit — cannot run regardless of the above${C_RESET}" ;;
+        blocked)    quota="$quota ${C_RED}(rate limited now)${C_RESET}" ;;
+    esac
+    [ -n "$refreshed" ] || refreshed="never"
     session_store="$(resolve_dir "$home/sessions" || true)"
     [ -n "$session_store" ] || session_store="missing"
     if [ -L "$home/state_5.sqlite" ]; then
@@ -756,9 +878,18 @@ cmd_status() {
 
     if [ "$json" = 0 ]; then
         section Account
-        row profile "$C_CYAN$active$C_RESET"
+        if [ "$subject" = "$active" ]; then
+            row profile "$C_CYAN$subject$C_RESET"
+        else
+            # Say it plainly: every other section still describes the machine,
+            # so a reader must not take this for the account in use.
+            row profile "$C_CYAN$subject$C_RESET ${C_YELLOW}(not active — '$active' is)$C_RESET"
+        fi
         row "signed in" "$who${kind:+ — $kind}${plan:+, $plan}"
         row quota "$quota"
+        # 'allowance' rather than 'credits': the same line carries a credit
+        # balance, a spend budget, or the fact that neither is reported.
+        [ -z "$credits" ] || row allowance "$credits"
         row refreshed "$refreshed"
         section Storage
         if stored; then
@@ -787,16 +918,19 @@ cmd_status() {
     fi
 
     if [ "$json" = 1 ]; then
-        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" "$home" <<'PY'
+        python3 - "$active" "$account" "$session_store" "$state_store" "$server_rows" "$proxy_count" "$status_word" "$home" "$subject" <<'PY'
 import json, os, sys
-active, account, sessions, state, rows, proxies, status, home = sys.argv[1:]
+active, account, sessions, state, rows, proxies, status, home, subject = sys.argv[1:]
 # Straight from the cache file, not the rendered column: a consumer wants the
 # percentage and the epoch, not "42%" and "Aug 18 18:17 (in 6d)".
 try:
     with open(os.path.join(home, ".cdx-usage.json")) as fh:
         c = json.load(fh)
     quota = {"used_percent": c.get("used"), "reset_at": c.get("reset_at"),
-             "measured_at": c.get("fetched_at"), "state": c.get("state")}
+             "measured_at": c.get("fetched_at"), "state": c.get("state"),
+             # None where the plan has no credit balance at all, so a consumer
+             # can tell "not applicable" from "spent".
+             "credits": c.get("credits")}
 except Exception:
     quota = None
 servers = []
@@ -809,6 +943,9 @@ for row in rows.splitlines():
     })
 print(json.dumps({
     "active_profile": active,
+    # Which account the account-level fields describe. Equal to active_profile
+    # unless a name was given, so a consumer never has to guess.
+    "reported_profile": subject,
     "selected_account": account,
     "quota": quota,
     "conversation_store": sessions,
@@ -1074,11 +1211,10 @@ QUOTA_WARN_PERCENT="${CDX_QUOTA_WARN:-90}"
 
 report_quota() {
     local target="$1"; shift
-    local n used resets state pct best="" best_pct=101 target_pct=""
+    local n used resets state pct best="" best_pct=101 target_pct="" unusable=0
     local kind acct plan age
-    while IFS=$'\037' read -r n kind acct plan used resets state age; do
-        pct="${used%\~}"; pct="${pct%\%}"
-        case "$pct" in ''|*[!0-9]*) pct="" ;; esac
+    while IFS=$'\037' read -r n kind acct plan used resets state age _; do
+        pct="$(pct_of "$used" || true)"
         if [ "$n" = "$target" ]; then
             target_pct="$pct"
             case "$state" in
@@ -1087,19 +1223,32 @@ report_quota() {
                     printf "%s  Run 'cdx add %s' to sign in again.%s\n" "$C_YELLOW" "$n" "$C_RESET"
                     return 0
                     ;;
+                # Landing here is exactly when this has to be said: every
+                # rate-limit field reports fine, so the percentage on the next
+                # line would otherwise read as permission to work.
+                spendlimit)
+                    printf "%s  '%s' is over its spend limit and cannot run — the%s\n" "$C_RED" "$n" "$C_RESET"
+                    printf "%s  usage below is its rate limit, which is not what stopped it.%s\n" "$C_RED" "$C_RESET"
+                    unusable=1
+                    ;;
             esac
             [ -z "$used" ] || printf '  quota: %s used, resets %s\n' "$used" "$resets"
-        elif [ -n "$pct" ] && [ "$state" != relogin ] && [ "$pct" -lt "$best_pct" ]; then
+        # An account that cannot run is not a place to send anyone, however low
+        # its percentage reads — and it reads low *because* it cannot run.
+        elif [ -n "$pct" ] && [ "$state" = ok ] && [ "$pct" -lt "$best_pct" ]; then
             best="$n"; best_pct="$pct"
         fi
     done < <(CDX_USAGE=off profile_rows 0 "$@")
-    [ -n "$target_pct" ] || return 0
-    [ "$target_pct" -ge "$QUOTA_WARN_PERCENT" ] || return 0
-    printf '%s  %s is nearly out of quota (%s%% used).%s\n' "$C_YELLOW" "$target" "$target_pct" "$C_RESET"
-    if [ -n "$best" ] && [ "$best_pct" -lt "$target_pct" ]; then
-        printf "%s  '%s' has the most room (%s%% used) — 'cdx use %s'.%s\n" \
-            "$C_YELLOW" "$best" "$best_pct" "$best" "$C_RESET"
+    if [ "$unusable" = 0 ]; then
+        [ -n "$target_pct" ] || return 0
+        [ "$target_pct" -ge "$QUOTA_WARN_PERCENT" ] || return 0
+        printf '%s  %s is nearly out of quota (%s%% used).%s\n' "$C_YELLOW" "$target" "$target_pct" "$C_RESET"
+        # Only worth naming an alternative that is actually better.
+        [ -n "$best" ] && [ "$best_pct" -lt "$target_pct" ] || return 0
     fi
+    [ -n "$best" ] || return 0
+    printf "%s  '%s' has the most room (%s%% used) — 'cdx use %s'.%s\n" \
+        "$C_YELLOW" "$best" "$best_pct" "$best" "$C_RESET"
 }
 
 # Activate an account for every client on this machine at once.
