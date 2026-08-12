@@ -437,6 +437,53 @@ def _claims(token: str) -> dict:
         return {}
 
 
+def parse_usage(body: dict) -> dict:
+    """The endpoint's response, reduced to what cdx stores and shows.
+
+    Pure: no clock beyond the stamp, no network, no filesystem. This is the
+    layer that decides whether an account can run at all, and every mistake
+    made about that this month was made here — reading has_credits as
+    exhaustion, reporting whichever window happened to be 'primary', missing
+    spend_control entirely. Being callable with a dict literal is the point.
+    """
+    limits = body.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = limits.get(key) or {}
+        if w.get("used_percent") is not None:
+            windows.append({"used": w["used_percent"], "reset_at": w.get("reset_at"),
+                            "seconds": w.get("limit_window_seconds")})
+    # 'primary' is not a fixed window: on some plans it is the weekly quota, on
+    # others the 5-hour one with the week in 'secondary'. Report whichever sits
+    # closest to its limit — that is the one that stops you — and keep the rest.
+    head = max(windows, key=lambda w: w["used"]) if windows else {}
+    # A percentage measures rate limiting — how fast a rolling window is being
+    # spent. It says nothing about a credit balance, which is what a
+    # credit-based plan runs out of, and the two disagree by construction: an
+    # account with nothing left sits at a LOW percentage precisely because it
+    # cannot spend. So the balance is captured whole, and kept.
+    #
+    # What it is NOT used for is a verdict. 'has_credits: false' reads like
+    # 'spent' and actually means 'this account does not use credits at all' —
+    # it is what the subscriptions report.
+    credits = limits.get("credits") or body.get("credits") or {}
+    # The third axis, and the only one that catches an admin-set budget. An
+    # account over its monthly credit allowance reports allowed=true,
+    # limit_reached=false and a low percentage — every rate-limit field says
+    # 'fine' — while refusing to run. spend_control.reached is the one field
+    # that says so, and individual_limit stays null when the budget is set on
+    # the organisation rather than the user.
+    spend = body.get("spend_control") or {}
+    return {"fetched_at": time.time(), "used": head.get("used"),
+            "reset_at": head.get("reset_at"), "window": head.get("seconds"),
+            "windows": windows, "plan": body.get("plan_type"),
+            "email": body.get("email"),
+            "credits": credits or None, "spend_control": spend or None,
+            "state": "spendlimit" if spend.get("reached") else
+                     "blocked" if limits.get("limit_reached")
+                                  or limits.get("allowed") is False else "ok"}
+
+
 def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     """Cached inside the profile, not the store: it is per-account by definition."""
     mode = os.environ.get("CDX_USAGE", "cache")
@@ -476,39 +523,7 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     # take the window closest to its limit — that is the one that stops you —
     # and label it, since 16% of a week and 16% of five hours are not the same
     # news. The others are kept so nothing is lost.
-    limits = body.get("rate_limit") or {}
-    windows = []
-    for key in ("primary_window", "secondary_window"):
-        w = limits.get(key) or {}
-        if w.get("used_percent") is not None:
-            windows.append({"used": w["used_percent"], "reset_at": w.get("reset_at"),
-                            "seconds": w.get("limit_window_seconds")})
-    head = max(windows, key=lambda w: w["used"]) if windows else {}
-    # A percentage measures rate limiting — how fast a rolling window is being
-    # spent. It says nothing about a credit balance, which is what a
-    # credit-based plan runs out of, and the two disagree by construction: an
-    # account with nothing left sits at a LOW percentage precisely because it
-    # cannot spend. So the balance is captured whole, and kept.
-    #
-    # What it is NOT used for is a verdict. 'has_credits: false' reads like
-    # 'spent' and actually means 'this account does not use credits at all' —
-    # it is what the subscriptions report.
-    credits = limits.get("credits") or body.get("credits") or {}
-    # The third axis, and the only one that catches an admin-set budget. An
-    # account over its monthly credit allowance reports allowed=true,
-    # limit_reached=false and a low percentage — every rate-limit field says
-    # 'fine' — while refusing to run. spend_control.reached is the one field
-    # that says so, and individual_limit stays null when the budget is set on
-    # the organisation rather than the user.
-    spend = body.get("spend_control") or {}
-    rec = {"fetched_at": time.time(), "used": head.get("used"),
-           "reset_at": head.get("reset_at"), "window": head.get("seconds"),
-           "windows": windows, "plan": body.get("plan_type"),
-           "email": body.get("email"),
-           "credits": credits or None, "spend_control": spend or None,
-           "state": "spendlimit" if spend.get("reached") else
-                    "blocked" if limits.get("limit_reached")
-                                 or limits.get("allowed") is False else "ok"}
+    rec = parse_usage(body)
     try:
         tmp = cache.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(rec))
