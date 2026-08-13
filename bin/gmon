@@ -305,7 +305,6 @@ def render(results, live=True):
         lines.append(cb("green", f"  {n_free} GPU{'s' if n_free != 1 else ''} free") + c("subtext0", f"  ({detail})"))
     else:
         lines.append(c("overlay1", "  no free GPUs"))
-    lines.append("")
 
     # host/gpu/users size to the widest value present (floored at the header label)
     host_w = max([len("HOST")] + [len(h) for h, _, _, _ in results])
@@ -323,13 +322,14 @@ def render(results, live=True):
         f"{'MEMORY (MiB)':^{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  {'FAN%':>{col_w['fan']}}  "
         f"{'USERS':<{col_w['users']}}"
     )
-    rule = "  " + "─" * (len(header) - 2)
+    # No rule under the header: the header is already dimmed away from the
+    # data, and a full-width line costs a row to repeat that.
     lines.append(c("subtext0", header))
-    lines.append(c("surface2", rule))
 
     for i, (host, gpus, err, age) in enumerate(srt):
-        if i:
-            lines.append("")  # blank line between servers
+        # Hosts are not separated by a blank line. The hostname printing only
+        # on a group's first row already marks where each starts, and the
+        # accent colour rotates per host — two cues for the price of no rows.
         accent = ACCENTS[i % len(ACCENTS)]  # rotate hostname color per server
         host_cell = cb(accent, f"{host:<{col_w['host']}}")  # blanked after first row
 
@@ -390,7 +390,6 @@ def render(results, live=True):
             why = f" ({err})" if err else ""
             lines.append("  " + " " * col_w["host"] + "  " + c("overlay1", f"⚠ stale {int(age)}s{why}"))
 
-    lines.append("")
     # Clear-to-EOL on every line so shorter rows don't leave stale chars behind
     return "".join(f"{line}\033[K\n" for line in lines)
 

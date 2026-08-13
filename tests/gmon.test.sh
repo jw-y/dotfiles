@@ -121,6 +121,12 @@ echo "${DIM}table${OFF}"
 printf 'alpha\n' > "$CONFIG"
 out="$(gmon --once)"
 it "renders the header";             assert_contains "$out" "MEMORY (MiB)"
+# Five hosts of four GPUs was 31 lines for 21 of data — a third of a short
+# terminal spent on separators. The grouping survives on the hostname column
+# and the per-host accent colour, so the rows themselves carry it.
+it "spends no line on a rule";       assert_eq "$(printf %s "$out" | grep -c '───')" "0"
+it "no blank lines between hosts";   assert_eq "$(printf %s "$out" | grep -c '^[[:space:]]*$')" "0"
+it "chrome is three lines";          assert_eq "$(printf %s "$out" | grep -cE 'GPU Monitor|GPUs? free|no free GPUs|HOST +GPU')" "3"
 # 'contains H200' would pass on the undropped name too, so assert the absence.
 it "drops the NVIDIA name prefix";   assert_missing "$out" "NVIDIA H200"
 it "shows utilisation";              assert_contains "$out" "97%"
