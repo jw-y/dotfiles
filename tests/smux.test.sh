@@ -42,6 +42,11 @@ __SMUX_GRES_MAP__
 __SMUX_JOBS__
 42|gpu|smoke|RUNNING|0:12|1:47:48|2026-08-13T00:15:43|node1
 EOF
+elif [[ "$cmd" == "sh -c 'command -v sbatch'" ]]; then
+    # smux checks for a controller before uploading anything. A host with GPUs
+    # and no Slurm is a real configuration among these clusters.
+    [ -n "${SMUX_FAKE_NO_SLURM:-}" ] && exit 1
+    echo /usr/bin/sbatch
 elif [[ "$cmd" == *"__SMUX_UPLOAD__"* ]]; then
     # The real upload script writes the file, re-hashes it and dies if the
     # digest differs; these two knobs stand in for those failures.
@@ -232,5 +237,29 @@ grep -q 'could not hash remote script' <<<"$gone_out" \
 grep -q 'sbatch --parsable /shared/jobs/gone.sbatch' "$SMUX_FAKE_LOG" \
     && fail 'submitted a remote script it could not verify'
 pass 'an unverifiable remote path is refused'
+
+# A machine with GPUs but no scheduler is a real configuration — one of these
+# clusters is exactly that. Submitting there used to reach sbatch through two
+# layers of ssh and come back as 'command not found'.
+before_uploads="$(grep -c '__SMUX_UPLOAD__' "$SMUX_FAKE_LOG")"
+noslurm_out="$(SMUX_FAKE_NO_SLURM=1 "$SMUX" submit alpha jobs/smoke.sbatch 2>&1 || true)"
+grep -q 'has no Slurm controller' <<<"$noslurm_out" \
+    || fail "scheduler-less host not named: $noslurm_out"
+[ "$(grep -c '__SMUX_UPLOAD__' "$SMUX_FAKE_LOG")" = "$before_uploads" ] \
+    || fail 'uploaded to a host that cannot submit'
+pass 'a host without Slurm is refused before upload'
+
+# The table says what every GPU is doing; the summary says where to go. Both
+# configured hosts answer with the same canned pair, so index 0 is free on
+# each and index 1 is busy on each.
+gpus_summary="$($SMUX gpus)"
+grep -q '2 GPUs free  (alpha:0  beta:0)' <<<"$gpus_summary" \
+    || fail "free summary: $(tail -1 <<<"$gpus_summary")"
+grep -q 'alpha:0,1' <<<"$gpus_summary" && fail 'busy GPU counted as free'
+pass 'the free summary names host and index'
+
+single="$($SMUX gpus alpha)"
+grep -q '1 GPU free  (alpha:0)' <<<"$single" || fail "singular: $(tail -1 <<<"$single")"
+pass 'one free GPU is not "1 GPUs"'
 
 echo 'all smux tests passed'

@@ -100,6 +100,13 @@ time. `smux logs` discovers the job's `StdOut` path through `scontrol`, so no
 cluster-specific log directory is assumed. `smux cleanup` is restricted to the
 managed upload directory and is a dry run unless `--apply` is supplied.
 
+`smux gpus` ends with a one-line summary — `4 GPUs free  (pado:0  byul:1,2,3)`
+— because the table says what every GPU is doing and that line says where to
+go. Connections are reused between commands (`ControlPersist`), so a `status`
+followed by a `gpus` across five clusters costs one round of handshakes rather
+than two. `smux submit` refuses a host with no `sbatch` before uploading
+anything, since a machine can have GPUs and no scheduler.
+
 `smux gpus` joins `nvidia-smi` occupancy with Slurm's `gres.conf` mapping. An
 idle physical GPU can therefore still be identified as a restricted type such
 as `debug`; submit it through the matching Slurm partition/GRES rather than

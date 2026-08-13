@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -117,10 +118,30 @@ def select_hosts(requested: list[str]) -> list[str]:
 
 
 def ssh_options() -> list[str]:
+    # One connection per host, reused: the first command opens a master socket
+    # and later ones — including a second smux invocation within
+    # ControlPersist — skip the TCP and auth handshake entirely. 'status'
+    # followed by 'gpus' across five clusters is ten handshakes without it.
+    #
+    # The socket path has to stay under the ~104-byte sun_path limit, and
+    # macOS's $TMPDIR plus the 40-char %C hash overflows it, so anchor
+    # somewhere short and per-user rather than in the system temp dir.
+    control_base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+    control_dir = os.path.join(control_base, f"smux-ssh-{os.getuid()}")
+    try:
+        os.makedirs(control_dir, mode=0o700, exist_ok=True)
+        control = ["-o", "ControlMaster=auto",
+                   "-o", f"ControlPath={control_dir}/%C",
+                   "-o", "ControlPersist=30s"]
+    except OSError:
+        # A read-only or otherwise unusable /tmp is not worth failing over;
+        # every command still works, just without the shared connection.
+        control = []
     return [
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={SSH_TIMEOUT}",
         "-o", "ServerAliveInterval=30",
+        *control,
     ]
 
 
@@ -384,12 +405,32 @@ def command_gpus(args: argparse.Namespace) -> int:
             ])
     if rows:
         print_table(["HOST", "GPU", "SLURM TYPE", "MEMORY", "UTIL", "IDLE", "MODEL"], rows)
+        print(free_summary(statuses))
     else:
         print("no GPUs found")
     for status in statuses:
         if status.error:
             print(f"smux: {status.host}: {status.error}", file=sys.stderr)
     return int(any(status.error for status in statuses))
+
+
+def free_summary(statuses: list[ClusterStatus]) -> str:
+    """One line answering the question the table is read for.
+
+    The table says what every GPU is doing; this says where to go. Grouped by
+    host and ordered as the hosts were, so the answer reads as an address —
+    'byul:0,1' is something you can act on without counting rows.
+    """
+    free: dict[str, list[str]] = {}
+    for status in statuses:
+        for gpu in status.gpus:
+            if _gpu_is_idle(gpu):
+                free.setdefault(status.host, []).append(gpu["index"])
+    total = sum(len(indexes) for indexes in free.values())
+    if not total:
+        return "no GPUs free"
+    detail = "  ".join(f"{host}:{','.join(indexes)}" for host, indexes in free.items())
+    return f"{total} GPU{'s' if total != 1 else ''} free  ({detail})"
 
 
 def _gpu_is_idle(gpu: dict[str, str]) -> bool:
@@ -530,8 +571,25 @@ def remote_script_sha256(host: str, script: str) -> str:
     return digest.lower()
 
 
+def has_scheduler(host: str) -> bool:
+    """Whether sbatch exists on the far side.
+
+    One cheap command rather than a full probe, and it shares the connection
+    the submit is about to use anyway.
+    """
+    result = run_command(host, ["sh", "-c", "command -v sbatch"], timeout=SSH_TIMEOUT)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def command_submit(args: argparse.Namespace) -> int:
     ensure_host(args.host)
+    try:
+        # Checked before the upload: a host with no controller cannot run the
+        # script, so there is no reason to copy it there first.
+        if not has_scheduler(args.host):
+            die(f"{args.host} has no Slurm controller (sbatch is not on its PATH)")
+    except SmuxError as exc:
+        die(str(exc))
     try:
         if args.remote:
             submitted_script = args.script
