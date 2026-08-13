@@ -12,6 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The whitespace check below diffs HEAD against its parent. The
+          # default shallow clone has no parent, so '--root' made it diff
+          # against nothing and report every pre-existing space in the repo as
+          # newly added. Two commits is all it needs.
+          fetch-depth: 2
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       # 'bash -n a b c' parses only 'a' — b and c become its positional
