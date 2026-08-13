@@ -126,7 +126,34 @@ it "renders the header";             assert_contains "$out" "MEMORY (MiB)"
 # and the per-host accent colour, so the rows themselves carry it.
 it "spends no line on a rule";       assert_eq "$(printf %s "$out" | grep -c '───')" "0"
 it "no blank lines between hosts";   assert_eq "$(printf %s "$out" | grep -c '^[[:space:]]*$')" "0"
-it "chrome is three lines";          assert_eq "$(printf %s "$out" | grep -cE 'GPU Monitor|GPUs? free|no free GPUs|HOST +GPU')" "3"
+it "chrome is two lines";            assert_eq "$(printf %s "$out" | grep -cE 'GPU Monitor|GPUs? free|no free GPUs|HOST +GPU')" "2"
+# The clock and the free list share a line when they fit, and split when they
+# do not — two header rows for one sentence is a lot on a short terminal, but
+# a wrapped line is worse than two clean ones.
+it "wide terminals get one line";    assert_eq "$(COLUMNS=200 gmon --once | grep -c 'GPU Monitor')" "0"
+# One host with two GPUs still fits in 40 columns here, so the split has to be
+# forced with a width no real terminal would have.
+it "narrow ones split it";           assert_eq "$(COLUMNS=20 gmon --once | grep -c 'GPU Monitor')" "1"
+it "and the clock survives either";  assert_eq "$(COLUMNS=20 gmon --once | grep -cE '[0-9]{2}:[0-9]{2}:[0-9]{2}')" "1"
+# The live frame must not end in a newline: the cursor would sit on the row
+# below the table, and with it hidden that reads as a bottom margin. One-shot
+# output keeps it, or the shell prompt resumes on top of the last row. Checked
+# against render() directly, since only a terminal shows the difference.
+frame_check() {
+    python3 - "$GMON" <<'PYEOF'
+import importlib.machinery, importlib.util, sys
+spec = importlib.util.spec_from_loader(
+    "gmon", importlib.machinery.SourceFileLoader("gmon", sys.argv[1]))
+gmon = importlib.util.module_from_spec(spec)
+sys.modules["gmon"] = gmon
+spec.loader.exec_module(gmon)
+rows = [("alpha", [{"name": "A100", "idx": "0", "util": 0, "mem_used": 0,
+                    "mem_total": 81920, "temp": 40, "fan": 30, "users": []}], None, None)]
+print("live-newline" if gmon.render(rows, live=True).endswith("\n") else "live-clean",
+      "once-newline" if gmon.render(rows, live=False).endswith("\n") else "once-clean")
+PYEOF
+}
+it "the live frame has no bottom row"; assert_eq "$(frame_check)" "live-clean once-newline"
 # 'contains H200' would pass on the undropped name too, so assert the absence.
 it "drops the NVIDIA name prefix";   assert_missing "$out" "NVIDIA H200"
 it "shows utilisation";              assert_contains "$out" "97%"
@@ -146,6 +173,21 @@ it "an unused GPU reads idle";       assert_contains "$out" "idle"
 # 12 MiB used, so it is grabbable; index 1 is not.
 it "counts the free GPU";            assert_contains "$out" "1 GPU free"
 it "names host and index";           assert_contains "$out" "alpha:0"
+# Consecutive cards collapse to a range: an idle four-GPU host is the common
+# case, and spelling every index out is what pushes the list onto its own line.
+ranges() {
+    python3 - "$GMON" <<'PYEOF'
+import importlib.machinery, importlib.util, sys
+spec = importlib.util.spec_from_loader(
+    "gmon", importlib.machinery.SourceFileLoader("gmon", sys.argv[1]))
+gmon = importlib.util.module_from_spec(spec)
+sys.modules["gmon"] = gmon
+spec.loader.exec_module(gmon)
+print(*(gmon.compress_indices(c) for c in
+        (["0", "1", "2", "3"], ["0", "2", "3"], ["1"], ["0", "2", "4"], [])))
+PYEOF
+}
+it "runs of cards become ranges";    assert_eq "$(ranges)" "0-3 0,2-3 1 0,2,4 "
 it "a busy GPU is not free";         assert_missing "$out" "alpha:0,1"
 # --free-mem is the knob for a card that idles with a few hundred MiB resident.
 it "--free-mem can exclude it";      assert_contains "$(gmon --once --free-mem 8)" "no free GPUs"

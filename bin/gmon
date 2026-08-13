@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -281,6 +282,30 @@ def is_free(gpu):
     return not gpu["users"] and (gpu["mem_used"] or 0) < FREE_MEM_MIB
 
 
+def compress_indices(indexes):
+    """['0','1','2','3'] -> '0-3'; ['0','2','3'] -> '0,2-3'.
+
+    A run of consecutive cards is the common case on an idle host, and
+    spelling every index out is what pushes the free list onto its own line.
+    Anything non-numeric is passed through untouched rather than guessed at.
+    """
+    try:
+        numbers = sorted(int(i) for i in indexes)
+    except (TypeError, ValueError):
+        return ",".join(indexes)
+    parts, start, previous = [], None, None
+    for number in numbers + [None]:
+        if start is None:
+            start = previous = number
+            continue
+        if number is not None and number == previous + 1:
+            previous = number
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    return ",".join(parts)
+
+
 def render(results, live=True):
     """Render a frame. `results` is a list of (host, gpus, err, age_seconds).
 
@@ -289,8 +314,6 @@ def render(results, live=True):
     """
     now = datetime.now().strftime("%H:%M:%S")
     lines = []
-    hint = f"  (refresh every {REFRESH_SECONDS:g}s)  Ctrl-C to quit" if live else ""
-    lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}{hint}"))
 
     srt = sorted(results, key=lambda r: r[0])
 
@@ -300,11 +323,26 @@ def render(results, live=True):
             if is_free(gpu):
                 free.setdefault(host, []).append(gpu["idx"])
     n_free = sum(len(v) for v in free.values())
+
+    # Title and free list on one line when they fit, since two header rows for
+    # one sentence is a lot on a short terminal. The indices collapse to ranges
+    # first — 'baram:0-3' rather than 'baram:0,1,2,3' — which is what usually
+    # makes the difference between fitting and not.
+    hint = f"  {REFRESH_SECONDS:g}s  ^C" if live else ""
     if n_free:
-        detail = ", ".join(f"{h}:{','.join(idxs)}" for h, idxs in free.items())
-        lines.append(cb("green", f"  {n_free} GPU{'s' if n_free != 1 else ''} free") + c("subtext0", f"  ({detail})"))
+        detail = "  ".join(f"{h}:{compress_indices(i)}" for h, i in free.items())
+        summary = f"{n_free} GPU{'s' if n_free != 1 else ''} free"
     else:
-        lines.append(c("overlay1", "  no free GPUs"))
+        detail, summary = "", "no free GPUs"
+    width = shutil.get_terminal_size((100, 24)).columns
+    one_line = len(f"  {now}  {summary}  {detail}{hint}") <= width
+    if one_line:
+        lines.append(c("overlay1", f"  {now}  ") + cb("green" if n_free else "overlay1", summary)
+                     + c("subtext0", f"  {detail}") + c("overlay0", hint))
+    else:
+        lines.append(cb("mauve", "  GPU Monitor") + c("overlay1", f"  {now}{hint}"))
+        lines.append(cb("green" if n_free else "overlay1", f"  {summary}")
+                     + c("subtext0", f"  {detail}"))
 
     # host/gpu/users size to the widest value present (floored at the header label)
     host_w = max([len("HOST")] + [len(h) for h, _, _, _ in results])
@@ -391,7 +429,13 @@ def render(results, live=True):
             lines.append("  " + " " * col_w["host"] + "  " + c("overlay1", f"⚠ stale {int(age)}s{why}"))
 
     # Clear-to-EOL on every line so shorter rows don't leave stale chars behind
-    return "".join(f"{line}\033[K\n" for line in lines)
+    frame = "".join(f"{line}\033[K\n" for line in lines)
+    # In the live view the trailing newline is a visible blank row: the cursor
+    # ends up below the table, and with it hidden that reads as a bottom
+    # margin the frame never asked for. Erase-below then starts at the end of
+    # the last row instead. One-shot output keeps the newline, or a shell
+    # prompt would resume on top of the final line.
+    return frame[:-1] if live else frame
 
 
 def clear():
