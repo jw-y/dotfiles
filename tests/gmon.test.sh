@@ -44,6 +44,11 @@ cat > "$BIN/nvidia-smi" <<'STUB'
 case "$*" in
     *--query-gpu=*)
         if [ -n "${GMON_FAKE_NO_GPUS:-}" ]; then exit 0; fi
+        if [ -n "${GMON_FAKE_NO_FAN:-}" ]; then
+            echo 'NVIDIA H200, GPU-aaaa, 0, 0, 12, 143771, 31, [N/A]'
+            echo 'NVIDIA H200, GPU-bbbb, 1, 97, 120000, 143771, 84, [N/A]'
+            exit 0
+        fi
         echo 'NVIDIA H200, GPU-aaaa, 0, 0, 12, 143771, 31, [N/A]'
         echo 'NVIDIA H200, GPU-bbbb, 1, 97, 120000, 143771, 84, 61'
         ;;
@@ -167,6 +172,22 @@ it "shows temperature";              assert_contains "$out" "84°C"
 # dash rather than crashing the int conversion or printing 'None'.
 it "renders an absent fan reading";  assert_contains "$out" "—"
 it "never prints a bare None";       assert_missing "$out" "None"
+
+# Datacentre cards report no fan, so on a fleet of them the column is five
+# characters of '—' per row. It appears only when something on screen has a
+# reading — here one card does.
+it "fan shows when one card has it"; assert_contains "$out" "FAN%"
+nofan="$(GMON_FAKE_NO_FAN=1 gmon --once)"
+it "and vanishes when none do";      assert_missing "$nofan" "FAN%"
+it "taking its dashes with it";      assert_missing "$nofan" "—"
+it "while the rest still renders";   assert_contains "$nofan" "120000/143771"
+
+# Utilisation and memory do not change colour with their value: a GPU at 97%
+# is working, not in trouble, and a number that shifts hue as it climbs reads
+# as an alarm. Temperature keeps its colouring, because that one is a warning.
+raw="$("$GMON" --once 2>&1)"
+it "a loaded GPU is not highlighted"; assert_eq "$(printf %s "$raw" | grep -c $'\033\[38;2;245;224;220m')" "0"
+it "but a hot one still is";          assert_eq "$(printf %s "$raw" | grep -cE $'\033\[38;2;(250;179;135|243;139;168)m')" "1"
 
 # Compute processes are correlated to their GPU by UUID, then to a username by
 # pid. Both users of the busy card must appear, and only on that card's row.

@@ -212,17 +212,6 @@ def _int(val):
         return None  # handles [N/A], empty, etc.
 
 
-def util_color(val):
-    # Two tiers: neutral subtext for normal load (blends into the table's
-    # gray family), rosewater once a GPU is clearly loaded — soft pink as
-    # a gentle highlight rather than an alarm.
-    if val is None:
-        return "overlay1"
-    if val < 70:
-        return "subtext0"
-    return "rosewater"
-
-
 def temp_color(val):
     # Normal temps recede (dim); only genuinely hot cards get warm/red
     if val is None:
@@ -266,15 +255,13 @@ def _bar(ratio, color, width, dim):
 def mem_bar(used, total, width=10, dim=False):
     if used is None or total is None or total == 0:
         return _bar(None, "", width, dim)
-    ratio = used / total
-    color = "subtext0" if ratio < 0.85 else "rosewater"
-    return _bar(ratio, color, width, dim)
+    return _bar(used / total, "subtext0", width, dim)
 
 
 def util_bar(util, width=10, dim=False):
     if util is None:
         return _bar(None, "", width, dim)
-    return _bar(util / 100, util_color(util), width, dim)
+    return _bar(util / 100, "subtext0", width, dim)
 
 
 def is_free(gpu):
@@ -353,12 +340,19 @@ def render(results, live=True):
     ])
     # util cell = 10-wide bar + space + 6-wide " 100%"  (each block = 10%, matches mem)
     # mem cell  = 10-wide bar + space + 13-wide "used/total" (fits H200's 143771/143771)
+    # Datacentre cards report no fan at all, so on a fleet of them the column
+    # is five characters of '—' on every row. Shown only when something on
+    # screen actually has a reading — the same rule the other conditional
+    # columns here follow.
+    show_fan = any(g["fan"] is not None
+                   for _, gpus, _, _ in results if gpus for g in gpus)
     col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 17, "mem": 24, "temp": 6, "fan": 5, "users": users_w}
     header = (
         f"  {'HOST':<{col_w['host']}}  {'GPU':<{col_w['gpu']}}  "
         f"{'#':>{col_w['idx']}}  {'UTIL%':^{col_w['util']}}  "
-        f"{'MEMORY (MiB)':^{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  {'FAN%':>{col_w['fan']}}  "
-        f"{'USERS':<{col_w['users']}}"
+        f"{'MEMORY (MiB)':^{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  "
+        + (f"{'FAN%':>{col_w['fan']}}  " if show_fan else "")
+        + f"{'USERS':<{col_w['users']}}"
     )
     # No rule under the header: the header is already dimmed away from the
     # data, and a full-width line costs a row to repeat that.
@@ -402,7 +396,7 @@ def render(results, live=True):
 
             name_cell  = c(dim("subtext0"), f"{gpu['name']:<{col_w['gpu']}}")
             idx_cell   = c(dim("overlay1"), f"{gpu['idx']:>{col_w['idx']}}")
-            util_text  = (c(dim(util_color(util)), f"{util:>5}%") if util is not None
+            util_text  = (c(dim("subtext0"), f"{util:>5}%") if util is not None
                           else c(dim("overlay1"), "    ?%"))
             mem_cell   = c(dim("subtext1"), f"{mem_str:>13}")
             temp_cell  = (c(dim(temp_color(temp)), f"{temp:>4}°C") if temp is not None
@@ -421,8 +415,8 @@ def render(results, live=True):
                 f"{ubar} {util_text}  "
                 f"{mbar} {mem_cell}  "
                 f"{temp_cell}  "
-                f"{fan_cell}  "
-                f"{users_cell}"
+                + (f"{fan_cell}  " if show_fan else "")
+                + f"{users_cell}"
             )
             lines.append(line)
             host_cell = " " * col_w["host"]  # only show hostname on first GPU row
