@@ -365,9 +365,12 @@ def render(results, live=True):
     lines.append(c("subtext0", header))
 
     for i, (host, gpus, err, age) in enumerate(srt):
-        # Hosts are not separated by a blank line. The hostname printing only
-        # on a group's first row already marks where each starts, and the
-        # accent colour rotates per host — two cues for the price of no rows.
+        # A blank row between hosts. The hostname column and the rotating
+        # accent already mark where a group starts, so this is not needed to
+        # parse the table — it is needed to read it, and four rows across five
+        # clusters is a cheaper way to buy that than anything else here.
+        if i:
+            lines.append("")
         accent = ACCENTS[i % len(ACCENTS)]  # rotate hostname color per server
         host_cell = cb(accent, f"{host:<{col_w['host']}}")  # blanked after first row
 

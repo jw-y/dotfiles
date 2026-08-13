@@ -125,7 +125,11 @@ it "renders the header";             assert_contains "$out" "MEMORY (MiB)"
 # terminal spent on separators. The grouping survives on the hostname column
 # and the per-host accent colour, so the rows themselves carry it.
 it "spends no line on a rule";       assert_eq "$(printf %s "$out" | grep -c '───')" "0"
-it "no blank lines between hosts";   assert_eq "$(printf %s "$out" | grep -c '^[[:space:]]*$')" "0"
+# One blank row between hosts and nowhere else: not needed to parse the table,
+# but wanted to read it. With one host in this sandbox there is nothing to
+# separate, so the count is zero here and one for a second host.
+it "a single host needs no spacer";  assert_eq "$(printf %s "$out" | grep -c '^[[:space:]]*$')" "0"
+it "two hosts get one between them"; assert_eq "$(printf 'alpha\nbeta\n' > "$CONFIG"; gmon --once | grep -c '^[[:space:]]*$'; printf 'alpha\n' > "$CONFIG")" "1"
 it "chrome is two lines";            assert_eq "$(printf %s "$out" | grep -cE 'GPU Monitor|GPUs? free|no free GPUs|HOST +GPU')" "2"
 # The clock and the free list share a line when they fit, and split when they
 # do not — two header rows for one sentence is a lot on a short terminal, but
