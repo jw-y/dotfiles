@@ -75,8 +75,13 @@ smux edit                         # add one SSH alias per line
 smux status                       # Slurm version, partitions, and job counts
 smux gpus                         # GPU occupancy plus Slurm GRES type by index
 smux jobs                         # aggregate your jobs across configured hosts
-smux submit gpu-a job.sbatch      # prints a globally useful gpu-a:1234 handle
+smux submit gpu-a job.sbatch      # uploads local script, then prints gpu-a:1234
 smux show gpu-a 1234
+smux logs gpu-a 1234              # tail Slurm stdout
+smux logs gpu-a 1234 --follow
+smux cancel gpu-a 1234            # explicit job ID required
+smux cleanup gpu-a                # dry-run stale uploaded-script cleanup
+smux cleanup gpu-a --apply
 smux wait gpu-a 1234
 ```
 
@@ -84,8 +89,16 @@ Use the reserved alias `local` for the current machine. A private host file
 might contain `local`, `gpu-a`, and `gpu-b`, one per line; these are names from
 your own `~/.ssh/config`. Submission records live in
 `~/.local/state/smux/jobs.jsonl`. Override those paths with `SMUX_HOSTS` and
-`SMUX_STATE` when needed. `smux` does not copy code, credentials, or data, and
-it never stores SSH keys.
+`SMUX_STATE` when needed. `smux submit` copies only the selected local Slurm
+script to `~/.local/state/smux/scripts/` on the target, verifies its SHA-256,
+and submits that immutable content-addressed copy. Use `--remote` only
+when the script is deliberately pre-positioned. `smux` does not copy project
+code, credentials, or data, and it never stores SSH keys.
+
+`smux jobs` includes elapsed time, remaining time, and Slurm's expected end
+time. `smux logs` discovers the job's `StdOut` path through `scontrol`, so no
+cluster-specific log directory is assumed. `smux cleanup` is restricted to the
+managed upload directory and is a dry run unless `--apply` is supplied.
 
 `smux gpus` joins `nvidia-smi` occupancy with Slurm's `gres.conf` mapping. An
 idle physical GPU can therefore still be identified as a restricted type such

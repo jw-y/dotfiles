@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -16,7 +18,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 
 CONFIG_FILE = Path(os.environ.get("SMUX_HOSTS", "~/.config/smux/hosts")).expanduser()
 STATE_FILE = Path(os.environ.get("SMUX_STATE", "~/.local/state/smux/jobs.jsonl")).expanduser()
@@ -60,7 +61,7 @@ for gres_file in /etc/slurm/gres.conf /etc/slurm-llnl/gres.conf; do
 done
 printf '__SMUX_JOBS__\n'
 if command -v squeue >/dev/null 2>&1; then
-    squeue -h -u "$(id -un)" -o '%i|%P|%j|%T|%M|%R' 2>/dev/null || true
+    squeue -h -u "$(id -un)" -o '%i|%P|%j|%T|%M|%L|%e|%R' 2>/dev/null || true
 fi
 '''
 
@@ -123,7 +124,12 @@ def ssh_options() -> list[str]:
     ]
 
 
-def run_shell(host: str, script: str, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+def run_shell(
+    host: str,
+    script: str,
+    *,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     if host == "local":
         command = ["sh", "-lc", script]
     else:
@@ -229,7 +235,19 @@ def probe_host(host: str) -> ClusterStatus:
         for line in sections["gres_map"]
     ]
     jobs = [
-        split_fields(line, ["job_id", "partition", "name", "state", "elapsed", "reason"])
+        split_fields(
+            line,
+            [
+                "job_id",
+                "partition",
+                "name",
+                "state",
+                "elapsed",
+                "time_left",
+                "end_time",
+                "reason",
+            ],
+        )
         for line in sections["jobs"]
     ]
     return ClusterStatus(host, scheduler, partitions, gpus, gres_map, jobs)
@@ -392,12 +410,35 @@ def command_jobs(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return int(any(status.error for status in statuses))
     rows = [
-        [status.host, job["job_id"], job["partition"], job["state"], job["elapsed"], job["name"], job["reason"]]
+        [
+            status.host,
+            job["job_id"],
+            job["partition"],
+            job["state"],
+            job["elapsed"],
+            job["time_left"],
+            job["end_time"],
+            job["name"],
+            job["reason"],
+        ]
         for status in statuses
         for job in status.jobs
     ]
     if rows:
-        print_table(["HOST", "JOB", "PARTITION", "STATE", "ELAPSED", "NAME", "REASON"], rows)
+        print_table(
+            [
+                "HOST",
+                "JOB",
+                "PARTITION",
+                "STATE",
+                "ELAPSED",
+                "LEFT",
+                "END",
+                "NAME",
+                "REASON",
+            ],
+            rows,
+        )
     else:
         print("no jobs")
     for status in statuses:
@@ -418,10 +459,92 @@ def append_state(payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_script(host: str, script: str) -> tuple[str, str]:
+    """Upload one local Slurm script and return its verified remote path."""
+    source = Path(script).expanduser().resolve()
+    if not source.is_file():
+        die(f"local script not found: {source}")
+    digest = file_sha256(source)
+    if host == "local":
+        return str(source), digest
+
+    payload = source.read_bytes()
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", source.name).strip(".-") or "job.sbatch"
+    remote_name = f"{digest[:16]}-{safe_name}"
+    upload = f'''# __SMUX_UPLOAD__
+set -eu
+directory="$HOME/.local/state/smux/scripts"
+target="$directory/{remote_name}"
+temporary="$target.tmp.$$"
+umask 077
+mkdir -p "$directory"
+cat > "$temporary"
+chmod 700 "$temporary"
+mv "$temporary" "$target"
+actual=$(sha256sum "$target" | awk '{{print $1}}')
+[ "$actual" = {shlex.quote(digest)} ]
+printf '%s\\n' "$target"
+'''
+    try:
+        result = subprocess.run(
+            ["ssh", *ssh_options(), host, upload],
+            input=payload,
+            capture_output=True,
+            timeout=SSH_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SmuxError(f"{host}: script upload timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise SmuxError(f"{host}: script upload failed: {detail or 'unknown error'}")
+    remote_path = result.stdout.decode(errors="replace").strip().splitlines()
+    if not remote_path or not remote_path[-1].startswith("/"):
+        raise SmuxError(f"{host}: script upload returned no absolute remote path")
+    return remote_path[-1], digest
+
+
+def remote_script_sha256(host: str, script: str) -> str:
+    if host == "local":
+        path = Path(script).expanduser().resolve()
+        if not path.is_file():
+            die(f"script not found: {path}")
+        return file_sha256(path)
+    result = run_command(host, ["sha256sum", "--", script], timeout=SSH_TIMEOUT)
+    if result.returncode != 0:
+        raise SmuxError(
+            f"{host}: could not hash remote script: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    digest = result.stdout.strip().split(None, 1)[0] if result.stdout.strip() else ""
+    if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+        raise SmuxError(f"{host}: invalid SHA-256 response for {script}")
+    return digest.lower()
+
+
 def command_submit(args: argparse.Namespace) -> int:
     ensure_host(args.host)
-    command = ["sbatch", "--parsable", *args.sbatch_arg, args.script, *args.script_args]
     try:
+        if args.remote:
+            submitted_script = args.script
+            script_sha256 = remote_script_sha256(args.host, args.script)
+        else:
+            submitted_script, script_sha256 = upload_script(args.host, args.script)
+        command = [
+            "sbatch",
+            "--parsable",
+            *args.sbatch_arg,
+            submitted_script,
+            *args.script_args,
+        ]
         result = run_command(args.host, command, cwd=args.chdir, timeout=SSH_TIMEOUT)
     except SmuxError as exc:
         die(str(exc))
@@ -436,6 +559,9 @@ def command_submit(args: argparse.Namespace) -> int:
         "host": args.host,
         "job_id": job_id,
         "script": args.script,
+        "submitted_script": submitted_script,
+        "script_source": "remote" if args.remote else "local-upload",
+        "script_sha256": script_sha256,
         "chdir": args.chdir,
         "sbatch_args": args.sbatch_arg,
         "script_args": args.script_args,
@@ -464,6 +590,89 @@ def command_show(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         die(f"{args.host}:{args.job_id}: {result.stderr.strip() or 'scontrol failed'}")
     print(result.stdout.rstrip())
+    return 0
+
+
+def job_stdout_path(host: str, job_id: str) -> str:
+    result = run_command(
+        host,
+        ["scontrol", "show", "job", "-o", job_id],
+        timeout=SSH_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise SmuxError(
+            f"{host}:{job_id}: {result.stderr.strip() or 'scontrol failed'}"
+        )
+    match = re.search(r"(?:^|\s)StdOut=(\S+)", result.stdout)
+    if not match or match.group(1) in {"(null)", ""}:
+        raise SmuxError(f"{host}:{job_id}: Slurm reports no stdout path")
+    return match.group(1)
+
+
+def command_logs(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    validate_job_id(args.job_id)
+    if args.lines < 1:
+        die("--lines must be >= 1")
+    try:
+        stdout_path = job_stdout_path(args.host, args.job_id)
+    except SmuxError as exc:
+        die(str(exc))
+    command = ["tail", "-n", str(args.lines)]
+    if args.follow:
+        command.append("-f")
+    command.append(stdout_path)
+    if args.follow:
+        if args.host == "local":
+            return subprocess.run(command, check=False).returncode
+        remote = shlex.join(command)
+        return subprocess.run(
+            ["ssh", *ssh_options(), args.host, remote],
+            check=False,
+        ).returncode
+    result = run_command(args.host, command, timeout=SSH_TIMEOUT)
+    if result.returncode != 0:
+        die(f"{args.host}:{args.job_id}: {result.stderr.strip() or 'tail failed'}")
+    print(result.stdout, end="")
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    validate_job_id(args.job_id)
+    result = run_command(
+        args.host,
+        ["scancel", args.job_id],
+        timeout=SSH_TIMEOUT,
+    )
+    if result.returncode != 0:
+        die(f"{args.host}:{args.job_id}: {result.stderr.strip() or 'scancel failed'}")
+    print(f"{args.host}:{args.job_id} CANCELLED")
+    return 0
+
+
+def command_cleanup(args: argparse.Namespace) -> int:
+    ensure_host(args.host)
+    if args.older_than_days < 0:
+        die("--older-than-days must be >= 0")
+    action = "-delete" if args.apply else "-print"
+    script = (
+        "set -eu; directory=\"$HOME/.local/state/smux/scripts\"; "
+        "[ -d \"$directory\" ] || exit 0; "
+        f"find \"$directory\" -maxdepth 1 -type f -mtime +{args.older_than_days} "
+        f"-print {action if args.apply else ''}"
+    )
+    result = run_shell(args.host, script, timeout=SSH_TIMEOUT)
+    if result.returncode != 0:
+        die(f"{args.host}: cleanup failed: {result.stderr.strip() or result.stdout.strip()}")
+    paths = [line for line in result.stdout.splitlines() if line.strip()]
+    label = "removed" if args.apply else "would remove"
+    for path in paths:
+        print(f"{label}: {path}")
+    print(
+        f"{args.host}: {len(paths)} managed script(s) {label}; "
+        f"older than {args.older_than_days} days"
+    )
     return 0
 
 
@@ -505,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="smux",
         description="Operate several independent Slurm controllers over SSH.",
     )
-    parser.add_argument("--version", action="version", version="smux 0.2.0")
+    parser.add_argument("--version", action="version", version="smux 0.4.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="create a private local host config")
@@ -538,11 +747,18 @@ def build_parser() -> argparse.ArgumentParser:
     gpus_parser.add_argument("--json", action="store_true")
     gpus_parser.set_defaults(func=command_gpus)
 
-    submit_parser = subparsers.add_parser("submit", help="submit an existing script on one host")
+    submit_parser = subparsers.add_parser(
+        "submit", help="upload a local script and submit it on one host"
+    )
     submit_parser.add_argument("host")
-    submit_parser.add_argument("script", help="path as seen on the selected host")
+    submit_parser.add_argument("script", help="local script path (uploaded and checksum-verified)")
     submit_parser.add_argument("script_args", nargs="*")
     submit_parser.add_argument("--chdir", help="remote working directory")
+    submit_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="treat SCRIPT as an existing remote path instead of uploading it",
+    )
     submit_parser.add_argument(
         "--sbatch-arg",
         action="append",
@@ -556,6 +772,30 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("host")
     show_parser.add_argument("job_id")
     show_parser.set_defaults(func=command_show)
+
+    logs_parser = subparsers.add_parser("logs", help="show or follow a job's Slurm stdout")
+    logs_parser.add_argument("host")
+    logs_parser.add_argument("job_id")
+    logs_parser.add_argument("--lines", type=int, default=50)
+    logs_parser.add_argument("--follow", "-f", action="store_true")
+    logs_parser.set_defaults(func=command_logs)
+
+    cancel_parser = subparsers.add_parser("cancel", help="cancel one explicit Slurm job ID")
+    cancel_parser.add_argument("host")
+    cancel_parser.add_argument("job_id")
+    cancel_parser.set_defaults(func=command_cancel)
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="list or remove stale smux-uploaded scripts"
+    )
+    cleanup_parser.add_argument("host")
+    cleanup_parser.add_argument("--older-than-days", type=int, default=30)
+    cleanup_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="delete listed files; default is a dry run",
+    )
+    cleanup_parser.set_defaults(func=command_cleanup)
 
     wait_parser = subparsers.add_parser("wait", help="wait for one job to leave its queue")
     wait_parser.add_argument("host")
