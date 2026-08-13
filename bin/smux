@@ -441,8 +441,24 @@ def _gpu_is_idle(gpu: dict[str, str]) -> bool:
 
 
 def command_jobs(args: argparse.Namespace) -> int:
-    statuses = probe_many(select_hosts(args.hosts))
-    if args.json:
+    if getattr(args, "watch", False) and not args.json:
+        # Same frame, redrawn: erase-below after each one so a shorter queue
+        # leaves nothing of the longer one behind it.
+        try:
+            while True:
+                sys.stdout.write("\033[H\033[2J")
+                render_jobs(probe_many(select_hosts(args.hosts)))
+                sys.stdout.write("\033[J")
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print()
+            return 0
+    return render_jobs(probe_many(select_hosts(args.hosts)), as_json=args.json)
+
+
+def render_jobs(statuses: list[ClusterStatus], *, as_json: bool = False) -> int:
+    if as_json:
         payload = [
             {"host": status.host, **job}
             for status in statuses
@@ -498,6 +514,49 @@ def append_state(payload: dict[str, Any]) -> None:
     descriptor = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def read_state(host: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    """Recorded submissions, newest last, optionally for one host.
+
+    Bad lines are skipped rather than fatal: this is a log, and a truncated
+    final write should not stop you reading the hundred good records above it.
+    """
+    try:
+        raw = STATE_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in raw:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if host and record.get("host") != host:
+            continue
+        records.append(record)
+    return records[-limit:] if limit else records
+
+
+def command_history(args: argparse.Namespace) -> int:
+    records = read_state(args.host, args.limit)
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    if not records:
+        print("no recorded submissions")
+        return 0
+    rows = [
+        [
+            f'{record.get("host", "?")}:{record.get("job_id", "?")}',
+            (record.get("submitted_at") or "")[:19].replace("T", " "),
+            record.get("script_source", ""),
+            record.get("script", ""),
+        ]
+        for record in records
+    ]
+    print_table(["JOB", "SUBMITTED (UTC)", "SOURCE", "SCRIPT"], rows)
+    return 0
 
 
 def file_sha256(path: Path) -> str:
@@ -629,7 +688,31 @@ def command_submit(args: argparse.Namespace) -> int:
         print(json.dumps(record, indent=2))
     else:
         print(f"{args.host}:{job_id}")
+    if getattr(args, "wait", False):
+        # The handle was just printed, so a caller reading stdout still gets
+        # it before this blocks. Exit status becomes the job's, which is what
+        # makes 'smux submit --wait && ./next-step' mean what it looks like.
+        return wait_for(args.host, job_id, interval=args.interval, timeout=None)
     return 0
+
+
+def wait_for(host: str, job_id: str, *, interval: float, timeout: float | None) -> int:
+    """Block until a job leaves the queue. 0 only if it COMPLETED."""
+    started = time.monotonic()
+    previous = None
+    while True:
+        try:
+            finished, state = job_state(host, job_id)
+        except SmuxError as exc:
+            die(str(exc))
+        if state != previous:
+            print(f"{host}:{job_id} {state}", flush=True)
+            previous = state
+        if finished:
+            return 0 if state.startswith("COMPLETED") else 1
+        if timeout is not None and time.monotonic() - started >= timeout:
+            die(f"timed out waiting for {host}:{job_id}")
+        time.sleep(interval)
 
 
 def validate_job_id(job_id: str) -> None:
@@ -750,21 +833,7 @@ def job_state(host: str, job_id: str) -> tuple[bool, str]:
 def command_wait(args: argparse.Namespace) -> int:
     ensure_host(args.host)
     validate_job_id(args.job_id)
-    started = time.monotonic()
-    previous = None
-    while True:
-        try:
-            finished, state = job_state(args.host, args.job_id)
-        except SmuxError as exc:
-            die(str(exc))
-        if state != previous:
-            print(f"{args.host}:{args.job_id} {state}", flush=True)
-            previous = state
-        if finished:
-            return 0 if state.startswith("COMPLETED") else 1
-        if args.timeout is not None and time.monotonic() - started >= args.timeout:
-            die(f"timed out waiting for {args.host}:{args.job_id}")
-        time.sleep(args.interval)
+    return wait_for(args.host, args.job_id, interval=args.interval, timeout=args.timeout)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -796,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_parser = subparsers.add_parser("jobs", help="aggregate your queues")
     jobs_parser.add_argument("hosts", nargs="*")
     jobs_parser.add_argument("--json", action="store_true")
+    jobs_parser.add_argument("--watch", "-w", action="store_true",
+                             help="redraw the queue until interrupted")
+    jobs_parser.add_argument("--interval", type=float, default=10.0, metavar="SEC",
+                             help="seconds between redraws with --watch (default: 10)")
     jobs_parser.set_defaults(func=command_jobs)
 
     gpus_parser = subparsers.add_parser(
@@ -824,7 +897,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra sbatch option; repeat as needed (use --sbatch-arg=--partition=gpu)",
     )
     submit_parser.add_argument("--json", action="store_true")
+    submit_parser.add_argument("--wait", action="store_true",
+                               help="block until the job leaves the queue; "
+                                    "exit status is the job's")
+    submit_parser.add_argument("--interval", type=float, default=10.0, metavar="SEC",
+                               help="seconds between checks with --wait (default: 10)")
     submit_parser.set_defaults(func=command_submit)
+
+    history_parser = subparsers.add_parser(
+        "history", help="submissions smux has recorded")
+    history_parser.add_argument("host", nargs="?", help="only this host")
+    history_parser.add_argument("--limit", type=int, default=20, metavar="N",
+                                help="most recent N (default: 20)")
+    history_parser.add_argument("--json", action="store_true")
+    history_parser.set_defaults(func=command_history)
 
     show_parser = subparsers.add_parser("show", help="show one job through scontrol")
     show_parser.add_argument("host")

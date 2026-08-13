@@ -262,4 +262,36 @@ single="$($SMUX gpus alpha)"
 grep -q '1 GPU free  (alpha:0)' <<<"$single" || fail "singular: $(tail -1 <<<"$single")"
 pass 'one free GPU is not "1 GPUs"'
 
+# The submission log had been written since the first version and read by
+# nothing. A record kept for its own sake is either given a reader or removed.
+history="$($SMUX history)"
+grep -q 'alpha:4321' <<<"$history" || fail "history missing the submitted job: $history"
+grep -q 'local-upload' <<<"$history" || fail 'history does not say how the script got there'
+pass 'history lists what was submitted'
+
+[ "$($SMUX history --limit 1 | tail -n +3 | wc -l)" = 1 ] || fail 'history --limit ignored'
+"$SMUX" history --json | python3 -c 'import json,sys; json.load(sys.stdin)' \
+    || fail 'history --json is not json'
+pass 'history takes a limit and speaks json'
+
+[ "$(SMUX_STATE="$T/empty.jsonl" "$SMUX" history)" = 'no recorded submissions' ] \
+    || fail 'empty history not explained'
+# A half-written final line must not hide the good records above it.
+printf '{"host":"alpha","job_id":"1"}\n{"host":"alpha"' > "$T/torn.jsonl"
+[ "$(SMUX_STATE="$T/torn.jsonl" "$SMUX" history | tail -n +3 | wc -l)" = 1 ] \
+    || fail 'a torn last line broke the reader'
+pass 'history survives an empty or truncated log'
+
+# submit --wait folds the three commands that always run in sequence into the
+# one that produced the handle, and hands back the job's exit status.
+waited="$($SMUX submit alpha jobs/smoke.sbatch --wait --interval 0.01)"
+grep -q 'alpha:4321' <<<"$waited" || fail "submit --wait lost the handle: $waited"
+grep -q 'COMPLETED' <<<"$waited" || fail "submit --wait did not report the state: $waited"
+pass 'submit --wait blocks and reports'
+
+# --watch is a terminal loop; with --json there is nothing to redraw, so it
+# has to stay a single shot rather than spinning forever.
+timeout 10 "$SMUX" jobs --watch --json >/dev/null 2>&1 || fail 'jobs --watch --json did not return'
+pass 'jobs --watch --json is one shot'
+
 echo 'all smux tests passed'

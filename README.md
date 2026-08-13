@@ -83,6 +83,9 @@ smux cancel gpu-a 1234            # explicit job ID required
 smux cleanup gpu-a                # dry-run stale uploaded-script cleanup
 smux cleanup gpu-a --apply
 smux wait gpu-a 1234
+smux submit gpu-a job.sbatch --wait   # submit, then block on the handle
+smux jobs --watch                     # redraw the queue until interrupted
+smux history                          # submissions smux has recorded
 ```
 
 Use the reserved alias `local` for the current machine. A private host file
