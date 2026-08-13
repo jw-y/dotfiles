@@ -19,13 +19,17 @@ jobs:
       # time is the only form that checks them all.
       - name: Check shell scripts
         run: |
-          for f in install.sh update.sh bin/cdx tests/*.test.sh; do
+          for f in install.sh update.sh tests/*.test.sh; do
             bash -n "$f"
           done
-          shellcheck --severity=warning install.sh update.sh bin/cdx tests/*.test.sh
+          shellcheck --severity=warning install.sh update.sh tests/*.test.sh
+      # bin/cdx moved here when it was rewritten in Python. Leaving it in the
+      # shell lists above turned every push red at 'bash -n', which gates the
+      # test run — a lint step that fails on the file it is meant to check is
+      # indistinguishable from one that works, right up until you read it.
       - name: Check Python syntax
         run: |
-          for f in bin/gmon bin/smux; do
+          for f in bin/cdx bin/gmon bin/smux tests/cdx_unit.py; do
             python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f"
           done
       - name: Check JSON
