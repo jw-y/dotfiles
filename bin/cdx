@@ -486,7 +486,7 @@ def parse_usage(body: dict) -> dict:
 
 def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     """Cached inside the profile, not the store: it is per-account by definition."""
-    mode = os.environ.get("CDX_USAGE", "cache")
+    mode = os.environ.get("CDX_USAGE", "auto")
     ttl = int(os.environ.get("CDX_USAGE_TTL") or 900)
     force = _quota.force  # type: ignore[attr-defined]
     cache = home / ".cdx-usage.json"
@@ -496,27 +496,42 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
         cached = None
     if mode == "off" or not token:
         return cached, "cache"
-    # 'cache' (the default) keeps the everyday listing local and predictable:
-    # it never calls out except to fill an empty cache, so the only slow 'cdx'
-    # is the first one on a machine. 'auto' re-fetches once the figure ages
-    # past the TTL, which trades that predictability for freshness.
+    # 'auto' (the default) re-fetches once the figure ages past the TTL, while
+    # 'cache' is the explicit predictable/offline mode that only fills an
+    # empty cache and otherwise never calls out.
     if cached and not force and (mode == "cache"
                                  or time.time() - cached.get("fetched_at", 0) < ttl):
         return cached, "cache"
     req = urllib.request.Request(USAGE_ENDPOINT, headers={
         "Authorization": "Bearer " + token, "User-Agent": "cdx"})
-    try:
-        with _opener.open(req, timeout=5) as fh:
-            body = json.load(fh)
-    except urllib.error.HTTPError as exc:
-        # 401/403 is the signal we actually care about: the credentials are
-        # no longer usable, whatever the token dates claim.
-        rec = dict(cached or {})
-        rec["state"] = "relogin" if exc.code in (401, 403) else "error"
-        return rec, "live"
-    except Exception:
-        # Offline, DNS failure, timeout: fall back to whatever we knew last.
-        return cached, "offline"
+    # Accounts are fetched concurrently, and the endpoint can throttle that
+    # short burst even though every credential is healthy. Retry only errors
+    # which may clear; a rejected credential is final and must not hold up the
+    # other accounts. Each worker owns its retry, so one failure never aborts
+    # or suppresses another profile's refresh.
+    for attempt in range(3):
+        try:
+            with _opener.open(req, timeout=5) as fh:
+                body = json.load(fh)
+            break
+        except urllib.error.HTTPError as exc:
+            # 401/403 is the signal we actually care about: the credentials
+            # are no longer usable, whatever the token dates claim.
+            if exc.code in (401, 403):
+                rec = dict(cached or {})
+                rec["state"] = "relogin"
+                return rec, "live"
+            if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                return cached, "offline"
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                delay = min(float(retry_after), 5.0) if retry_after else 0.25 * 2 ** attempt
+            except (TypeError, ValueError):
+                delay = 0.25 * 2 ** attempt
+            time.sleep(max(0.0, delay))
+        except Exception:
+            # Offline, DNS failure, timeout: fall back to whatever we knew.
+            return cached, "offline"
     # 'primary' is not a fixed window: on some plans it is the weekly quota, on
     # others the 5-hour one with the week in 'secondary'. Reporting whichever
     # sits in 'primary' made the column mean different things per account, so
@@ -571,16 +586,17 @@ def reset_phrase(epoch: float) -> str:
     return time.strftime("%b %d %H:%M", time.localtime(epoch)) + f" ({rel})"
 
 
-BLOCKS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
-
-
 def bar(ratio: float, width: int = 10) -> str:
-    """Filled-block bar with eighth-block partials, so a 10-wide bar still
-    resolves to about 1% rather than snapping to the nearest tenth. Plain
-    characters, not escapes: this has to survive NO_COLOR and a pipe."""
-    eighths = int(max(0.0, min(1.0, ratio)) * width * 8)
-    full, rem = divmod(eighths, 8)
-    return "█" * full + BLOCKS[rem] + "░" * (width - full - (1 if rem else 0))
+    """Simple whole-cell bar; the adjacent percentage carries the precision.
+
+    Fractional block glyphs render unevenly in common terminal fonts and look
+    especially noisy against the shaded track (for example ``▏░░░░░``).
+    """
+    # int(x + .5) is conventional half-up rounding. Python's round() uses
+    # ties-to-even, which made equally exact half-cells lean in alternating
+    # directions (25% of six -> 2 cells, 75% -> 4 cells).
+    filled = int(max(0.0, min(1.0, ratio)) * width + 0.5)
+    return "█" * filled + "░" * (width - filled)
 
 
 @dataclass
@@ -765,13 +781,18 @@ def list_profiles(argv: list[str]) -> int:
         return 0
 
     relogin = any(r.state == "relogin" for r in rows)
-    oldest = max([r.age or 0 for r in rows], default=0)
+    # A rejected account may carry an old cached percentage, but the listing
+    # replaces it with "re-login" because that quota is no longer meaningful.
+    # Its timestamp must not then make every visible figure look stale.
+    oldest = max([r.age or 0 for r in rows if r.state != "relogin"], default=0)
     for r in rows:
         # An account that cannot run takes over the USED cell rather than
         # earning a column of its own: the percentage is not what stopped it,
         # so it is not the thing to read. 'status' still gives both.
         if r.state in ("relogin", "blocked", "spendlimit"):
             r.used = r.note
+        if r.state == "relogin":
+            r.resets = ""
 
     # How you signed in is 'chatgpt' on every ordinary account, so a column
     # for it is a constant — nine characters saying nothing. It only carries
@@ -833,8 +854,8 @@ def list_profiles(argv: list[str]) -> int:
             f"{C.DIM}{r.plan:<{wp}}{C.RESET}  {color}{cells[r.name]:>{wu}}{C.RESET}  "
             f"{C.DIM}{r.resets}{C.RESET}")
 
-    # The default never re-fetches, so the figures have to say how old they are
-    # — an unlabelled percentage reads as current no matter when it was taken.
+    # A failed automatic refresh or explicit cache mode can still leave an old
+    # figure, so state its age — an unlabelled percentage reads as current.
     if oldest >= 300:
         ago = (f"{oldest // 60}m" if oldest < 3600 else
                f"{oldest // 3600}h" if oldest < 86400 else f"{oldest // 86400}d")
@@ -1801,10 +1822,10 @@ re-pointing it and no client needs configuring.
 {C.CYAN}Environment{C.RESET}
   CODEX_PROFILES           where accounts live
   CDX_CODEX_LINK           the switchable link, normally {tilde(str(CODEX_LINK))}
-  CDX_USAGE                off never asks OpenAI for quota; auto re-fetches
+  CDX_USAGE                off never asks OpenAI for quota; cache never updates
+                           an existing figure; auto (the default) re-fetches
                            once the cache is older than CDX_USAGE_TTL seconds
-                           (900). The default only fills an empty cache, so
-                           listing never waits on the network.
+                           (900), falling back to the cache when offline.
   CDX_QUOTA_WARN           percent at which 'use' warns you (90)
   CDX_COLOR                auto, always or never (NO_COLOR also disables it)
   CDX_NO_KILL=1            report which processes would be stopped, stop none""")

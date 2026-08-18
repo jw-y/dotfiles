@@ -18,8 +18,12 @@ rather than imported by name.
 
 import importlib.machinery
 import importlib.util
+import io
+import json
 import sys
+import tempfile
 import time
+import urllib.error
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "bin" / "cdx"
@@ -95,12 +99,11 @@ print("bar")
 check("empty is all track", cdx.bar(0.0, 6), "░░░░░░")
 check("full is all fill", cdx.bar(1.0, 6), "██████")
 check("half of six", cdx.bar(0.5, 6), "███░░░")
-# 0.1 of six cells is 4.8 eighths, which truncates to four — half a block.
-check("partials resolve below a block", cdx.bar(0.1, 6), "▌░░░░░")
-check("and round down, never up", cdx.bar(0.166, 6), "▉░░░░░")
-# A partial only appears where a whole block cannot: 0.2 of six is nine
-# eighths, so one full block and one eighth over.
-check("a full block plus a sliver", cdx.bar(0.2, 6), "█▏░░░░")
+check("small values leave a clean track", cdx.bar(0.03, 6), "░░░░░░")
+check("whole cells round to the nearest", cdx.bar(0.25, 6), "██░░░░")
+check("half cells consistently round up", cdx.bar(0.75, 6), "█████░")
+# Precision belongs to the percentage printed beside the approximate bar.
+check("twenty percent rounds cleanly", cdx.bar(0.2, 6), "█░░░░░")
 check("over 1.0 clamps", cdx.bar(4.0, 6), "██████")
 check("below 0 clamps", cdx.bar(-1.0, 6), "░░░░░░")
 check("width is honoured", len(cdx.bar(0.37, 10)), 10)
@@ -323,6 +326,45 @@ finally:
 check("CDX_NO_KILL signals nothing", fake.signalled, [])
 check("and says why", "signalling nothing" in text, True)
 check("while still reporting the selection", "Stopping 1 process(es)" in text, True)
+
+# A forced multi-account refresh arrives as a short request burst. A healthy
+# account throttled by that burst must get another chance instead of silently
+# keeping an old cache while a neighbouring account refreshes successfully.
+class QuotaOpener:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+
+    def open(self, _req, timeout=0):
+        self.calls += 1
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return io.BytesIO(json.dumps(reply).encode())
+
+
+throttled = urllib.error.HTTPError(
+    cdx.USAGE_ENDPOINT, 429, "slow down", {"Retry-After": "0"}, None)
+healthy = {"plan_type": "pro", "rate_limit": {
+    "primary_window": {"used_percent": 9, "limit_window_seconds": 604800}}}
+real_opener, real_mode, real_force = (
+    cdx._opener, _os.environ.get("CDX_USAGE"), cdx._quota.force)
+fake_opener = QuotaOpener([throttled, healthy])
+try:
+    cdx._opener = fake_opener
+    _os.environ.pop("CDX_USAGE", None)
+    cdx._quota.force = True
+    with tempfile.TemporaryDirectory() as tmp:
+        rec, source = cdx._quota(Path(tmp), "healthy-token")
+finally:
+    cdx._opener = real_opener
+    cdx._quota.force = real_force
+    if real_mode is None:
+        _os.environ.pop("CDX_USAGE", None)
+    else:
+        _os.environ["CDX_USAGE"] = real_mode
+check("a throttled account is retried", fake_opener.calls, 2)
+check("the retry refreshes its quota", (rec["used"], source), (9, "live"))
 
 print()
 print(f"{PASS} passed" if not FAIL else f"{PASS} passed, {FAIL} failed")

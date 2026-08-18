@@ -542,14 +542,14 @@ it "every command has help";             assert_eq "$(for c in list status use a
 # own, so only the word straight after the command counts.
 it "help is positional";                 assert_eq "$(cdx "$U" add work --help | grep -c '^cdx add')" "0"
 
-# The default mode fills an empty cache once and then stays local: a stale
-# figure is reused rather than re-fetched, so the everyday listing never waits
-# on the network. 'auto' is what re-fetches on a TTL.
+# Explicit cache mode fills an empty cache once and then stays local. Auto,
+# which is the real default outside this network-disabled harness, re-fetches
+# on a TTL.
 rm -f "$U"/profiles/*/.cdx-usage.json
 CDX_USAGE=cache cdx "$U" list >/dev/null
-it "the default fills an empty cache";   assert_eq "$([ -f "$U/profiles/lab/.cdx-usage.json" ] && echo cached)" "cached"
+it "cache mode fills an empty cache";    assert_eq "$([ -f "$U/profiles/lab/.cdx-usage.json" ] && echo cached)" "cached"
 out="$(CDX_USAGE=cache CDX_USAGE_TTL=0 CDX_USAGE_ENDPOINT="file://$U/gone.json" cdx "$U" list)"
-it "the default never re-fetches";       assert_contains "$out" "42%"
+it "cache mode never re-fetches";        assert_contains "$out" "42%"
 it "so it is never marked stale";        assert_eq "$(printf %s "$out" | grep -c '42%~')" "0"
 out="$(CDX_USAGE=auto CDX_USAGE_TTL=0 CDX_USAGE_ENDPOINT="file://$U/gone.json" cdx "$U" list)"
 it "'auto' does re-fetch on the TTL";    assert_contains "$out" "42%~"
@@ -590,6 +590,12 @@ it "the warning threshold is tunable";    assert_eq "$(CDX_QUOTA_WARN=99 CDX_USA
 write_quota personal 12 relogin
 it "use refuses to stay quiet on a dead token"; assert_contains "$(CDX_USAGE=off cdx "$U" use personal --no-restart)" "refresh token is dead"
 it "and says how to fix it";              assert_contains "$(CDX_USAGE=off cdx "$U" use personal --no-restart)" "cdx add personal"
+python3 -c 'import json,sys,time
+p=sys.argv[1]; d=json.load(open(p)); d["fetched_at"]=time.time()-4*86400
+json.dump(d,open(p,"w"))' "$U/profiles/personal/.cdx-usage.json"
+out="$(CDX_USAGE=off cdx "$U" list)"
+it "re-login cache does not age the table"; assert_eq "$(printf %s "$out" | grep -c 'quota measured')" "0"
+it "re-login cache drops its old reset";    assert_eq "$(printf %s "$out" | awk '/personal/ && /\(in 1d\)/{n++} END{print n+0}')" "0"
 rm -f "$U"/profiles/*/.cdx-usage.json
 it "no cached figure means no noise";     assert_eq "$(CDX_USAGE=off cdx "$U" use lab --no-restart | grep -c quota)" "0"
 

@@ -1,0 +1,1052 @@
+#!/usr/bin/env python3
+"""cdc — run Claude Code under a named account profile (separate config per account).
+
+Modeled on cdx (bin/cdx), which does the same thing for Codex by re-pointing
+~/.codex at a profile directory. Claude Code's config is not one directory:
+it is ~/.claude (credentials, history, plugins, sessions...) *and* a sibling
+file, ~/.claude.json, which carries account identity (oauthAccount, userID)
+alongside a lot of unrelated local app state. So cdc re-points two links
+instead of one, and treats ~/.claude.json as a whole as per-profile data
+rather than trying to share the app-state fields inside it.
+
+CLAUDE_CONFIG_DIR is the env var Claude Code itself honours for relocating
+its config (confirmed: setting it moves .claude.json inside that directory
+too, not just the ~/.claude-shaped parts). cdc does not rely on it — the same
+reason cdx re-points ~/.codex instead of setting CODEX_HOME: every client
+(CLI, desktop app, IDE extensions) reads the default paths, and not all of
+them are known to honour the env var, so "activating" a profile has to mean
+re-pointing the paths every client already reads.
+
+Known sharp edge, ported from cdx's config.toml problem: Claude Code writes
+~/.claude.json with a temp-file-then-rename, which replaces a symlink with a
+real file rather than writing through it. 'cdc use' reclaims that real file
+into the outgoing profile's slot before switching, so a session's writes are
+never lost — but between switches the live file can silently stop being a
+symlink. 'cdc link' re-derives everything from stored state, so it is always
+the fix when something looks wrong.
+"""
+
+from __future__ import annotations
+
+import filecmp
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+PROFILES = Path(os.environ.get("CLAUDE_PROFILES") or HOME / ".claude-profiles")
+CLAUDE_LINK = Path(os.environ.get("CDC_CLAUDE_LINK") or HOME / ".claude")
+CLAUDE_JSON_LINK = Path(os.environ.get("CDC_CLAUDE_JSON_LINK") or HOME / ".claude.json")
+STORE = PROFILES / ".store"
+SWITCH_LOCK = PROFILES / ".cdc-switch.lock"
+
+# Shared across every profile: user preferences and installed plugins, not
+# account state. Kept in STORE and symlinked into each profile's home/, the
+# same pattern cdx uses for config.toml. Safe to re-link over a clobbered
+# copy — see the module docstring.
+SHARED_FILES = ["settings.json"]
+SHARED_DIRS = []
+
+# Conversation history, like cdx shares 'sessions' across every Codex
+# account: it is content you typed, not account state, and different
+# profiles here are mostly different billing logins for the same person
+# rather than different personas. Unlike SHARED_FILES/SHARED_DIRS above,
+# these can genuinely diverge per profile before they are ever linked (two
+# profiles independently continuing what was, at some point, the same
+# session id) — so folding one profile's copy in is a real merge: identical
+# content is deduped, anything that differs is kept under both names rather
+# than one overwriting the other. See merge_shared_dir/merge_shared_file.
+#
+# plugins/cache joined this list rather than SHARED_DIRS (which only ever
+# warns and leaves a profile's own real copy alone) once a profile actually
+# showed up with independently-installed plugins: a warn-only policy just
+# means the warning fires on every 'cdc use' forever. Merging means every
+# profile ends up with the union of what anyone installed.
+MERGE_DIRS = ["projects", "session-env", "file-history", "paste-cache", "jobs",
+              "backups", "plugins", "cache"]
+MERGE_FILES = ["history.jsonl"]
+
+
+class C:
+    RESET = RED = GREEN = YELLOW = CYAN = DIM = ""
+
+
+def _init_color() -> None:
+    if "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb" \
+            and sys.stdout.isatty():
+        C.RESET, C.RED, C.GREEN = "\033[0m", "\033[31m", "\033[32m"
+        C.YELLOW, C.CYAN, C.DIM = "\033[33m", "\033[36m", "\033[2m"
+
+
+def die(message: str) -> "NoReturn":  # type: ignore[valid-type]
+    sys.stderr.write(f"{C.RED}cdc: {message}{C.RESET}\n")
+    raise SystemExit(1)
+
+
+def out(text: str = "") -> None:
+    sys.stdout.write(text + "\n")
+
+
+# ── layout ───────────────────────────────────────────────────────────────────
+def initialized() -> bool:
+    return CLAUDE_LINK.is_symlink()
+
+
+def validate_name(name: str) -> None:
+    import re
+    if not name or re.search(r"[^A-Za-z0-9._-]", name):
+        die(f"invalid profile name '{name}' (use letters, numbers, '.', '_' or '-')")
+    if name.startswith("."):
+        die(f"invalid profile name '{name}' (names starting with '.' are reserved for cdc)")
+
+
+def profile_dir(name: str) -> Path:
+    return PROFILES / name
+
+
+def profile_home(name: str) -> Path:
+    """The directory that becomes ~/.claude when this profile is active."""
+    return profile_dir(name) / "home"
+
+
+def profile_json(name: str) -> Path:
+    """The file that becomes ~/.claude.json when this profile is active."""
+    return profile_dir(name) / "claude.json"
+
+
+def profile_names() -> list[str]:
+    if not PROFILES.is_dir():
+        return []
+    return sorted(p.name for p in PROFILES.iterdir()
+                  if p.is_dir() and not p.name.startswith(".") and (p / "home").is_dir())
+
+
+def active_profile() -> str | None:
+    if not initialized():
+        return None
+    try:
+        target = CLAUDE_LINK.resolve()
+    except OSError:
+        return None
+    # profile/home -> profile is the parent
+    return target.parent.name if target.name == "home" else None
+
+
+def require_profile(name: str) -> None:
+    if name not in profile_names():
+        die(f"no such profile: {name} (try 'cdc add {name}')")
+
+
+def require_initialized() -> None:
+    if not initialized():
+        die("not set up yet — run 'cdc init'")
+
+
+# ── permissions ──────────────────────────────────────────────────────────────
+def secure_profile(home: Path, json_file: Path) -> None:
+    try:
+        os.chmod(home, 0o700)
+    except OSError:
+        pass
+    creds = home / ".credentials.json"
+    if creds.exists():
+        try:
+            os.chmod(creds, 0o600)
+        except OSError:
+            pass
+    if json_file.exists():
+        try:
+            os.chmod(json_file, 0o600)
+        except OSError:
+            pass
+
+
+# ── shared links ─────────────────────────────────────────────────────────────
+def _unlink(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def links_to(path: Path, want: Path) -> bool:
+    return path.is_symlink() and os.readlink(path) == str(want)
+
+
+def unique_suffixed(path: Path, tag: str) -> Path:
+    """path, renamed to carry `tag` (a profile name), guaranteed not to
+    already exist. Used only when two profiles' copies of the same name
+    turned out to hold different content — both are kept."""
+    base, ext = (path.stem, path.suffix) if path.suffix else (path.name, "")
+    n = 0
+    while True:
+        cand = path.with_name(f"{base}-{tag}" + (f"-{n}" if n else "") + ext)
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+def merge_tree_into(src: Path, dst: Path, tag: str, stats: dict) -> None:
+    if src.is_symlink():
+        return
+    if src.is_dir():
+        if dst.exists() and not dst.is_dir():
+            dst = unique_suffixed(dst, tag)
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in list(src.iterdir()):
+            merge_tree_into(child, dst / child.name, tag, stats)
+    elif src.is_file():
+        if dst.exists() and dst.is_dir():
+            dst = unique_suffixed(dst, tag)
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            stats["copied"] += 1
+        elif filecmp.cmp(src, dst, shallow=False):
+            stats["identical"] += 1
+        else:
+            shutil.copy2(src, unique_suffixed(dst, tag))
+            stats["diverged"] += 1
+    # sockets/fifos/etc: skip silently, same reasoning as cdc import
+
+
+def merge_shared_dir(home: Path, name: str, tag: str) -> None:
+    link, target = home / name, STORE / name
+    if links_to(link, target):
+        return
+    if not os.path.lexists(link) or link.is_symlink():
+        _unlink(link)
+        target.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, link)
+        return
+    if not target.exists():
+        # first profile to contribute this dir: same filesystem, so a plain
+        # rename is instant and there is nothing yet to merge against.
+        os.rename(link, target)
+        os.symlink(target, link)
+        return
+    stats = {"copied": 0, "identical": 0, "diverged": 0}
+    merge_tree_into(link, target, tag, stats)
+    if stats["diverged"]:
+        sys.stderr.write(
+            f"cdc: {link} merged into shared history — {stats['diverged']} item(s) "
+            f"differed from another profile's copy, kept both (suffixed '-{tag}')\n")
+    shutil.rmtree(link)
+    os.symlink(target, link)
+
+
+def merge_shared_file(home: Path, name: str) -> None:
+    link, target = home / name, STORE / name
+    if links_to(link, target):
+        return
+    if not os.path.lexists(link) or link.is_symlink():
+        _unlink(link)
+        target.touch(exist_ok=True)
+        os.symlink(target, link)
+        return
+    if not target.exists():
+        os.rename(link, target)
+        os.symlink(target, link)
+        return
+    # Snapshot first: if this is the active profile's history.jsonl, Claude's
+    # own background daemon can rewrite it out from under us mid-merge (the
+    # real bug this guards — a live daemon replaced the file between the
+    # is_symlink() check above and an in-place read, and the merge silently
+    # folded in zero bytes). Reading a stable copy instead of the live path
+    # means a concurrent rewrite loses at worst its own write, never ours.
+    snapshot = link.with_name(link.name + ".cdc-merge-tmp")
+    shutil.copy2(link, snapshot)
+    with target.open("a") as out_f, snapshot.open() as in_f:
+        shutil.copyfileobj(in_f, out_f)
+    snapshot.unlink()
+    _unlink(link)
+    os.symlink(target, link)
+
+
+def link_shared(home: Path) -> None:
+    """Point this profile's shared config at STORE, creating STORE the first
+    time it's needed. Mirrors cdx's link_shared: files are safe to re-link
+    over a clobbered copy, directories are never removed if they turned out
+    to be real (a profile-specific install, not a mistake)."""
+    STORE.mkdir(parents=True, exist_ok=True)
+    for name in SHARED_FILES:
+        target, link = STORE / name, home / name
+        if links_to(link, target):
+            continue
+        if not target.exists():
+            if link.exists() and not link.is_symlink():
+                shutil.copy2(link, target)
+            else:
+                continue
+        _unlink(link)
+        os.symlink(target, link)
+    for name in SHARED_DIRS:
+        target, link = STORE / name, home / name
+        if links_to(link, target):
+            continue
+        if not target.is_dir():
+            if link.is_dir() and not link.is_symlink():
+                shutil.move(str(link), str(target))
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+        if link.is_dir() and not link.is_symlink():
+            sys.stderr.write(f"cdc: {link} is this profile's own directory — left as is\n")
+            continue
+        _unlink(link)
+        os.symlink(target, link)
+    tag = home.parent.name
+    for name in MERGE_DIRS:
+        merge_shared_dir(home, name, tag)
+    for name in MERGE_FILES:
+        merge_shared_file(home, name)
+
+
+# ── stale remote-control connections ────────────────────────────────────────
+# claude.ai/code and the mobile app talk to whichever local server is bound
+# to a profile's remote/ directory — and that server keeps running, bound to
+# whatever profile was active when it was spawned, even after 'cdc use'
+# switches the symlink elsewhere. Left alone, a remote session started under
+# one account keeps being served by that account's local process forever:
+# the app can show one account while commands actually execute against
+# another's data. cdx has the identical problem for Codex's SSH remote
+# proxies and fixes it the same way — kill anything still bound to the
+# outgoing profile on every switch, so a stale connection always drops
+# instead of silently answering under the wrong account.
+def _username() -> str:
+    return subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+
+
+def _open_paths(pid: int) -> list[str]:
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if not fd_dir.is_dir():
+        return []
+    paths = []
+    try:
+        for fd in fd_dir.iterdir():
+            try:
+                paths.append(os.readlink(fd))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return paths
+
+
+def stop_remote_bound_to(name: str) -> int:
+    """Kill remote-control server/bridge processes whose open files resolve
+    into `name`'s profile directory. Scoped to just those processes (not
+    'claude' generally) so this never touches an interactive session."""
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-u", _username(), "-f", "remote/srv/.+/server"],
+            capture_output=True, text=True).stdout.split()
+    except Exception:
+        return 0
+    prefix = str(profile_dir(name)) + "/"
+    killed = 0
+    for p in pids:
+        if not p.isdigit():
+            continue
+        pid = int(p)
+        if any(path.startswith(prefix) for path in _open_paths(pid)):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            except OSError:
+                pass
+    return killed
+
+
+# ── the reclaim problem ──────────────────────────────────────────────────────
+def reclaim(link: Path, owned_copy: Path) -> None:
+    """If `link` is a real file/dir rather than the symlink cdc left there,
+    Claude Code clobbered it with a fresh write (see module docstring). That
+    real data is live and current — move it back into the active profile's
+    slot before we repoint anything, so switching never loses a session's
+    writes."""
+    if not os.path.lexists(link) or link.is_symlink():
+        return
+    _unlink(owned_copy)
+    os.replace(link, owned_copy)
+
+
+def reclaim_active() -> None:
+    active = active_profile()
+    if active is None:
+        return
+    reclaim(CLAUDE_LINK, profile_home(active))
+    reclaim(CLAUDE_JSON_LINK, profile_json(active))
+
+
+# ── locking ──────────────────────────────────────────────────────────────────
+_lock_held = False
+
+
+def acquire_switch_lock() -> None:
+    global _lock_held
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(SWITCH_LOCK, 0o700)
+    except FileExistsError:
+        die(f"another cdc switch appears to be running (lock: {SWITCH_LOCK})")
+    _lock_held = True
+
+
+def release_switch_lock() -> None:
+    global _lock_held
+    if not _lock_held:
+        return
+    try:
+        SWITCH_LOCK.rmdir()
+    except OSError:
+        pass
+    _lock_held = False
+
+
+# ── account identity ─────────────────────────────────────────────────────────
+def oauth_account(json_file: Path) -> dict:
+    try:
+        return json.loads(json_file.read_text()).get("oauthAccount") or {}
+    except Exception:
+        return {}
+
+
+def describe(name: str) -> str:
+    """Best-effort account line for a profile. Reads the live file for the
+    active profile (it may currently be a clobbered real file, not yet
+    reclaimed) and the stored copy for everyone else."""
+    json_file = CLAUDE_JSON_LINK if name == active_profile() else profile_json(name)
+    acc = oauth_account(json_file)
+    if not acc:
+        return "not logged in"
+    email = acc.get("emailAddress") or "?"
+    plan = acc.get("organizationType") or ""
+    return f"{email}" + (f" ({plan})" if plan else "")
+
+
+# ── quota ────────────────────────────────────────────────────────────────────
+# Live quota, per account. Nothing in the local files (history.jsonl,
+# .credentials.json's expiry) records usage against a specific account, and
+# Claude Code's own '/status' figure comes from asking the server directly —
+# GET /api/oauth/usage, found by inspecting the client binary since it isn't
+# documented anywhere. This is the only way to get a per-profile number.
+USAGE_ENDPOINT = os.environ.get(
+    "CDC_USAGE_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
+
+
+def _check_usage_endpoint() -> None:
+    """The request carries a live access token, so the destination is checked
+    before it is sent anywhere: 'http://' would put the token on the wire in
+    clear. 'file://' is how tests point it at a fixture."""
+    if not (USAGE_ENDPOINT.startswith("https://")
+            or USAGE_ENDPOINT.startswith("file://")):
+        die(f"refusing to send credentials to CDC_USAGE_ENDPOINT={USAGE_ENDPOINT}"
+            " (https:// or file:// only)")
+
+
+class _SameHostAuth(urllib.request.HTTPRedirectHandler):
+    """urllib replays the original headers on a 30x, so a redirect off
+    api.anthropic.com would hand the access token to whatever host answered.
+    Keep it on redirects that stay on the same host, strip it otherwise."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != \
+                urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+
+_usage_opener = urllib.request.build_opener(_SameHostAuth)
+
+
+def _oauth_creds(name: str) -> dict:
+    try:
+        creds = json.loads((profile_home(name) / ".credentials.json").read_text())
+        return creds.get("claudeAiOauth") or {}
+    except Exception:
+        return {}
+
+
+def _access_token(name: str) -> str | None:
+    return _oauth_creds(name).get("accessToken")
+
+
+def _refresh_token_alive(name: str) -> bool:
+    """A profile's access token routinely goes stale from disuse (Claude Code
+    only refreshes it when the profile is actually run) — that is not the
+    same as the account needing 'cdc use && claude' to log in again. Only the
+    refresh token dying (or being missing) means that."""
+    expires = _oauth_creds(name).get("refreshTokenExpiresAt")
+    return bool(expires) and expires > time.time() * 1000
+
+
+def parse_usage(body: dict) -> dict:
+    """The endpoint's response, reduced to what cdc caches and shows. Pure:
+    no clock beyond the stamp, no network, no filesystem — a dict literal
+    exercises this the same as a real response.
+
+    body['limits'] carries one entry per rolling window (currently a 5-hour
+    'session' window and a 7-day 'weekly_all' one). Report whichever sits
+    closest to its limit — that is the one that stops you — and keep the
+    rest, the same choice cdx makes between Codex's primary/secondary
+    windows for the same reason.
+    """
+    windows = []
+    for w in body.get("limits") or []:
+        pct = w.get("percent")
+        if pct is None:
+            continue
+        label = {"session": "5h", "weekly_all": "wk"}.get(w.get("kind"), w.get("kind") or "?")
+        windows.append({"used": pct, "reset_at": w.get("resets_at"), "label": label})
+    head = max(windows, key=lambda w: w["used"]) if windows else {}
+    return {"fetched_at": time.time(), "used": head.get("used"),
+            "reset_at": head.get("reset_at"), "label": head.get("label"),
+            "windows": windows}
+
+
+def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
+    """Cached inside the profile, not the store: it is per-account by
+    definition."""
+    mode = os.environ.get("CDC_USAGE", "auto")
+    ttl = int(os.environ.get("CDC_USAGE_TTL") or 900)
+    force = _quota.force  # type: ignore[attr-defined]
+    cache = home / ".cdc-usage.json"
+    try:
+        cached = json.loads(cache.read_text())
+    except Exception:
+        cached = None
+    if mode == "off" or not token:
+        return cached, "cache"
+    # 'auto' (the default) re-fetches once the figure ages past the TTL, while
+    # 'cache' is the explicit predictable/offline mode that only fills an
+    # empty cache and otherwise never calls out.
+    if cached and not force and (mode == "cache"
+                                 or time.time() - cached.get("fetched_at", 0) < ttl):
+        return cached, "cache"
+    _check_usage_endpoint()
+    req = urllib.request.Request(USAGE_ENDPOINT, headers={
+        "Authorization": "Bearer " + token, "User-Agent": "cdc"})
+    # Profiles are fetched concurrently, and the endpoint can throttle that
+    # short burst even though every credential is healthy. Retry only errors
+    # that may clear; a rejected credential is final and must not hold up
+    # another profile's refresh.
+    for attempt in range(3):
+        try:
+            with _usage_opener.open(req, timeout=5) as fh:
+                body = json.load(fh)
+            break
+        except urllib.error.HTTPError as exc:
+            # 401/403 is the signal that actually matters: the credentials
+            # are no longer usable, whatever the token dates claim.
+            if exc.code in (401, 403):
+                rec = dict(cached or {})
+                rec["state"] = "relogin"
+                return rec, "live"
+            if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                return cached, "offline"
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                delay = min(float(retry_after), 5.0) if retry_after else 0.25 * 2 ** attempt
+            except (TypeError, ValueError):
+                delay = 0.25 * 2 ** attempt
+            time.sleep(max(0.0, delay))
+        except Exception:
+            # Offline, DNS failure, timeout: fall back to whatever we knew.
+            return cached, "offline"
+    else:
+        return cached, "offline"
+    rec = parse_usage(body)
+    try:
+        tmp = cache.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cache)
+    except Exception:
+        pass
+    return rec, "live"
+
+
+_quota.force = False  # type: ignore[attr-defined]
+
+
+def reset_phrase(iso: str) -> str:
+    """Wall clock first, countdown in parentheses — a bare date answers "wait
+    it out or switch?" wrong precisely when the reset is close, since a
+    window closing in five hours still renders as today's date."""
+    try:
+        epoch = datetime.fromisoformat(iso).timestamp()
+    except Exception:
+        return ""
+    left = epoch - time.time()
+    if left <= 0:
+        return "now"
+    if left < 3600:
+        rel = f"in {round(left / 60)}m"
+    elif left < 86400:
+        rel = f"in {round(left / 3600)}h"
+    else:
+        rel = f"in {round(left / 86400)}d"
+    return time.strftime("%b %d %H:%M", time.localtime(epoch)) + f" ({rel})"
+
+
+def usage_cell(rec: dict, src: str, refresh_alive: bool = True) -> tuple[str, str, str]:
+    """(used, resets, note) as rendered in 'cdc list'."""
+    rec = rec or {}
+    used = resets = note = ""
+    if rec.get("state") == "relogin":
+        note = "re-login" if not refresh_alive else "stale (refreshes on next use)"
+    elif not rec and src == "offline":
+        note = "unreachable"
+    if rec.get("used") is not None:
+        # '~' marks a figure that could not be refreshed, so a stale number
+        # is never mistaken for a live one.
+        used = f"{round(rec['used'])}%" + ("~" if src == "offline" else "")
+        if rec.get("label"):
+            used += " " + rec["label"]
+    if rec.get("reset_at"):
+        resets = reset_phrase(rec["reset_at"])
+    return used, resets, note
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+def cmd_init(argv: list[str]) -> int:
+    if initialized():
+        out(f"already set up: {CLAUDE_LINK} -> {os.readlink(CLAUDE_LINK)}")
+        return 0
+    if not CLAUDE_LINK.is_dir() or CLAUDE_LINK.is_symlink():
+        die(f"{CLAUDE_LINK} does not exist as a plain directory — nothing to set up")
+    if (PROFILES / "main").exists():
+        die(f"{PROFILES / 'main'} already exists, but {CLAUDE_LINK} is a real "
+            f"directory — move one aside first")
+
+    if not argv or argv[0] != "-y":
+        if not sys.stdin.isatty():
+            die("not a terminal — rerun as 'cdc init -y' to confirm")
+        out(f"cdc: one-time setup — {CLAUDE_LINK} and {CLAUDE_JSON_LINK} become symlinks")
+        out("     so accounts can be switched by re-pointing them. Your current account")
+        out(f"     moves to {PROFILES / 'main'} and stays active. Nothing is copied.")
+        sys.stdout.write("proceed? [y/N] ")
+        sys.stdout.flush()
+        if sys.stdin.readline().strip() not in ("y", "Y"):
+            out("cancelled")
+            return 1
+
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    main_dir = PROFILES / "main"
+    main_dir.mkdir()
+    os.rename(CLAUDE_LINK, main_dir / "home")
+    if CLAUDE_JSON_LINK.exists() and not CLAUDE_JSON_LINK.is_symlink():
+        os.rename(CLAUDE_JSON_LINK, main_dir / "claude.json")
+    link_shared(main_dir / "home")
+    secure_profile(main_dir / "home", main_dir / "claude.json")
+    os.symlink(main_dir / "home", CLAUDE_LINK)
+    os.symlink(main_dir / "claude.json", CLAUDE_JSON_LINK)
+    out(f"set up: {CLAUDE_LINK} -> {main_dir / 'home'}")
+    out(f"        {CLAUDE_JSON_LINK} -> {main_dir / 'claude.json'}")
+    out(f"shared store: {STORE}")
+    return 0
+
+
+def cmd_add(argv: list[str]) -> int:
+    require_initialized()
+    if not argv:
+        die("usage: cdc add <name>")
+    name = argv[0]
+    validate_name(name)
+    if profile_dir(name).exists():
+        die(f"profile already exists: {name}")
+    acquire_switch_lock()
+    try:
+        home = profile_home(name)
+        home.mkdir(parents=True)
+        link_shared(home)
+        secure_profile(home, profile_json(name))
+    finally:
+        release_switch_lock()
+    out(f"created profile '{name}'")
+    out(f"run 'cdc use {name}' then 'claude' — Claude Code will prompt you to log in")
+    return 0
+
+
+def cmd_import(argv: list[str]) -> int:
+    """Copy an existing CLAUDE_CONFIG_DIR-shaped directory (.claude.json and
+    all, flat — the shape 'CLAUDE_CONFIG_DIR=X claude' produces) in as a new
+    profile. A copy, not a move: the source directory is untouched, so
+    whatever pointed at it (an alias, a script) keeps working."""
+    require_initialized()
+    if len(argv) < 2:
+        die("usage: cdc import <name> <dir>")
+    name, source_arg = argv[0], argv[1]
+    validate_name(name)
+    if profile_dir(name).exists():
+        die(f"profile already exists: {name}")
+    source = Path(source_arg).expanduser()
+    if not source.is_dir():
+        die(f"not a directory: {source}")
+    if not (source / ".credentials.json").exists() and not (source / ".claude.json").exists():
+        die(f"{source} doesn't look like a Claude config dir "
+            f"(no .credentials.json or .claude.json)")
+
+    acquire_switch_lock()
+    try:
+        home = profile_home(name)
+        profile_dir(name).mkdir(parents=True)
+        try:
+            shutil.copytree(source, home, symlinks=True)
+        except shutil.Error as exc:
+            # Runtime IPC files (Claude leaves sockets under remote/run/) are
+            # not copyable or meaningful in another profile. Treat FIFOs and
+            # device nodes the same way; regular-file failures remain fatal.
+            def runtime_special(path: str) -> bool:
+                try:
+                    mode = os.lstat(path).st_mode
+                    return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+                                or stat.S_ISLNK(mode))
+                except OSError:
+                    return False
+
+            real = [e for e in exc.args[0] if not runtime_special(e[0])]
+            if real:
+                raise
+            for src_path, _dst_path, _err in exc.args[0]:
+                sys.stderr.write(f"cdc: skipped runtime file {src_path} "
+                                 "(not copyable, not needed)\n")
+        source_json = home / ".claude.json"
+        if source_json.exists():
+            shutil.move(str(source_json), str(profile_json(name)))
+        link_shared(home)
+        secure_profile(home, profile_json(name))
+    finally:
+        release_switch_lock()
+    out(f"imported '{name}' from {source} ({describe(name)})")
+    out(f"({source} was left untouched — this is a copy)")
+    return 0
+
+
+def cmd_use(argv: list[str]) -> int:
+    require_initialized()
+    if not argv:
+        die("usage: cdc use <name>")
+    name = argv[0]
+    validate_name(name)
+    require_profile(name)
+    if name == active_profile():
+        out(f"'{name}' is already active")
+        return 0
+
+    acquire_switch_lock()
+    try:
+        outgoing = active_profile()
+        reclaim_active()
+        # The outgoing profile's own history.jsonl/projects/etc. may have
+        # been clobbered back into a real file mid-session (Claude's daemon
+        # rewrites them the same way it rewrites .claude.json). Fold that
+        # back into the shared store now — otherwise it silently stops being
+        # shared until someone remembers to run 'cdc link'.
+        if outgoing:
+            link_shared(profile_home(outgoing))
+        _unlink(CLAUDE_LINK)
+        _unlink(CLAUDE_JSON_LINK)
+        home, json_file = profile_home(name), profile_json(name)
+        link_shared(home)
+        secure_profile(home, json_file)
+        os.symlink(home, CLAUDE_LINK)
+        os.symlink(json_file, CLAUDE_JSON_LINK)
+    finally:
+        release_switch_lock()
+
+    dropped = stop_remote_bound_to(outgoing) if outgoing else 0
+    out(f"switched to '{name}' ({describe(name)})")
+    if dropped:
+        out(f"disconnected {dropped} stale remote-control connection(s) from '{outgoing}'")
+    return 0
+
+
+def cmd_rename(argv: list[str]) -> int:
+    require_initialized()
+    if len(argv) < 2:
+        die("usage: cdc rename <old> <new>")
+    old, new = argv[0], argv[1]
+    validate_name(old)
+    validate_name(new)
+    require_profile(old)
+    if profile_dir(new).exists():
+        die(f"profile already exists: {new}")
+
+    acquire_switch_lock()
+    try:
+        was_active = old == active_profile()
+        os.rename(profile_dir(old), profile_dir(new))
+        if was_active:
+            _unlink(CLAUDE_LINK)
+            _unlink(CLAUDE_JSON_LINK)
+            os.symlink(profile_home(new), CLAUDE_LINK)
+            os.symlink(profile_json(new), CLAUDE_JSON_LINK)
+    finally:
+        release_switch_lock()
+
+    out(f"renamed '{old}' to '{new}'" + (" (active)" if was_active else ""))
+    return 0
+
+
+def cmd_rm(argv: list[str]) -> int:
+    require_initialized()
+    if not argv:
+        die("usage: cdc rm <name>")
+    name = argv[0]
+    validate_name(name)
+    require_profile(name)
+    if name == active_profile():
+        die(f"'{name}' is active — 'cdc use' another profile first")
+    force = "-y" in argv[1:]
+    if not force:
+        if not sys.stdin.isatty():
+            die("not a terminal — rerun with 'cdc rm <name> -y' to confirm")
+        sys.stdout.write(f"delete profile '{name}' and everything in it? [y/N] ")
+        sys.stdout.flush()
+        if sys.stdin.readline().strip() not in ("y", "Y"):
+            out("cancelled")
+            return 1
+    acquire_switch_lock()
+    try:
+        # re-check under the lock: another 'cdc use' could have raced us
+        # between the confirmation prompt and here.
+        if name == active_profile():
+            die(f"'{name}' became active while confirming — 'cdc use' another profile first")
+        shutil.rmtree(profile_dir(name))
+    finally:
+        release_switch_lock()
+    out(f"removed '{name}'")
+    return 0
+
+
+def cmd_link(argv: list[str]) -> int:
+    require_initialized()
+    reclaim_active()
+    for name in profile_names():
+        link_shared(profile_home(name))
+    out("shared config re-linked for every profile")
+
+    active = active_profile()
+    dropped = sum(stop_remote_bound_to(name) for name in profile_names() if name != active)
+    if dropped:
+        out(f"disconnected {dropped} stale remote-control connection(s) from inactive profiles")
+    return 0
+
+
+def cmd_list(argv: list[str]) -> int:
+    as_json = force = False
+    for arg in argv:
+        if arg == "--json":
+            as_json = True
+        elif arg == "--refresh":
+            force = True
+        elif arg == "--no-usage":
+            os.environ["CDC_USAGE"] = "off"
+        else:
+            die(f"unknown option to 'list': {arg}")
+
+    if not initialized():
+        if as_json:
+            out(json.dumps({"initialized": False, "profiles": []}, indent=2))
+        else:
+            out(f"({CLAUDE_LINK} is a plain directory — run 'cdc init' to enable switching)")
+        return 0
+
+    active = active_profile()
+    names = profile_names()
+
+    # One request per profile, concurrently: a cold cache costs one timeout
+    # rather than one per account, and an offline machine stalls once.
+    _quota.force = force  # type: ignore[attr-defined]
+    quotas: dict[str, tuple[dict | None, str]] = {}
+    if os.environ.get("CDC_USAGE") != "off":
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            fetched = pool.map(
+                lambda n: (n, *_quota(profile_home(n), _access_token(n))), names)
+        quotas = {n: (rec, src) for n, rec, src in fetched}
+
+    rows = []
+    for n in names:
+        rec, src = quotas.get(n, (None, "cache"))
+        used, resets, note = usage_cell(rec, src, _refresh_token_alive(n))
+        rows.append((n, describe(n), used, resets, note))
+
+    if as_json:
+        out(json.dumps({
+            "initialized": True,
+            "active_profile": active,
+            "profiles": [{
+                "name": n, "active": n == active, "account": d,
+                "used_percent": (quotas.get(n, (None, ""))[0] or {}).get("used"),
+                "window": (quotas.get(n, (None, ""))[0] or {}).get("label"),
+                "resets_at": (quotas.get(n, (None, ""))[0] or {}).get("reset_at"),
+                "note": note,
+            } for n, d, used, resets, note in rows],
+        }, indent=2))
+        return 0
+
+    if not rows:
+        out("no profiles yet — 'cdc add <name>'")
+        return 0
+    wn = max([len("NAME")] + [len(n) for n, *_ in rows])
+    show_usage = os.environ.get("CDC_USAGE") != "off" and any(used or note for *_, used, _, note in rows)
+    if show_usage:
+        wd = max([len("ACCOUNT")] + [len(d) for _, d, *_ in rows])
+        wu = max([len("USED")] + [len(used) for *_, used, _, _ in rows])
+        out(f"{C.DIM}   {'NAME':<{wn}}  {'ACCOUNT':<{wd}}  {'USED':<{wu}}  RESETS{C.RESET}")
+    else:
+        out(f"{C.DIM}   {'NAME':<{wn}}  ACCOUNT{C.RESET}")
+    for n, d, used, resets, note in rows:
+        mark = " *" if n == active else "  "
+        color = C.GREEN if n == active else ""
+        if show_usage:
+            note_color = C.RED if note == "re-login" else C.DIM if note == "unreachable" else C.YELLOW
+            tail = f"{note_color}{note}{C.RESET}" if note else f"{used:<{wu}}  {resets}"
+            out(f"{mark} {color}{n:<{wn}}{C.RESET}  {d:<{wd}}  {tail}")
+        else:
+            out(f"{mark} {color}{n:<{wn}}{C.RESET}  {d}")
+    return 0
+
+
+def cmd_status(argv: list[str]) -> int:
+    if not initialized():
+        out(f"not set up — {CLAUDE_LINK} is a plain directory. Run 'cdc init'.")
+        return 1
+    active = active_profile()
+    out(f"active profile: {C.CYAN}{active}{C.RESET}")
+    out(f"account:        {describe(active) if active else 'unknown'}")
+
+    ok = True
+    for link, expected_name in ((CLAUDE_LINK, "home"), (CLAUDE_JSON_LINK, "claude.json")):
+        if not link.is_symlink():
+            ok = False
+            out(f"{C.RED}{link} is not a symlink — it was likely just clobbered by a "
+                f"write; 'cdc link' will fix it{C.RESET}")
+        elif active and os.readlink(link) != str(profile_dir(active) / expected_name):
+            ok = False
+            out(f"{C.RED}{link} points somewhere unexpected: {os.readlink(link)}{C.RESET}")
+    if ok:
+        out(f"{C.GREEN}links look consistent{C.RESET}")
+
+    stale = []
+    try:
+        pids = subprocess.run(
+            ["pgrep", "-u", _username(), "-f", "remote/srv/.+/server"],
+            capture_output=True, text=True).stdout.split()
+        for p in pids:
+            if not p.isdigit():
+                continue
+            pid = int(p)
+            for path in _open_paths(pid):
+                prefix = f"{PROFILES}/"
+                if path.startswith(prefix):
+                    owner = path[len(prefix):].split("/", 1)[0]
+                    if owner and owner != active:
+                        stale.append((pid, owner))
+                    break
+    except Exception:
+        pass
+    if stale:
+        ok = False
+        names = ", ".join(f"PID {pid} ({owner})" for pid, owner in stale)
+        out(f"{C.RED}stale remote-control server(s) still bound to another profile: "
+            f"{names} — will be disconnected on the next 'cdc use'{C.RESET}")
+
+    # Informational only, unlike the checks above: an interactive 'claude'
+    # session pinned to a non-active profile isn't a bug to fix — it's just
+    # a session you started before switching, and killing it would be wrong.
+    # Claude Code has no single shared backend the way Codex's app-server is
+    # (every invocation is its own process), so this is the honest analog:
+    # visibility, not a MISMATCH verdict.
+    try:
+        pids = subprocess.run(["pgrep", "-u", _username(), "-f", "claude"],
+                               capture_output=True, text=True).stdout.split()
+        elsewhere: dict[str, int] = {}
+        prefix = f"{PROFILES}/"
+        for p in pids:
+            if not p.isdigit():
+                continue
+            for path in _open_paths(int(p)):
+                if path.startswith(prefix):
+                    owner = path[len(prefix):].split("/", 1)[0]
+                    if owner and owner != active:
+                        elsewhere[owner] = elsewhere.get(owner, 0) + 1
+                    break
+        if elsewhere:
+            desc = ", ".join(f"{n} on '{o}'" for o, n in sorted(elsewhere.items()))
+            out(f"{C.DIM}other running claude processes: {desc} "
+                f"(unaffected by switching — not an error){C.RESET}")
+    except Exception:
+        pass
+
+    return 0 if ok else 1
+
+
+HELP = """cdc — run Claude Code under a named account profile
+
+usage:
+  cdc                    list profiles, with quota (default)
+  cdc list [--refresh] [--no-usage] [--json]
+  cdc init [-y]          one-time setup: move the current account into 'main'
+  cdc add <name>         create an empty profile (log in with 'claude' after)
+  cdc import <name> <dir>
+                          copy an existing CLAUDE_CONFIG_DIR-shaped directory in
+  cdc use <name>         switch the active profile
+  cdc rename <old> <new>
+                          rename a profile (works even if it's active)
+  cdc rm <name> [-y]     delete a profile (must not be active)
+  cdc link               repair shared config symlinks across all profiles
+  cdc status             show the active profile and symlink health
+
+  --refresh    take a live quota reading instead of the cached one
+  --no-usage   skip the quota lookup entirely
+
+env:
+  CDC_USAGE          auto (default) | cache (never update existing) | off
+  CDC_USAGE_TTL      seconds before a cached reading is considered stale (900)
+  CDC_USAGE_ENDPOINT override the quota endpoint (https:// or file:// only)
+"""
+
+
+def main(argv: list[str]) -> int:
+    _init_color()
+    if not argv or argv[0] in ("list", "ls", "-l"):
+        return cmd_list(argv[1:] if argv else [])
+    # Listing is the default command, so its two common flags work without
+    # spelling out "list", matching `cdc` itself and cdx's CLI.
+    if argv[0] in ("--refresh", "--no-usage"):
+        return cmd_list(argv)
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("-h", "--help", "help"):
+        out(HELP)
+        return 0
+    dispatch = {
+        "init": cmd_init, "add": cmd_add, "import": cmd_import, "use": cmd_use,
+        "rename": cmd_rename, "rm": cmd_rm, "link": cmd_link, "status": cmd_status,
+        "list": cmd_list,
+    }
+    if cmd not in dispatch:
+        die(f"unknown command: {cmd} (see 'cdc --help')")
+    return dispatch[cmd](rest)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

@@ -116,7 +116,6 @@ alias cp="cp -i"
 alias rm="rm -i"
 export PYTHONBREAKPOINT=ipdb.set_trace
 export VIRTUAL_ENV_DISABLE_PROMPT=1
-alias claude-lab='CLAUDE_CONFIG_DIR=$HOME/.claude-lab command claude'
 
 alias vim="nvim"
 export EDITOR="nvim"

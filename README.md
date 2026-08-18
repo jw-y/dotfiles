@@ -7,7 +7,7 @@ Personal terminal and development configuration for macOS and Linux.
 - **Shell:** Zsh, Oh My Zsh, a custom theme, autosuggestions, and syntax highlighting
 - **Terminal:** Ghostty, tmux, TPM, and Catppuccin
 - **Editor:** Neovim with LSP, Treesitter, Telescope, Mason, and completion
-- **CLI tools:** `gmon`, `smux`, `cdx`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
+- **CLI tools:** `gmon`, `smux`, `cdx`, `cdc`, uv, NVM/Node.js, Hugging Face CLI, Claude Code, and OpenAI Codex
 - **Development:** Git, Python debugger/linter settings, and VS Code keybindings
 
 ## Quick start
@@ -57,11 +57,36 @@ cdx ssh baram use work # drive another machine's accounts over SSH
 
 Accounts live in `~/.codex-profiles/<name>`, holding only credentials and logs. Everything shareable — config, conversation history, memories, and the ~1.7 GB of binary and plugin caches — lives once in `~/.codex-profiles/.store`, which is not an account and is symlinked into each one. That keeps each account a few hundred KB, lets `resume` see your work whichever account is active, and means any account can be renamed or deleted without disturbing the rest. `cdx link` rebuilds those symlinks if Codex ever overwrites one.
 
-The listing shows how much of each account's weekly quota is spent, so you can see where to switch before you hit a limit. The figure comes from the same OpenAI endpoint the Codex CLI polls for its own `/status`, asked once per account and cached inside it. Listing never waits on the network: it calls out only to fill an empty cache, reuses the stored figure afterwards, and says how old that figure is. `--refresh` takes a live reading, `--no-usage` (or `CDX_USAGE=off`) skips quota entirely, and `CDX_USAGE=auto` restores refresh-when-stale (`CDX_USAGE_TTL`, default 900s), where an unreachable endpoint falls back to the last known number marked `~`. It doubles as a health check — an account whose refresh token has died shows `re-login` rather than a percentage, which token expiry dates cannot tell you, since Codex leaves expired `id_token`s in place on perfectly working accounts.
+The listing shows how much of each account's weekly quota is spent, so you can see where to switch before you hit a limit. The figure comes from the same OpenAI endpoint the Codex CLI polls for its own `/status`, asked once per account and cached inside it. A normal listing refreshes figures older than `CDX_USAGE_TTL` (default 900 seconds); an unreachable endpoint falls back to the last known number marked `~`. `--refresh` forces a live reading, `--no-usage` (or `CDX_USAGE=off`) skips quota entirely, and `CDX_USAGE=cache` keeps existing figures without refreshing them. It doubles as a health check — an account whose refresh token has died shows `re-login` rather than a percentage, which token expiry dates cannot tell you, since Codex leaves expired `id_token`s in place on perfectly working accounts.
 
 A percentage is not the only way to run out. An account can sit at 16% and still refuse to work, because an admin-set spend budget is exhausted — every rate-limit field reports fine and only `spend_control.reached` says otherwise. Such an account shows `spend limit` in place of its percentage, is never suggested as the one with the most room, and is called out when you switch to it. `cdx status <name>` gives the long form for any account, active or not: both limits, what the plan reports about credits, and whether the running clients match. Only the Account section follows the name — storage and running clients always describe this machine.
 
 Run `cdx -h` for the command map and `cdx <command> -h` for one command's detail, and `make test` for the regression suite. `cdx` needs `codex` and `python3` on `PATH` and refuses to run without either.
+
+## Switching Claude Code accounts (`cdc`)
+
+Same idea as `cdx`, ported to Claude Code — with one wrinkle Codex doesn't have. Claude Code's config isn't one directory: it's `~/.claude` *and* a sibling file, `~/.claude.json`, which carries account identity alongside a lot of unrelated local app state. `cdc` re-points both.
+
+Quota readings are cached independently inside each profile. A normal `cdc` listing refreshes an account once its reading is older than `CDC_USAGE_TTL` (default 900 seconds), while `cdc --refresh` forces every available account and `CDC_USAGE=cache` keeps existing readings offline.
+
+```bash
+cdc                       # list profiles; '*' marks the active one
+cdc init                  # one-time: make ~/.claude and ~/.claude.json switchable
+cdc add work              # create an empty profile, then log in with 'claude'
+cdc import work ~/.claude-work  # or bring in an existing CLAUDE_CONFIG_DIR directory
+cdc use work               # activate it, disconnecting stale remote-control connections
+cdc rename work primary     # rename a profile, even the active one
+cdc status                 # symlink health and any stale remote-control servers
+cdc link                   # repair shared config, merge conversation history, disconnect stale sessions
+```
+
+Profiles live in `~/.claude-profiles/<name>`. Unlike `cdx`, conversation history (`projects/`, `history.jsonl`, `session-env/`, and more) is shared across every profile by default, in `~/.claude-profiles/.store` — switching accounts never changes what history you see. Settings and plugins are shared the same way. Where two profiles already had independent, diverging history before either was linked (two accounts that predate `cdc`, say), `cdc link` merges them: identical content is deduped, anything that actually differs is kept under both names rather than either one silently winning.
+
+Claude Code writes several of these files with a temp-file-then-rename, which replaces `cdc`'s symlink with a real file rather than writing through it — the same problem `cdx` has with `config.toml`. `cdc use` reclaims that real data into the outgoing profile's slot before switching, so a session's writes are never lost; `cdc link` is the general-purpose repair for when something drifts.
+
+Claude's remote-control feature (claude.ai/code, the mobile app) talks to a local server process bound to whichever profile was active when it started — it keeps running, and keeps answering, even after you switch accounts locally. `cdc use` and `cdc link` disconnect anything still bound to a profile you're no longer on, so a stale connection can't keep serving the wrong account in the background.
+
+Run `cdc --help` for the command map, and `make test` for the regression suite. `cdc` needs `python3` on `PATH`.
 
 ## Multiplexing independent Slurm clusters (`smux`)
 
@@ -121,7 +146,7 @@ The installer checks for `zsh`, `git`, `curl`, and `rsync`. On Linux, it install
 
 ## Safety and update behavior
 
-- Neovim, Ghostty, `gmon`, and `cdx` are symlinked into the home directory.
+- Neovim, Ghostty, `gmon`, `cdx`, and `cdc` are symlinked into the home directory.
 - An existing file, directory, or incorrect symlink is moved to a timestamped `*.dotfiles-backup-YYYYMMDD-HHMMSS` path before replacement.
 - Copied shell, theme, and Claude files use the same timestamped backup suffix when their contents change.
 - Dry-run mode performs no filesystem writes.
@@ -140,7 +165,7 @@ dotfiles/
 ├── ghostty/             # Ghostty configuration
 ├── claude/              # Claude settings and status line
 ├── git/                 # Shareable Git configuration
-├── bin/                 # Personal command-line tools (gmon, cdx)
+├── bin/                 # Personal command-line tools (gmon, cdx, cdc)
 ├── tests/               # Test suite for bin/ tools (make test)
 ├── vscode/              # VS Code keybindings
 ├── archive/             # Older configurations kept for reference

@@ -23,6 +23,7 @@ FILES=(
 TOOLS=(
     gmon
     cdx
+    cdc
     smux
 )
 
@@ -84,7 +85,17 @@ echo "checking jungwoo.zsh-theme"
 sync_file "jungwoo.zsh-theme" "$THEME_PATH"
 
 echo "checking Claude settings"
-sync_file "claude/settings.json" "$HOME/.claude"
+if [ -L "$HOME/.claude/settings.json" ]; then
+    # cdc points this at its shared store once initialized, and Claude Code
+    # itself writes into it (e.g. /auto-mode-setup). sync_file's rsync
+    # --backup doesn't write through a symlink target — it backs the
+    # symlink up and drops a real file in its place, silently detaching
+    # the profile from cdc's store and discarding whatever Claude Code had
+    # written there since. Leave it to cdc once that link exists.
+    echo "  ~/.claude/settings.json is a symlink (managed by cdc) — leaving it alone"
+else
+    sync_file "claude/settings.json" "$HOME/.claude"
+fi
 
 for tool in "${TOOLS[@]}"; do
     if [ ! -f "$DOTFILES_DIR/bin/$tool" ]; then
