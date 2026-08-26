@@ -327,6 +327,62 @@ check("CDX_NO_KILL signals nothing", fake.signalled, [])
 check("and says why", "signalling nothing" in text, True)
 check("while still reporting the selection", "Stopping 1 process(es)" in text, True)
 
+# ── app-server lifecycle ─────────────────────────────────────────────────────
+print("app_server_lifecycle")
+
+
+def classify_server(table, *, managed_pid=None, configured=False):
+    fake = FakeProcesses(table)
+    real, cdx.PROCS = cdx.PROCS, fake
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            daemon = home / "app-server-daemon"
+            if managed_pid is not None or configured:
+                daemon.mkdir()
+            if managed_pid is not None:
+                (daemon / "app-server.pid").write_text(json.dumps({"pid": managed_pid}))
+            if configured:
+                (daemon / "settings.json").write_text(
+                    json.dumps({"remoteControlEnabled": True}))
+            return cdx.app_server_lifecycle(home, sorted(table))
+    finally:
+        cdx.PROCS = real
+
+
+ephemeral = classify_server({101: (
+    "codex -c features.code_mode_host=true app-server --listen unix://", [])})
+check("an SSH-started server is ephemeral", ephemeral.mode, "ephemeral")
+check("ephemeral mode does not claim Remote Control", ephemeral.remote_status, "off")
+check("its label gives the safe ordering hint",
+      "close SSH clients" in cdx.remote_control_label(ephemeral), True)
+
+blocked = classify_server({102: (
+    "codex -c features.code_mode_host=true app-server --listen unix://", [])},
+    configured=True)
+check("configured Remote Control can be blocked by an ephemeral server",
+      blocked.problem, True)
+check("the blocked state is explicit", blocked.remote_status, "configured")
+
+managed = classify_server({103: (
+    "codex app-server --remote-control --listen unix://", [])},
+    managed_pid=103, configured=True)
+check("a daemon pidfile identifies persistent mode", managed.mode, "persistent")
+check("a matching Remote Control daemon is managed", managed.managed_remote, True)
+check("the managed label is explicit", cdx.remote_control_label(managed),
+      "enabled — managed")
+
+unmanaged = classify_server({104: (
+    "codex app-server --remote-control --listen unix://", [])},
+    managed_pid=999, configured=True)
+check("a stale pidfile cannot adopt a foreground server", unmanaged.mode, "unmanaged")
+check("unmanaged Remote Control is a conflict", unmanaged.problem, True)
+
+stopped = classify_server({}, configured=True)
+check("configured without a process is stopped", stopped.mode, "stopped")
+check("a stopped configured daemon is recoverable, not conflicting",
+      stopped.problem, False)
+
 # A forced multi-account refresh arrives as a short request burst. A healthy
 # account throttled by that burst must get another chance instead of silently
 # keeping an old cache while a neighbouring account refreshes successfully.

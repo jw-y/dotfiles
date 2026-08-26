@@ -1002,6 +1002,95 @@ def pgrep(pattern: str) -> list[int]:
     return PROCS.matching(pattern)
 
 
+@dataclass(frozen=True)
+class AppServerLifecycle:
+    """How the active profile's app-server was launched.
+
+    The daemon owns a server only when its pidfile names that live PID.
+    Command-line shape alone is insufficient: a foreground remote-control
+    server also carries --remote-control, and a stale daemon can outlive its
+    pidfile.
+    """
+
+    mode: str
+    remote_status: str
+    configured: bool
+    managed_pid: int | None
+    managed_remote: bool
+
+    @property
+    def problem(self) -> bool:
+        return (self.remote_status == "configured" and self.mode != "stopped") \
+            or (self.remote_status == "enabled" and self.mode == "unmanaged")
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        value = path.read_text().strip()
+        if value.isdigit():
+            return int(value)
+        payload = json.loads(value)
+        pid = payload.get("pid")
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def remote_control_configured(home: Path) -> bool:
+    try:
+        settings = json.loads((home / "app-server-daemon/settings.json").read_text())
+        return settings.get("remoteControlEnabled") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def app_server_lifecycle(home: Path, server_pids: list[int]) -> AppServerLifecycle:
+    """Classify live servers against one profile's daemon state."""
+    managed_pid = read_pid(home / "app-server-daemon/app-server.pid")
+    commands = {pid: PROCS.cmdline(pid) for pid in server_pids}
+    remote_pids = {pid for pid, cmd in commands.items()
+                   if "app-server" in cmd and "--remote-control" in cmd}
+    managed_running = managed_pid is not None and managed_pid in server_pids
+    configured = remote_control_configured(home)
+
+    if not server_pids:
+        mode = "stopped"
+    elif managed_running:
+        mode = "persistent"
+    elif remote_pids:
+        mode = "unmanaged"
+    else:
+        mode = "ephemeral"
+
+    if remote_pids:
+        remote_status = "enabled"
+    elif configured:
+        remote_status = "configured"
+    else:
+        remote_status = "off"
+
+    return AppServerLifecycle(
+        mode=mode,
+        remote_status=remote_status,
+        configured=configured,
+        managed_pid=managed_pid,
+        managed_remote=managed_running and managed_pid in remote_pids,
+    )
+
+
+def remote_control_label(state: AppServerLifecycle) -> str:
+    if state.remote_status == "enabled":
+        owner = "managed" if state.managed_remote else "unmanaged"
+        return f"enabled — {owner}"
+    if state.remote_status == "configured":
+        if state.mode == "stopped":
+            return "configured — server stopped"
+        return f"configured — blocked by {state.mode} server"
+    if state.mode == "ephemeral":
+        return "off — close SSH clients before enabling"
+    return "off"
+
+
 # ── status ───────────────────────────────────────────────────────────────────
 def section(title: str) -> None:
     out(f"\n{C.CYAN}{title}{C.RESET}")
@@ -1096,6 +1185,7 @@ def cmd_status(argv: list[str]) -> int:
 
     server_pids = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
     proxy_count = len(pgrep(r"(^|/)codex app-server proxy( |$)"))
+    lifecycle = app_server_lifecycle(home_of(active), server_pids)
 
     mismatch = False
     server_rows: list[tuple[int, str]] = []
@@ -1106,7 +1196,9 @@ def cmd_status(argv: list[str]) -> int:
             mismatch = True
     else:
         for pid in server_pids:
-            owner = app_server_profile(pid)
+            # A persistent server need not keep an open profile file. Its
+            # daemon pidfile is the stronger ownership proof in that case.
+            owner = active if pid == lifecycle.managed_pid else app_server_profile(pid)
             server_rows.append((pid, owner))
             if owner == active:
                 server_lines.append(
@@ -1164,6 +1256,8 @@ def cmd_status(argv: list[str]) -> int:
         for line in server_lines:
             out(line)
         row("ssh proxies", str(proxy_count))
+        row("server mode", lifecycle.mode)
+        row("remote ctrl", remote_control_label(lifecycle))
         row("desktop", "not observable from this host")
         out()
 
@@ -1173,6 +1267,10 @@ def cmd_status(argv: list[str]) -> int:
     elif not server_pids:
         status_word, color = "idle", C.YELLOW
         message = f"IDLE — the next Codex client should start with {active}."
+    elif lifecycle.problem:
+        status_word, color = "remote-conflict", C.RED
+        message = ("REMOTE CONTROL CONFLICT — close connected clients, then run "
+                   "'codex remote-control start'.")
     else:
         status_word, color = "ok", C.GREEN
         message = f"OK — host-side Codex execution is using {active}."
@@ -1187,6 +1285,8 @@ def cmd_status(argv: list[str]) -> int:
                           "credits": c.get("credits")}
         except Exception:
             quota_json = None
+        recommended = f"cdx use {active}" if status_word == "mismatch" else (
+            "codex remote-control start" if status_word == "remote-conflict" else None)
         out(json.dumps({
             "active_profile": active,
             "reported_profile": subject,
@@ -1199,12 +1299,19 @@ def cmd_status(argv: list[str]) -> int:
                             for pid, owner in server_rows],
             "ssh_remote_proxies": proxy_count,
             "desktop_account_observable": False,
+            "app_server_mode": lifecycle.mode,
+            "remote_control": {
+                "status": lifecycle.remote_status,
+                "configured": lifecycle.configured,
+                "managed_pid": lifecycle.managed_pid,
+                "managed": lifecycle.managed_remote,
+            },
             "status": status_word,
-            "recommended_command": f"cdx use {active}" if status_word == "mismatch" else None,
+            "recommended_command": recommended,
         }, indent=2))
     else:
         out(f"Status: {color}{message}{C.RESET}")
-    return 1 if mismatch else 0
+    return 1 if mismatch or lifecycle.problem else 0
 
 
 # ── init and the store ───────────────────────────────────────────────────────
@@ -1420,6 +1527,32 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
     return 0
 
 
+def restart_remote_control(profile: str) -> int:
+    """Restore a daemon that cdx deliberately stopped during a switch."""
+    if os.environ.get("CDX_NO_KILL") == "1":
+        out(f"{C.YELLOW}  Would restart Remote Control for {profile}.{C.RESET}")
+        return 0
+    out(f"{C.YELLOW}  Restarting Remote Control for {profile}...{C.RESET}")
+    proc = subprocess.run(
+        ["codex", "remote-control", "start"],
+        text=True,
+        capture_output=True,
+    )
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode:
+        sys.stderr.write(
+            f"{C.RED}cdx: profile switched, but Remote Control did not restart."
+            f"{C.RESET}\n"
+        )
+        sys.stderr.write("     Close connected clients and run "
+                         "'codex remote-control start'.\n")
+        return proc.returncode
+    return 0
+
+
 # ── use ──────────────────────────────────────────────────────────────────────
 def report_quota(target: str, names: list[str]) -> None:
     """What 'use' reports about the account you just landed on. Cache only:
@@ -1494,11 +1627,18 @@ def cmd_use(argv: list[str]) -> int:
     if not dry_run:
         acquire_switch_lock()
     old_target = resolve_dir(CODEX_LINK)
+    old_lifecycle = None
+    if restart and old_target:
+        old_servers = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
+        old_lifecycle = app_server_lifecycle(Path(old_target), old_servers)
+    preserve_remote = bool(old_lifecycle and old_lifecycle.managed_remote)
     if dry_run:
         out(f"{C.YELLOW}Dry run:{C.RESET} would activate {C.CYAN}{name}{C.RESET} "
             f"({CODEX_LINK} -> {home})")
         if restart and old_target:
             stop_bound_to(old_target, dry_run=True)
+            if preserve_remote:
+                restart_remote_control(name)
         else:
             out("  Existing Codex and remote connections would be left running.")
         return 0
@@ -1513,7 +1653,11 @@ def cmd_use(argv: list[str]) -> int:
     report_quota(name, profile_names())
     if restart:
         if old_target:
-            stop_bound_to(old_target)
+            stopped = stop_bound_to(old_target)
+            if stopped:
+                return stopped
+            if preserve_remote and restart_remote_control(name):
+                return 1
     else:
         out("  Existing Codex and remote connections were left running by request.")
         out("  They may keep the old account until restarted or reconnected.")
@@ -1852,8 +1996,9 @@ SUB_HELP = {
   about another account — a non-active account is marked as such.
 
   Quota comes from the cache, so this works offline; 'cdx --refresh' takes a
-  live reading. Exits non-zero on a mismatch, which is what makes it usable
-  in a script.
+  live reading. Clients also show whether the app-server is persistent,
+  ephemeral or unmanaged and whether Remote Control is healthy. Exits non-zero
+  on a profile mismatch or Remote Control lifecycle conflict.
 
   --json       machine-readable, with raw percentages and epochs, plus
                'reported_profile' alongside 'active_profile'""",
@@ -1862,7 +2007,9 @@ SUB_HELP = {
   Point ~/.codex at <name>, which switches every Codex client on this
   machine at once, then stop the processes still bound to the old account so
   they come back on the new one. SSH remote proxies are disconnected too, so
-  the desktop app reconnects rather than holding a dead backend.
+  the desktop app reconnects rather than holding a dead backend. If the old
+  profile has a verified daemon-managed Remote Control server, cdx restarts
+  Remote Control for the newly active profile.
 
   Reports where you landed, and warns when that account is nearly out of
   quota or cannot run at all, naming the account with the most room.

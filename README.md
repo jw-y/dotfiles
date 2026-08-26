@@ -63,6 +63,17 @@ A percentage is not the only way to run out. An account can sit at 16% and still
 
 Run `cdx -h` for the command map and `cdx <command> -h` for one command's detail, and `make test` for the regression suite. `cdx` needs `codex` and `python3` on `PATH` and refuses to run without either.
 
+### Remote Control on headless hosts
+
+Start `codex remote-control start` on a headless SSH host before opening Codex
+desktop or IDE connections to it. Otherwise an SSH client can create an
+ephemeral app-server that the persistent Remote Control daemon cannot safely
+adopt. Remote Control belongs to the active `cdx` profile; `cdx use` preserves
+it when a managed daemon is already running. Enrollment can require fresh MFA
+assurance. See the
+[headless Remote Control runbook](docs/codex-remote-control.md) for setup,
+verification, and recovery steps.
+
 ## Switching Claude Code accounts (`cdc`)
 
 Same idea as `cdx`, ported to Claude Code — with one wrinkle Codex doesn't have. Claude Code's config isn't one directory: it's `~/.claude` *and* a sibling file, `~/.claude.json`, which carries account identity alongside a lot of unrelated local app state. `cdc` re-points both.

@@ -12,10 +12,11 @@
 # during development a mutation that made the filter match everything killed a
 # live app-server and its SSH proxies.
 #
-# Two defences, both required:
+# Two defences:
 #   1. CDX_NO_KILL=1 in the sandbox env below — cdx reports what it would stop
 #      and signals nothing, so even a broken build cannot touch real work.
-#   2. --no-restart on every 'cdx use'. 'use' disconnects every proxy it sees
+#   2. --no-restart on ordinary 'cdx use' calls. One daemon-preserving test
+#      relies on CDX_NO_KILL instead. 'use' disconnects every proxy it sees
 #      by command name regardless of path, which is correct in production
 #      (a changed account makes cached connections stale) and unwanted here.
 # Assertions compare against cdx's rendered output, which contains a literal
@@ -724,6 +725,22 @@ kill "$holder" 2>/dev/null; sleep 1.3
 out="$(cdx "$D" rename one two)"
 it "spares proxies when nothing is stale"; assert_contains "$out" "No running processes were bound"
 it "idle proxy is left alone";             assert_eq "$(kill -0 "$proxy" 2>/dev/null && echo alive)" "alive"
+
+# A profile switch preserves Remote Control only when the daemon's pidfile
+# proves that it owns the live --remote-control server. CDX_NO_KILL turns both
+# the stop and restart into reports, so this cannot touch the real daemon.
+D3="$(store_env remote)"
+mkdir -p "$D3/profiles/main/app-server-daemon" "$D3/profiles/main/app-server-control"
+echo '{"remoteControlEnabled":true}' > "$D3/profiles/main/app-server-daemon/settings.json"
+echo socket > "$D3/profiles/main/app-server-control/hold"
+spawn_named 'codex app-server --remote-control --listen unix://' \
+    'exec 9<"'"$D3"'/profiles/main/app-server-control/hold"; '
+managed="$SPAWN_PID"
+echo "$managed" > "$D3/profiles/main/app-server-daemon/app-server.pid"
+sleep 0.5
+out="$(cdx "$D3" use lab)"
+it "use preserves a managed Remote Control daemon"; assert_contains "$out" "Would restart Remote Control for lab"
+it "the preserving switch still moves profiles";    assert_link "$D3/codex" "$D3/profiles/lab"
 
 # A process bound to a different sandbox must not be dragged in.
 D2="$(store_env proc2)"
