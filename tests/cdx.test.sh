@@ -109,7 +109,13 @@ new_env() {
     make_stub "$d/bin"
     echo 'model="gpt-5"'  > "$d/codex/config.toml"
     echo 'agents-content' > "$d/codex/AGENTS.md"
-    echo 'state-db'       > "$d/codex/state_5.sqlite"
+    python3 - "$d/codex/state_5.sqlite" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("create table threads (id text primary key)")
+db.commit()
+db.close()
+PY
     echo 'memories-db'    > "$d/codex/memories_1.sqlite"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
@@ -299,6 +305,26 @@ it "relinks a clobbered memories db";    assert_link "$D/profiles/personal/memor
 it "and says nothing about it";          assert_eq "$(printf %s "$out" | grep -c 'memories_1')" "0"
 it "the shared memories db is intact";   assert_eq "$([ -f "$S/memories_1.sqlite" ] && [ ! -L "$S/memories_1.sqlite" ] && echo real)" "real"
 it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
+
+# A store file can exist yet be unusable. Linking profiles to that file used
+# to split history silently when Codex recreated a valid private database in
+# the active profile. Refuse all link-producing operations, name a healthy
+# recovery candidate, and leave the active profile pointer untouched.
+echo "${DIM}corrupt shared state${OFF}"
+D="$(store_env corrupt-state)"; S="$D/profiles/.store"
+cp "$S/state_5.sqlite" "$D/healthy-state.sqlite"
+rm "$D/profiles/personal/state_5.sqlite"
+cp "$D/healthy-state.sqlite" "$D/profiles/personal/state_5.sqlite"
+printf 'not a sqlite database\n' > "$S/state_5.sqlite"
+active_before="$(readlink "$D/codex")"
+out="$(cdx "$D" link)"
+it "link reports the corrupt store";     assert_contains "$out" "shared state database is corrupt"
+it "link names a recovery candidate";   assert_contains "$out" "$D/profiles/personal/state_5.sqlite"
+it "link fails instead of relinking";    assert_fails cdx "$D" link
+out="$(cdx "$D" use lab --no-restart)"
+it "use refuses the corrupt store";      assert_contains "$out" "refusing to switch or relink accounts"
+it "use leaves the active profile";      assert_eq "$(readlink "$D/codex")" "$active_before"
+it "list warns without becoming unusable"; assert_contains "$(cdx "$D" list)" "account switching and relinking are disabled"
 
 # -------------------------------------------------------------- rename -----
 echo "${DIM}rename${OFF}"

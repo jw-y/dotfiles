@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -336,11 +337,71 @@ def links_to(path: Path, want: Path) -> bool:
     return path.is_symlink() and os.readlink(path) == str(want)
 
 
+def sqlite_problem(path: Path) -> str | None:
+    """Return why a SQLite database is unusable, or None when it is healthy.
+
+    Existence is not enough for irreplaceable shared state: a zero-filled or
+    otherwise corrupt state_5.sqlite used to count as a valid store target,
+    letting one profile remain linked to garbage while another profile built
+    a private replacement database and silently split account history.
+    """
+    if not path.is_file():
+        return None
+    uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=1)
+        try:
+            row = db.execute("PRAGMA quick_check").fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        return str(exc)
+    if row != ("ok",):
+        return str(row[0] if row else "quick_check returned no result")
+    return None
+
+
+def shared_state_problem() -> str | None:
+    state = STORE / "state_5.sqlite"
+    problem = sqlite_problem(state)
+    if problem is None:
+        return None
+    return f"shared state database is corrupt: {state} ({problem})"
+
+
+def healthy_profile_state_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if not PROFILES.is_dir():
+        return candidates
+    for profile in sorted(PROFILES.iterdir()):
+        state = profile / "state_5.sqlite"
+        if profile.is_dir() and not profile.name.startswith(".") \
+                and state.is_file() and not state.is_symlink() \
+                and sqlite_problem(state) is None:
+            candidates.append(state)
+    return candidates
+
+
+def require_healthy_shared_state() -> None:
+    problem = shared_state_problem()
+    if problem is None:
+        return
+    candidates = healthy_profile_state_candidates()
+    detail = "\n     refusing to switch or relink accounts"
+    if candidates:
+        label = "candidate" if len(candidates) == 1 else "candidates"
+        detail += (f"\n     valid profile recovery {label}: "
+                   + ", ".join(str(path) for path in candidates))
+    die(problem + detail)
+
+
 def link_shared(home: Path) -> None:
     src = shared_src()
     # The store links to nothing: it is the thing being linked to.
     if home == src:
         return
+    if src == STORE:
+        require_healthy_shared_state()
     for name in SHARED_FILES:
         target, link = src / name, home / name
         if not target.exists() or links_to(link, target):
@@ -895,6 +956,8 @@ def list_profiles(argv: list[str]) -> int:
         # the commands that depend on the store refuse outright.
         out(f"\n{C.YELLOW}(no shared store — {PROFILES / 'main'} still holds it; "
             f"'cdx link' explains the fix){C.RESET}")
+    elif problem := shared_state_problem():
+        out(f"\n{C.RED}({problem}; account switching and relinking are disabled){C.RESET}")
     return 0
 
 
