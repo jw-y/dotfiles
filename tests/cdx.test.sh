@@ -30,7 +30,7 @@ CDX="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/cdx"
 [ -x "$CDX" ] || { echo "cannot find bin/cdx next to tests/" >&2; exit 1; }
 
 PASS=0 FAIL=0 CURRENT=""
-ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cdx-test.XXXXXX")"
+ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/cdx-test.XXXXXX")" && pwd -P)"
 SPAWNED=()
 # TERM first, then make sure: a leaked fake would sit in the user's process
 # table looking like a real Codex proxy, and the next 'cdx use' would try to
@@ -109,14 +109,10 @@ new_env() {
     make_stub "$d/bin"
     echo 'model="gpt-5"'  > "$d/codex/config.toml"
     echo 'agents-content' > "$d/codex/AGENTS.md"
-    python3 - "$d/codex/state_5.sqlite" <<'PY'
-import sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
-db.execute("create table threads (id text primary key)")
-db.commit()
-db.close()
-PY
-    echo 'memories-db'    > "$d/codex/memories_1.sqlite"
+    python3 -c 'import sqlite3,sys
+for p in sys.argv[1:]:
+    db=sqlite3.connect(p); db.execute("create table fixture (value text)"); db.close()' \
+        "$d/codex/state_5.sqlite" "$d/codex/memories_1.sqlite"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
     echo "$d"
@@ -145,7 +141,8 @@ legacy_env() {
 # below opts back in against a file:// endpoint it controls.
 cdx() {
     local d="$1"; shift
-    env -i HOME="$d" PATH="$d/bin:/usr/bin:/bin" NO_COLOR=1 TERM=dumb \
+    env -i HOME="$d" PATH="$d/bin:/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp \
+        NO_COLOR=1 TERM=dumb \
         CDX_NO_KILL=1 CDX_USAGE="${CDX_USAGE:-off}" \
         ${CDX_USAGE_ENDPOINT+CDX_USAGE_ENDPOINT="$CDX_USAGE_ENDPOINT"} \
         ${CDX_USAGE_TTL+CDX_USAGE_TTL="$CDX_USAGE_TTL"} \
@@ -174,7 +171,7 @@ D="$(new_env init)"
 out="$(cdx "$D" init -y)"
 it "init reports the new symlink";        assert_contains "$out" "$D/codex -> $D/profiles/main"
 it "init creates the shared store";       assert_contains "$out" "shared store:"
-it "init leaves no stray output";         assert_eq "$(printf %s "$out" | wc -l)" "1"
+it "init leaves no stray output";         assert_eq "$(printf %s "$out" | wc -l | tr -d ' ')" "1"
 it "store holds the real sessions dir";   assert_eq "$([ -d "$D/profiles/.store/sessions" ] && [ ! -L "$D/profiles/.store/sessions" ] && echo real)" "real"
 it "main links into the store";           assert_link "$D/profiles/main/sessions" "$D/profiles/.store/sessions"
 it "active pointer targets a profile";    assert_link "$D/codex" "$D/profiles/main"
@@ -383,7 +380,7 @@ out="$(cdx "$U" list)"
 it "list shows the quota column";        assert_contains "$out" "USED"
 # Widths follow the content, so a long account name must not be truncated and
 # must not leave the columns ragged: every row is the same length as the header.
-it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/tester@/{print index($0,"tester@")}' | sort -u | wc -l)" "1"
+it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/tester@/{print index($0,"tester@")} ' | sort -u | awk 'END {print NR}')" "1"
 # How you signed in is 'chatgpt' on every ordinary account, so it earns no
 # column — but it still has to be visible when it is something else, or an
 # API-key profile would look like a ChatGPT one.
@@ -399,7 +396,8 @@ it "list shows time until the reset";    assert_contains "$out" "(in 3d)"
 it "list shows the wall-clock reset";    assert_contains "$out" "$(python3 -c 'import json,time;print(time.strftime("%b %d %H:%M", time.localtime(json.load(open("'"$U"'/usage.json"))["rate_limit"]["primary_window"]["reset_at"])))')"
 it "live plan wins over the token";      assert_contains "$out" "pro"
 it "the figure is cached per profile";   assert_eq "$(python3 -c 'import json;print(json.load(open("'"$U"'/profiles/lab/.cdx-usage.json"))["used"])')" "42"
-it "the cache is not world-readable";    assert_eq "$(stat -c %a "$U/profiles/lab/.cdx-usage.json")" "600"
+mode="$(stat -c %a "$U/profiles/lab/.cdx-usage.json" 2>/dev/null || stat -f %Lp "$U/profiles/lab/.cdx-usage.json")"
+it "the cache is not world-readable";    assert_eq "$mode" "600"
 
 # Credits. A subscription reports 'has_credits: false' with a zero balance
 # attached — it means "this account does not use credits", NOT "the balance is
@@ -518,7 +516,7 @@ export CDX_USAGE_ENDPOINT="file://$U/usage.json"
 rm -f "$U"/profiles/*/.cdx-usage.json
 out="$(cdx "$U" list --no-usage)"
 it "--no-usage skips the lookup";        assert_eq "$(printf %s "$out" | grep -c '42%')" "0"
-it "--no-usage leaves no cache behind";  assert_eq "$(ls "$U"/profiles/*/.cdx-usage.json 2>/dev/null | wc -l)" "0"
+it "--no-usage leaves no cache behind";  assert_eq "$(ls "$U"/profiles/*/.cdx-usage.json 2>/dev/null | awk 'END {print NR}')" "0"
 it "--refresh is accepted bare";         assert_contains "$(cdx "$U" --refresh)" "42%"
 it "rejects unknown list options";       assert_contains "$(cdx "$U" list --bogus)" "unknown option to 'list'"
 
@@ -564,10 +562,32 @@ it "unknown flags are refused";          assert_contains "$(CDX_USAGE=off cdx "$
 # command has to live where anyone would look for it.
 it "status has its own help";            assert_contains "$(cdx "$U" status -h)" "cdx status [name] [--json]"
 it "help does not run the command";      assert_eq "$(cdx "$U" status -h | grep -c '^Account$')" "0"
-it "every command has help";             assert_eq "$(for c in list status use add app ssh rename rm init link; do cdx "$U" "$c" --help | head -1; done | grep -c '^cdx ')" "10"
+it "every command has help";             assert_eq "$(for c in list status use add app ssh rename rm init link doctor version update; do cdx "$U" "$c" --help | head -1; done | grep -c '^cdx ')" "13"
 # 'cdx add work --help' is asking codex login for its help, not cdx for its
 # own, so only the word straight after the command counts.
 it "help is positional";                 assert_eq "$(cdx "$U" add work --help | grep -c '^cdx add')" "0"
+
+# The updater operates on a copy: even a successful regression test must not
+# rewrite the repository's cdx. CDX_UPDATE_URL is the documented test/mirror
+# escape hatch and exercises the same validation and atomic replacement path.
+mkdir -p "$ROOT/self-update"
+cp "$CDX" "$ROOT/self-update/cdx"
+cp "$CDX" "$ROOT/self-update/latest"
+python3 -c 'import pathlib,sys
+p=pathlib.Path(sys.argv[1]); data=p.read_text();
+p.write_text(data.replace("CDX_VERSION = \"0.1.0\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+    "$ROOT/self-update/latest"
+chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
+update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
+    CDX_UPDATE_URL="file://$ROOT/self-update/latest")
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.0"
+it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
+"${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
+it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"
+
+doctor_json="$(cdx "$U" doctor --json)"
+it "doctor emits valid json";            assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")')" "ok"
+it "doctor checks shared sqlite";        assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;print(all(x["ok"] for x in json.load(sys.stdin)["sqlite"]))')" "True"
 
 # Explicit cache mode fills an empty cache once and then stays local. Auto,
 # which is the real default outside this network-disabled harness, re-fetches

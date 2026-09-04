@@ -210,6 +210,7 @@ class FakeProcesses:
         # pid -> (cmdline, [open paths])
         self.table = table
         self.signalled: list[int] = []
+        self.force_killed: list[int] = []
         self.stubborn: set[int] = set()
 
     def matching(self, pattern):
@@ -226,6 +227,10 @@ class FakeProcesses:
 
     def terminate(self, pid):
         self.signalled.append(pid)
+
+    def force_kill(self, pid):
+        self.force_killed.append(pid)
+        self.stubborn.discard(pid)
 
     def alive(self, pid):
         return pid in self.stubborn
@@ -259,6 +264,21 @@ rc, text, fake = run_stop({100: ELSEWHERE})
 check("a process bound elsewhere is spared", fake.signalled, [])
 check("and the run says nothing happened",
       "No running processes were bound" in text, True)
+
+# Re-selecting the current profile still reconciles app servers. This is the
+# desktop restart case: an older server can remain attached to another profile
+# even though none of its open files live below the currently active one.
+STALE = ("codex app-server --listen unix://stale", [
+    f"{cdx.PROFILES}/lab/app-server-control/server.sock"])
+rc, text, fake = run_stop({100: STALE}, target_profile="personal", dry_run=True)
+check("a cross-profile app server is selected", "100" in text, True)
+check("a stale server dry run signals nothing", fake.signalled, [])
+check("and explains the mismatch", "stale cross-profile app server" in text, True)
+
+TARGET = ("codex app-server --listen unix://current", [
+    f"{cdx.PROFILES}/personal/app-server-control/server.sock"])
+rc, text, fake = run_stop({100: TARGET}, target_profile="personal", dry_run=True)
+check("the target profile's app server is spared", "Would stop" in text, False)
 
 # 'use' changes the account, so every cached remote connection is stale
 # whether or not anything else was stopped.
@@ -307,6 +327,24 @@ finally:
     cdx.time.sleep = _slept
 check("a survivor makes the command fail", rc, 1)
 check("and it waited the full run", len(fake.signalled), 1)
+
+# SIGKILL is only reachable through an explicit force request, after the same
+# graceful wait, and only while the PID still identifies itself as Codex.
+fake = FakeProcesses({100: BOUND})
+fake.stubborn = {100}
+_slept, cdx.time.sleep = cdx.time.sleep, lambda _s: None
+real, cdx.PROCS = cdx.PROCS, fake
+_buf = _io.StringIO()
+try:
+    with _ctx.redirect_stdout(_buf), _ctx.redirect_stderr(_io.StringIO()):
+        rc = cdx.stop_bound_to(OLD, force=True)
+finally:
+    cdx.PROCS = real
+    cdx.time.sleep = _slept
+check("--force still tries SIGTERM first", fake.signalled, [100])
+check("--force hard-kills a verified survivor", fake.force_killed, [100])
+check("a successful force cleanup exits cleanly", rc, 0)
+check("force cleanup is reported", "Force-killing" in _buf.getvalue(), True)
 
 # CDX_NO_KILL is what makes the end-to-end suite safe to run at all: pgrep
 # sees the whole user's process table, so without it a test that stops "the

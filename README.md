@@ -50,14 +50,20 @@ cdx --refresh          # re-ask OpenAI for each account's quota
 cdx init               # one-time: make ~/.codex switchable
 cdx add work           # create an account and log in (device auth over SSH)
 cdx use work           # activate it, restarting clients that cached the old account
+cdx use work --force   # hard-stop verified Codex survivors after graceful timeout
 cdx work resume        # run one command as 'work' without switching
 cdx status work        # inspect one account without switching to it
 cdx ssh baram use work # drive another machine's accounts over SSH
+cdx doctor             # audit new Codex state, SQLite files, and stale clients
+cdx version --check    # see whether GitHub has a newer cdx
+cdx update             # validate and atomically install the newest bin/cdx
 ```
 
 Accounts live in `~/.codex-profiles/<name>`, holding only credentials and logs. Everything shareable — config, conversation history, memories, and the ~1.7 GB of binary and plugin caches — lives once in `~/.codex-profiles/.store`, which is not an account and is symlinked into each one. That keeps each account a few hundred KB, lets `resume` see your work whichever account is active, and means any account can be renamed or deleted without disturbing the rest. `cdx link` rebuilds those symlinks if Codex ever overwrites one.
 
 The listing shows how much of each account's weekly quota is spent, so you can see where to switch before you hit a limit. The figure comes from the same OpenAI endpoint the Codex CLI polls for its own `/status`, asked once per account and cached inside it. A normal listing refreshes figures older than `CDX_USAGE_TTL` (default 900 seconds); an unreachable endpoint falls back to the last known number marked `~`. `--refresh` forces a live reading, `--no-usage` (or `CDX_USAGE=off`) skips quota entirely, and `CDX_USAGE=cache` keeps existing figures without refreshing them. It doubles as a health check — an account whose refresh token has died shows `re-login` rather than a percentage, which token expiry dates cannot tell you, since Codex leaves expired `id_token`s in place on perfectly working accounts.
+
+`cdx` also versions itself. `cdx update` fetches `bin/cdx` from this checkout's GitHub origin, verifies that it is a syntactically valid, versioned cdx release, and replaces the installed script atomically. It refuses to overwrite local edits, reuse a version number for different code, or downgrade unless `--force` is explicit. `cdx doctor` is the companion for Codex changes: it flags top-level storage names that postdate cdx's reviewed policy, checks every SQLite database read-only, and reports app servers attached to the wrong profile without moving or deleting anything. A file being SQLite is intentionally not enough reason to share it—`thread_history_1.sqlite`, for example, is a per-profile projection rather than canonical conversation history.
 
 A percentage is not the only way to run out. An account can sit at 16% and still refuse to work, because an admin-set spend budget is exhausted — every rate-limit field reports fine and only `spend_control.reached` says otherwise. Such an account shows `spend limit` in place of its percentage, is never suggested as the one with the most room, and is called out when you switch to it. `cdx status <name>` gives the long form for any account, active or not: both limits, what the plan reports about credits, and whether the running clients match. Only the Account section follows the name — storage and running clients always describe this machine.
 

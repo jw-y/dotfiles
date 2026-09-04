@@ -23,6 +23,8 @@ python3 3.10+, which is why that trade was acceptable.
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -41,6 +43,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
+CDX_VERSION = "0.1.0"
+DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
 
@@ -103,6 +107,29 @@ SHARED_DATA = ["state_5.sqlite", "session_index.jsonl", "history.jsonl"]
 SHARED_DIRS = ["packages", "plugins", "cache", "skills", "rules", "sessions",
                "archived_sessions", "attachments", "generated_images",
                "visualizations"]
+
+# cdx deliberately has a hybrid layout: credentials and disposable runtime
+# state stay with an account, while config and canonical conversation data are
+# shared.  Codex adds top-level state over time, so silently treating every new
+# name as either private or shared would eventually lose one of those
+# properties.  `cdx doctor` compares the live layout with this dated policy and
+# makes additions visible without moving them.  Patterns below are current
+# rebuildable/runtime state, not candidates for SHARED_DATA.
+STORAGE_POLICY_DATE = "2026-09-04"
+KNOWN_PRIVATE_ENTRIES = {
+    ".cdx-usage.json", ".codex-global-state.json", ".codex-global-state.json.bak",
+    ".personality_migration", ".sandbox_migration", ".tmp", "ambient-suggestions",
+    "app-server-control", "app-server-daemon", "auth.json",
+    "chrome-native-hosts-v2.json", "cloud-config-bundle-cache.json", "computer-use",
+    "dictation-history", "electron", "installation_id", "ipc", "log",
+    "mcp-oauth-locks", "pets", "process_manager", "shell_snapshots", "sqlite",
+    "thread-writer-locks", "tmp", "transcription-history.jsonl",
+    "tui-thread-reference-capabilities", "vendor_imports", "version.json",
+}
+KNOWN_PRIVATE_PATTERNS = (
+    re.compile(r"\.\.codex-global-state\.json\.tmp-.*"),
+    re.compile(r"(?:goals|logs|queue|thread_history)_\d+\.sqlite(?:-(?:shm|wal))?"),
+)
 
 SWITCH_LOCK = PROFILES / ".cdx-switch.lock"
 QUOTA_WARN_PERCENT = int(os.environ.get("CDX_QUOTA_WARN") or 90)
@@ -436,6 +463,114 @@ def link_shared(home: Path) -> None:
             continue
         _unlink(link)
         os.symlink(target, link)
+
+
+def known_profile_entry(name: str) -> bool:
+    """Whether cdx has made an explicit keep/share decision for this name."""
+    if name in KNOWN_PRIVATE_ENTRIES:
+        return True
+    if name in SHARED_FILES + SHARED_DATA + SHARED_DIRS:
+        return True
+    if name in {f"{item}{suffix}" for item in SHARED_FILES + SHARED_DATA
+                for suffix in ("-shm", "-wal")}:
+        return True
+    return any(pattern.fullmatch(name) for pattern in KNOWN_PRIVATE_PATTERNS)
+
+
+def storage_unknowns() -> list[dict[str, str]]:
+    """Top-level state introduced since cdx's storage policy was reviewed.
+
+    Unknowns are diagnostic only.  In particular, do not auto-link an SQLite
+    file: whether it is canonical state or a rebuildable projection cannot be
+    inferred from its extension.
+    """
+    found: list[dict[str, str]] = []
+    roots: list[tuple[str, Path]] = []
+    if STORE.is_dir():
+        roots.append(("store", STORE))
+    if PROFILES.is_dir():
+        roots.extend((entry.name, entry) for entry in sorted(PROFILES.iterdir())
+                     if entry.is_dir() and not entry.name.startswith("."))
+    elif CODEX_LINK.is_dir():
+        roots.append(("main", CODEX_LINK))
+    for profile, root in roots:
+        try:
+            entries = sorted(root.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if known_profile_entry(entry.name):
+                continue
+            kind = "symlink" if entry.is_symlink() else "directory" if entry.is_dir() else "file"
+            found.append({"profile": profile, "name": entry.name, "kind": kind,
+                          "path": str(entry)})
+    return found
+
+
+def sqlite_health() -> list[dict[str, str | bool]]:
+    """Read-only quick checks for every real top-level SQLite database."""
+    checked: list[dict[str, str | bool]] = []
+    seen: set[str] = set()
+    roots = ([STORE] if STORE.is_dir() else [])
+    if PROFILES.is_dir():
+        roots += [entry for entry in sorted(PROFILES.iterdir())
+                  if entry.is_dir() and not entry.name.startswith(".")]
+    elif CODEX_LINK.is_dir():
+        roots.append(CODEX_LINK)
+    for root in roots:
+        try:
+            candidates = sorted(root.glob("*.sqlite"))
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                resolved = str(candidate.resolve(strict=True))
+            except OSError as exc:
+                checked.append({"path": str(candidate), "ok": False, "detail": str(exc)})
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            uri = "file:" + urllib.parse.quote(resolved) + "?mode=ro"
+            try:
+                db = sqlite3.connect(uri, uri=True, timeout=0.25)
+                try:
+                    detail = str(db.execute("PRAGMA quick_check(1)").fetchone()[0])
+                finally:
+                    db.close()
+                checked.append({"path": resolved, "ok": detail == "ok", "detail": detail})
+            except sqlite3.Error as exc:
+                # SQLite may request directory access for locking even in
+                # mode=ro. A sandbox can deny that while still allowing the
+                # database itself to be read. With no live WAL/SHM sidecars,
+                # immutable mode is an equivalent integrity check that does
+                # not attempt lock-file access.
+                sidecars = (Path(resolved + "-wal"), Path(resolved + "-shm"))
+                if str(exc) == "unable to open database file" \
+                        and not any(path.exists() for path in sidecars):
+                    immutable = uri + "&immutable=1"
+                    try:
+                        db = sqlite3.connect(immutable, uri=True, timeout=0.25)
+                        try:
+                            detail = str(db.execute("PRAGMA quick_check(1)").fetchone()[0])
+                        finally:
+                            db.close()
+                        checked.append({"path": resolved, "ok": detail == "ok",
+                                        "detail": detail})
+                        continue
+                    except sqlite3.Error as fallback_exc:
+                        exc = fallback_exc
+                checked.append({"path": resolved, "ok": False, "detail": str(exc)})
+    return checked
+
+
+def codex_version() -> str:
+    try:
+        proc = subprocess.run(["codex", "--version"], capture_output=True, text=True,
+                              timeout=5)
+        return (proc.stdout or proc.stderr).strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def _unlink(path: Path) -> None:
@@ -1050,7 +1185,22 @@ class Processes:
         except OSError:
             pass
 
+    def force_kill(self, pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
     def alive(self, pid: int) -> bool:
+        # kill(pid, 0) also succeeds for a zombie. Treat it as exited: no code
+        # or file handles remain, and only its parent can reap the process-table
+        # entry. Counting zombies as survivors produced false timeout errors.
+        try:
+            tail = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1]
+            if tail.split(None, 1)[0] == "Z":
+                return False
+        except (OSError, IndexError):
+            pass
         try:
             os.kill(pid, 0)
             return True
@@ -1115,7 +1265,6 @@ def app_server_lifecycle(home: Path, server_pids: list[int]) -> AppServerLifecyc
                    if "app-server" in cmd and "--remote-control" in cmd}
     managed_running = managed_pid is not None and managed_pid in server_pids
     configured = remote_control_configured(home)
-
     if not server_pids:
         mode = "stopped"
     elif managed_running:
@@ -1124,14 +1273,12 @@ def app_server_lifecycle(home: Path, server_pids: list[int]) -> AppServerLifecyc
         mode = "unmanaged"
     else:
         mode = "ephemeral"
-
     if remote_pids:
         remote_status = "enabled"
     elif configured:
         remote_status = "configured"
     else:
         remote_status = "off"
-
     return AppServerLifecycle(
         mode=mode,
         remote_status=remote_status,
@@ -1494,7 +1641,8 @@ def cmd_init(argv: list[str]) -> int:
 
 
 # ── stopping bound processes ─────────────────────────────────────────────────
-def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always") -> int:
+def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always",
+                  target_profile: str | None = None, force: bool = False) -> int:
     """Kill running Codex processes whose open files still point inside `old`.
 
     SSH remote proxies need their own rule: they hold anonymous socket fds
@@ -1518,12 +1666,23 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
     killed: list[int] = []
     proxies: list[int] = []
     remote_proxies = 0
+    stale_servers = 0
     for pid in PROCS.matching("[cC]odex"):
         matched = False
         cmd = PROCS.cmdline(pid)
         remote_proxy = "codex app-server proxy" in cmd
         if remote_proxy and proxy_policy == "always":
             matched = True
+        # A repeated `cdx use personal` must also clean up a server left on
+        # `lab`.  Looking only below the old active directory missed exactly
+        # that case: shared SQLite fds resolve into .store, while the stale
+        # server's control socket names a different profile.
+        app_server = "app-server" in cmd and "--listen" in cmd and not remote_proxy
+        if not matched and target_profile and app_server:
+            owner = app_server_profile(pid)
+            if owner not in ("unknown", target_profile):
+                matched = True
+                stale_servers += 1
         if not matched:
             matched = any(target.startswith(old + "/")
                           for target in PROCS.open_paths(pid))
@@ -1548,12 +1707,21 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
     listed = " ".join(str(p) for p in killed)
     if dry_run:
         out(f"{C.YELLOW}  Would stop {len(killed)} process(es): {listed}{C.RESET}")
+        if stale_servers:
+            out(f"{C.YELLOW}  Would remove {stale_servers} stale cross-profile "
+                f"app server(s).{C.RESET}")
         if remote_proxies:
             out(f"{C.YELLOW}  Would disconnect {remote_proxies} SSH remote "
                 f"proxy/proxies.{C.RESET}")
+        if force:
+            out(f"{C.YELLOW}  Would force-kill only verified Codex survivors "
+                f"after the 20-second graceful timeout.{C.RESET}")
         return 0
     out(f"{C.YELLOW}  Stopping {len(killed)} process(es) bound to the old "
         f"profile: {listed}{C.RESET}")
+    if stale_servers:
+        out(f"{C.YELLOW}  Removing {stale_servers} stale cross-profile app "
+            f"server(s).{C.RESET}")
     if remote_proxies:
         out(f"{C.YELLOW}  Disconnecting {remote_proxies} SSH remote proxy/proxies; "
             f"desktop clients should reconnect.{C.RESET}")
@@ -1579,10 +1747,38 @@ def stop_bound_to(old: str, dry_run: bool = False, proxy_policy: str = "always")
         time.sleep(0.1)
         waited = attempt
     if survivors:
+        if force:
+            # Recheck command identity immediately before SIGKILL. A PID that
+            # exited and was reused during the graceful wait must never make
+            # an unrelated process eligible for the hard-stop path.
+            verified = [pid for pid in survivors
+                        if "codex" in PROCS.cmdline(pid).lower()]
+            refused = [pid for pid in survivors if pid not in verified]
+            if refused:
+                sys.stderr.write(
+                    f"{C.RED}cdx: refusing to force-kill PID(s) whose identity "
+                    f"changed: {' '.join(str(p) for p in refused)}{C.RESET}\n")
+                return 1
+            out(f"{C.YELLOW}  Force-killing {len(verified)} verified Codex "
+                f"survivor(s): {' '.join(str(p) for p in verified)}{C.RESET}")
+            for pid in verified:
+                PROCS.force_kill(pid)
+            for _attempt in range(50):
+                survivors = [pid for pid in verified if PROCS.alive(pid)]
+                if not survivors:
+                    break
+                time.sleep(0.1)
+            if not survivors:
+                out(f"{C.GREEN}  All targeted processes exited.{C.RESET}")
+                return 0
+            sys.stderr.write(
+                f"{C.RED}cdx: force-killed but still observable after 5 seconds: "
+                f"{' '.join(str(p) for p in survivors)}{C.RESET}\n")
+            return 1
         sys.stderr.write(f"{C.RED}cdx: {len(survivors)} process(es) did not exit after "
                          f"20 seconds: {' '.join(str(p) for p in survivors)}{C.RESET}\n")
         sys.stderr.write(f"{C.YELLOW}     They were not force-killed; inspect them "
-                         f"and rerun cdx status.{C.RESET}\n")
+                         f"and rerun with --force if appropriate.{C.RESET}\n")
         return 1
     if waited >= 10:
         out(f"{C.YELLOW}  (waited {waited // 10}s for a graceful exit){C.RESET}")
@@ -1670,7 +1866,7 @@ def cmd_use(argv: list[str]) -> int:
         die("use needs a name (try 'cdx' to list)")
     name = argv[0]
     validate_name(name)
-    restart, dry_run = True, False
+    restart, dry_run, force = True, False, False
     for arg in argv[1:]:
         if arg == "--restart":
             restart = True
@@ -1678,8 +1874,12 @@ def cmd_use(argv: list[str]) -> int:
             restart = False
         elif arg == "--dry-run":
             dry_run = True
+        elif arg == "--force":
+            force = True
         else:
             die(f"unknown option to 'use': {arg}")
+    if force and not restart:
+        die("--force cannot be combined with --no-restart")
     if not initialized():
         die(f"run 'cdx init' first — it makes {CODEX_LINK} switchable")
     home = home_of(name)
@@ -1699,7 +1899,7 @@ def cmd_use(argv: list[str]) -> int:
         out(f"{C.YELLOW}Dry run:{C.RESET} would activate {C.CYAN}{name}{C.RESET} "
             f"({CODEX_LINK} -> {home})")
         if restart and old_target:
-            stop_bound_to(old_target, dry_run=True)
+            stop_bound_to(old_target, dry_run=True, target_profile=name, force=force)
             if preserve_remote:
                 restart_remote_control(name)
         else:
@@ -1716,7 +1916,7 @@ def cmd_use(argv: list[str]) -> int:
     report_quota(name, profile_names())
     if restart:
         if old_target:
-            stopped = stop_bound_to(old_target)
+            stopped = stop_bound_to(old_target, target_profile=name, force=force)
             if stopped:
                 return stopped
             if preserve_remote and restart_remote_control(name):
@@ -1946,14 +2146,15 @@ def cmd_ssh(argv: list[str]) -> int:
     if opts:
         ssh_cmd.extend(opts.split())
     # Ship this script to the host and run it there, instead of requiring an
-    # install on every machine. base64 so no quoting survives contact with two
-    # shells; stdin stays free, which is what lets -t carry the prompts.
-    enc = base64.b64encode(SELF.read_bytes()).decode()
+    # install on every machine. Compress before base64: once cdx grew past
+    # zsh's per-argument ceiling, an uncompressed payload failed before SSH
+    # could even start it. stdin stays free, so -t can still carry prompts.
+    enc = base64.b64encode(gzip.compress(SELF.read_bytes())).decode()
     args = "".join(" " + _shell_quote(a) for a in rest)
     # PATH: a non-interactive ssh shell has neither ~/.local/bin nor the codex
     # install dir, and rc files are not sourced, so set it explicitly.
-    remote = (f"f=$(mktemp) && printf %s {enc} | base64 -d > $f && "
-              f'PATH="$HOME/.local/bin:$PATH" python3 $f{args}; '
+    remote = (f"f=$(mktemp) && printf %s {enc} | base64 -d | gzip -d > $f && "
+              f'PATH="$HOME/.local/bin:$PATH" CDX_SSH_SHIPPED=1 python3 $f{args}; '
               "r=$?; rm -f $f; exit $r")
     return subprocess.run([*ssh_cmd, host, remote]).returncode
 
@@ -1973,6 +2174,194 @@ def cmd_run(argv: list[str]) -> "NoReturn":  # type: ignore[valid-type]
     if not (home / "auth.json").is_file():
         sys.stderr.write(f"cdx: '{name}' is not logged in — Codex will prompt.\n")
     os.execvpe("codex", ["codex", *rest], dict(os.environ, CODEX_HOME=str(home)))
+
+
+# ── compatibility and self-update ──────────────────────────────────────────
+def cmd_doctor(argv: list[str]) -> int:
+    as_json = False
+    for arg in argv:
+        if arg == "--json":
+            as_json = True
+        else:
+            die(f"unknown option to 'doctor': {arg}")
+
+    unknowns = storage_unknowns()
+    databases = sqlite_health()
+    bad_databases = [item for item in databases if not item["ok"]]
+    active = active_profile()
+    servers = []
+    for pid in pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://"):
+        owner = app_server_profile(pid)
+        servers.append({"pid": pid, "profile": owner,
+                        "matches_active_profile": owner == active})
+    stale = [server for server in servers if server["profile"] not in (active, "unknown")]
+    healthy = not unknowns and not bad_databases and not stale
+    report = {
+        "cdx_version": CDX_VERSION,
+        "codex_version": codex_version(),
+        "storage_policy_date": STORAGE_POLICY_DATE,
+        "unknown_storage": unknowns,
+        "sqlite": databases,
+        "active_profile": active,
+        "app_servers": servers,
+        "healthy": healthy,
+    }
+    if as_json:
+        out(json.dumps(report, indent=2))
+    else:
+        section("Versions")
+        row("cdx", CDX_VERSION)
+        row("codex", report["codex_version"])
+        row("policy", STORAGE_POLICY_DATE)
+        section("Storage")
+        row("recognized", "yes" if not unknowns else "new entries need review")
+        for item in unknowns:
+            out(f"  {C.YELLOW}{item['profile']}/{item['name']} "
+                f"({item['kind']}){C.RESET}")
+        row("sqlite", f"{len(databases)} checked, {len(bad_databases)} failed")
+        for item in bad_databases:
+            out(f"  {C.RED}{tilde(str(item['path']))}: {item['detail']}{C.RESET}")
+        section("Clients")
+        row("active", active)
+        if not servers:
+            row("app server", "not running")
+        for server in servers:
+            mark = "matches" if server["matches_active_profile"] else "MISMATCH"
+            out(f"  app server    PID {server['pid']} — {server['profile']} ({mark})")
+        out()
+        if healthy:
+            out(f"{C.GREEN}Healthy: cdx recognizes this Codex layout.{C.RESET}")
+        else:
+            out(f"{C.YELLOW}Attention: cdx found compatibility or client-state "
+                f"drift; it changed nothing.{C.RESET}")
+    return 0 if healthy else 1
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        die(f"invalid cdx version '{version}'")
+    return tuple(int(part) for part in version.split("."))  # type: ignore[return-value]
+
+
+def _candidate_version(data: bytes) -> str:
+    match = re.search(rb'^CDX_VERSION = "(\d+\.\d+\.\d+)"$', data, re.MULTILINE)
+    if not match:
+        die("download is not a versioned cdx release")
+    return match.group(1).decode()
+
+
+def _validate_candidate(data: bytes, source: str) -> str:
+    if not data.startswith(b"#!/usr/bin/env python3\n") or b'"""cdx ' not in data[:512]:
+        die(f"download from {source} does not look like cdx")
+    version = _candidate_version(data)
+    try:
+        compile(data, source, "exec")
+    except SyntaxError as exc:
+        die(f"download from {source} is not valid Python: {exc}")
+    return version
+
+
+def _git_update_candidate(force: bool) -> tuple[bytes, str]:
+    """Fetch bin/cdx from this checkout's GitHub origin."""
+    override = os.environ.get("CDX_UPDATE_URL")
+    if override:
+        try:
+            with urllib.request.urlopen(override, timeout=15) as response:
+                return response.read(), override
+        except (OSError, urllib.error.URLError) as exc:
+            die(f"could not fetch cdx update: {exc}")
+
+    root_proc = subprocess.run(["git", "-C", str(SELF.parent), "rev-parse",
+                                "--show-toplevel"], capture_output=True, text=True)
+    if root_proc.returncode != 0:
+        try:
+            with urllib.request.urlopen(DEFAULT_UPDATE_URL, timeout=15) as response:
+                return response.read(), DEFAULT_UPDATE_URL
+        except (OSError, urllib.error.URLError) as exc:
+            die(f"cdx is not in a Git checkout and GitHub could not be reached: {exc}")
+    root = Path(root_proc.stdout.strip())
+    try:
+        relative = SELF.relative_to(root)
+    except ValueError:
+        die(f"cdx resolved outside its Git checkout: {SELF}")
+    remote = os.environ.get("CDX_UPDATE_REMOTE", "origin")
+    branch = os.environ.get("CDX_UPDATE_BRANCH", "main")
+    remote_url = subprocess.run(["git", "-C", str(root), "remote", "get-url", remote],
+                                capture_output=True, text=True)
+    if remote_url.returncode != 0 or "github.com" not in remote_url.stdout:
+        die(f"update remote '{remote}' is not a GitHub remote")
+    dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--",
+                            str(relative)], capture_output=True, text=True)
+    if dirty.stdout.strip() and not force:
+        die(f"{relative} has local changes; commit them or rerun 'cdx update --force'")
+    fetched = subprocess.run(["git", "-C", str(root), "fetch", "--quiet", remote, branch],
+                             capture_output=True, text=True)
+    if fetched.returncode != 0:
+        die(f"could not fetch {remote}/{branch}: {fetched.stderr.strip()}")
+    shown = subprocess.run(["git", "-C", str(root), "show", f"FETCH_HEAD:{relative}"],
+                           capture_output=True)
+    if shown.returncode != 0:
+        die(f"{relative} does not exist on {remote}/{branch}")
+    return shown.stdout, f"{remote}/{branch}:{relative}"
+
+
+def cmd_update(argv: list[str]) -> int:
+    check_only = False
+    force = False
+    for arg in argv:
+        if arg == "--check":
+            check_only = True
+        elif arg == "--force":
+            force = True
+        else:
+            die(f"unknown option to 'update': {arg}")
+    if os.environ.get("CDX_SSH_SHIPPED") == "1":
+        die("'cdx ssh <host>' already ships the current local cdx; run the "
+            "host's installed cdx directly to update its checkout")
+
+    candidate, source = _git_update_candidate(force)
+    remote_version = _validate_candidate(candidate, source)
+    local_data = SELF.read_bytes()
+    local_hash = hashlib.sha256(local_data).hexdigest()
+    remote_hash = hashlib.sha256(candidate).hexdigest()
+    if local_hash == remote_hash:
+        out(f"cdx {CDX_VERSION} is up to date ({local_hash[:12]}).")
+        return 0
+    if _version_tuple(remote_version) < _version_tuple(CDX_VERSION) and not force:
+        die(f"GitHub has older cdx {remote_version}; refusing to downgrade {CDX_VERSION}")
+    if remote_version == CDX_VERSION and not force:
+        die(f"GitHub changed cdx {remote_version} without changing CDX_VERSION; "
+            "fix the release version or use --force")
+    if check_only:
+        out(f"cdx {remote_version} is available (installed: {CDX_VERSION}).")
+        return 0
+
+    mode = stat.S_IMODE(SELF.stat().st_mode)
+    temp = SELF.with_name(SELF.name + f".update-{os.getpid()}")
+    try:
+        with temp.open("xb") as handle:
+            handle.write(candidate)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, SELF)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+    out(f"Updated cdx {CDX_VERSION} -> {remote_version} from {source} "
+        f"({remote_hash[:12]}).")
+    return 0
+
+
+def cmd_version(argv: list[str]) -> int:
+    if not argv:
+        out(f"cdx {CDX_VERSION}")
+        return 0
+    if argv == ["--check"]:
+        return cmd_update(["--check"])
+    die("usage: cdx version [--check]")
 
 
 # ── help ─────────────────────────────────────────────────────────────────────
@@ -2003,6 +2392,12 @@ re-pointing it and no client needs configuring.
 {C.CYAN}Setup and repair{C.RESET}
   cdx init                 one-time: make {tilde(str(CODEX_LINK))} a switchable link
   cdx link                 rebuild every account's links to the store
+  cdx doctor               audit Codex storage and running profile compatibility
+
+{C.CYAN}Keeping cdx current{C.RESET}
+  cdx version              show the installed cdx release
+  cdx version --check      check GitHub for a newer release
+  cdx update               fetch and atomically install the latest bin/cdx
 
 {C.CYAN}Options{C.RESET}
   --refresh                take a live quota reading instead of the cached one
@@ -2010,11 +2405,15 @@ re-pointing it and no client needs configuring.
   --json                   machine-readable listing (also 'status --json')
   use --no-restart         leave running clients on the old account
   use --dry-run            show what would change, and change nothing
+  use --force              hard-stop verified Codex survivors after 20 seconds
   add <name> [args...]     extra arguments pass through to 'codex login'
   app <name> [dir] --stock reuse the app's existing ChatGPT desktop login
   init -y / rm <name> -y   skip the confirmation prompt
   status <name>            report that account instead of the active one
   status --json            machine-readable, with the raw quota figures
+  doctor --json            machine-readable compatibility report
+  update --check           report an update without installing it
+  update --force           replace local edits or allow a downgrade
 
 {C.CYAN}Layout{C.RESET}
   accounts  {tilde(str(PROFILES))}/<name>
@@ -2065,7 +2464,7 @@ SUB_HELP = {
 
   --json       machine-readable, with raw percentages and epochs, plus
                'reported_profile' alongside 'active_profile'""",
-    "use": """cdx use <name> [--no-restart] [--dry-run]
+    "use": """cdx use <name> [--no-restart] [--dry-run] [--force]
 
   Point ~/.codex at <name>, which switches every Codex client on this
   machine at once, then stop the processes still bound to the old account so
@@ -2078,7 +2477,8 @@ SUB_HELP = {
   quota or cannot run at all, naming the account with the most room.
 
   --no-restart  leave running clients on the old account
-  --dry-run     show what would change, change nothing""",
+  --dry-run     show what would change, change nothing
+  --force       SIGKILL verified Codex processes that survive SIGTERM for 20s""",
     "add": """cdx add <name> [args...]
 
   Create <name> and log in. Extra arguments pass through to 'codex login';
@@ -2123,6 +2523,26 @@ SUB_HELP = {
   if Codex overwrites a link with a real file, or a link is left pointing
   somewhere stale. An account's own data is never replaced — it is reported
   and left alone.""",
+    "doctor": """cdx doctor [--json]
+
+  Compare the live Codex home layout with cdx's dated storage policy, run
+  read-only SQLite quick checks, and report app servers bound to another
+  profile. Unknown files are reported but never moved or linked automatically.
+
+  --json       machine-readable compatibility report""",
+    "version": """cdx version [--check]
+
+  Print cdx's embedded release version. --check fetches the latest bin/cdx
+  from the checkout's GitHub origin and reports whether an update is ready.""",
+    "update": """cdx update [--check] [--force]
+
+  Fetch bin/cdx from the current Git checkout's GitHub origin/main, validate
+  its identity, Python syntax and embedded version, then replace this script
+  atomically. Refuses to overwrite local bin/cdx edits or reuse a release
+  number unless --force is explicit.
+
+  --check      report what is available without installing it
+  --force      overwrite local edits or permit a downgrade""",
 }
 
 
@@ -2153,7 +2573,7 @@ def main(argv: list[str]) -> int:
     # moment that dir moves — a hand-run migration, a renamed store —
     # resolving it fails. Demanding codex here would put the only fix on the
     # far side of the thing that needs fixing. cmd_link shells out to nothing.
-    if command != "link" and not shutil.which("codex"):
+    if command not in ("link", "doctor", "version", "update") and not shutil.which("codex"):
         die("codex is not on PATH")
 
     if command in ("", "list", "ls"):
@@ -2172,6 +2592,12 @@ def main(argv: list[str]) -> int:
         return cmd_app(rest)
     if command == "status":
         return cmd_status(rest)
+    if command == "doctor":
+        return cmd_doctor(rest)
+    if command == "version":
+        return cmd_version(rest)
+    if command == "update":
+        return cmd_update(rest)
     if command == "ssh":
         return cmd_ssh(rest)
     if command in ("rename", "mv"):
