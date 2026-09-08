@@ -279,7 +279,8 @@ rm -f "$D/profiles/lab/AGENTS.md"                                               
 cdx "$D" link >/dev/null
 it "repairs a link Codex overwrote";      assert_link "$D/profiles/lab/config.toml" "$S/config.toml"
 it "repairs a dangling link";             assert_link "$D/profiles/lab/sessions" "$S/sessions"
-it "repairs a stale link";                assert_link "$D/profiles/lab/state_5.sqlite" "$S/state_5.sqlite"
+it "does not create shared state links";  assert_link "$D/profiles/lab/state_5.sqlite" "$D/profiles/main/state_5.sqlite"
+it "doctor rejects legacy state links";  assert_eq "$(cdx "$D" doctor --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["unsafe_sqlite_links"]))')" "1"
 it "recreates a missing link";            assert_link "$D/profiles/lab/AGENTS.md" "$S/AGENTS.md"
 it "repaired data reads correctly";       assert_eq "$(cat "$D/profiles/lab/config.toml")" 'model="gpt-5"'
 
@@ -287,41 +288,27 @@ echo 'private-db' > "$D/profiles/personal/state_5.sqlite.tmp"
 rm -f "$D/profiles/personal/state_5.sqlite"
 mv "$D/profiles/personal/state_5.sqlite.tmp" "$D/profiles/personal/state_5.sqlite"
 out="$(cdx "$D" link)"
-it "refuses to clobber private history"; assert_contains "$out" "is this profile's own"
+it "does not relink private state";      assert_eq "$(printf %s "$out" | grep -c 'state_5')" "0"
 it "private history survives link";      assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
 
-# memories_1.sqlite is the exception among the sqlite files: Codex rewrites it
-# atomically, so a real file here is the app-server having clobbered the link,
-# not private data. Guarding it the way state_5.sqlite is guarded left the
-# profile permanently unlinked, since the next app-server recreated the file.
+# Every SQLite database stays private even when Codex can rebuild it.
 echo 'clobbered-by-codex' > "$D/profiles/personal/memories_1.sqlite.tmp"
 rm -f "$D/profiles/personal/memories_1.sqlite"
 mv "$D/profiles/personal/memories_1.sqlite.tmp" "$D/profiles/personal/memories_1.sqlite"
 out="$(cdx "$D" link)"
-it "relinks a clobbered memories db";    assert_link "$D/profiles/personal/memories_1.sqlite" "$S/memories_1.sqlite"
+it "keeps a private memories db";       assert_eq "$(cat "$D/profiles/personal/memories_1.sqlite")" "clobbered-by-codex"
 it "and says nothing about it";          assert_eq "$(printf %s "$out" | grep -c 'memories_1')" "0"
-it "the shared memories db is intact";   assert_eq "$([ -f "$S/memories_1.sqlite" ] && [ ! -L "$S/memories_1.sqlite" ] && echo real)" "real"
+it "no shared memories db is created";  assert_eq "$([ -e "$S/memories_1.sqlite" ] && echo present || echo absent)" "absent"
 it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
 
-# A store file can exist yet be unusable. Linking profiles to that file used
-# to split history silently when Codex recreated a valid private database in
-# the active profile. Refuse all link-producing operations, name a healthy
-# recovery candidate, and leave the active profile pointer untouched.
-echo "${DIM}corrupt shared state${OFF}"
-D="$(store_env corrupt-state)"; S="$D/profiles/.store"
-cp "$S/state_5.sqlite" "$D/healthy-state.sqlite"
-rm "$D/profiles/personal/state_5.sqlite"
-cp "$D/healthy-state.sqlite" "$D/profiles/personal/state_5.sqlite"
-printf 'not a sqlite database\n' > "$S/state_5.sqlite"
-active_before="$(readlink "$D/codex")"
-out="$(cdx "$D" link)"
-it "link reports the corrupt store";     assert_contains "$out" "shared state database is corrupt"
-it "link names a recovery candidate";   assert_contains "$out" "$D/profiles/personal/state_5.sqlite"
-it "link fails instead of relinking";    assert_fails cdx "$D" link
-out="$(cdx "$D" use lab --no-restart)"
-it "use refuses the corrupt store";      assert_contains "$out" "refusing to switch or relink accounts"
-it "use leaves the active profile";      assert_eq "$(readlink "$D/codex")" "$active_before"
-it "list warns without becoming unusable"; assert_contains "$(cdx "$D" list)" "account switching and relinking are disabled"
+# Corrupt profile state is visible to doctor, but cannot poison another
+# profile because state databases are no longer linked together.
+echo "${DIM}corrupt profile state${OFF}"
+D="$(store_env corrupt-state)"
+printf 'not a sqlite database\n' > "$D/profiles/main/state_5.sqlite"
+doctor_json="$(cdx "$D" doctor --json)"
+it "doctor reports corrupt local state"; assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(any(not x["ok"] and x["path"].endswith("/main/state_5.sqlite") for x in d["sqlite"]))')" "True"
+it "another profile remains switchable"; assert_contains "$(cdx "$D" use lab --no-restart)" "lab is now active"
 
 # -------------------------------------------------------------- rename -----
 echo "${DIM}rename${OFF}"
@@ -575,19 +562,19 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.0\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.1\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.0"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.1"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"
 
 doctor_json="$(cdx "$U" doctor --json)"
 it "doctor emits valid json";            assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")')" "ok"
-it "doctor checks shared sqlite";        assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;print(all(x["ok"] for x in json.load(sys.stdin)["sqlite"]))')" "True"
+it "doctor checks every sqlite db";      assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;print(all(x["ok"] for x in json.load(sys.stdin)["sqlite"]))')" "True"
 
 # Explicit cache mode fills an empty cache once and then stays local. Auto,
 # which is the real default outside this network-disabled harness, re-fetches

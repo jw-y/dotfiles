@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.0"
+CDX_VERSION = "0.1.1"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -70,31 +70,24 @@ CODEX_LINK = Path(os.environ.get("CDX_CODEX_LINK")
 STORE = PROFILES / ".store"
 
 # Config, shared so settings live in one place, not N copies. Safe to replace
-# with a link if a profile has its own: nothing here is unrecoverable.
-#
-# memories_1.sqlite sits here rather than with the history below because Codex
-# rewrites it the same way it rewrites config.toml — atomically, temp file
-# renamed over the target, which destroys the symlink. Treating it as history
-# meant link_shared saw a real file, assumed private conversations, and
-# refused; the app-server then recreated it after every relink, so the profile
-# could never rejoin the store. It holds a job queue that Codex rebuilds, not
-# anything a user typed.
+# with a link if a profile has its own: nothing here is unrecoverable. SQLite
+# databases are excluded even when rebuildable: their WAL/SHM siblings make a
+# file-level symlink unsafe.
 SHARED_FILES = ["config.toml", "AGENTS.md", "AGENTS.override.md",
                 "instructions.md", "custom-instructions.md",
-                "models_cache.json", "memories_1.sqlite"]
+                "models_cache.json"]
 
 # Same idea, but these hold irreplaceable history, so a real file is never
-# overwritten to make room for the link. state_5.sqlite is the index 'resume'
-# reads; without it, shared sessions/ transcripts exist but stay invisible.
-# Their -wal/-shm siblings need no linking: sqlite creates those next to the
-# resolved path, which is the shared original.
-#
-# session_index.jsonl and history.jsonl belong here for a subtler reason: the
+# overwritten to make room for the link. session_index.jsonl and history.jsonl
+# belong here for a subtler reason: the
 # names you give threads and the prompts you have typed live *only* in these
-# files. state_5.sqlite carries auto-generated titles but leaves its 'name'
-# column empty, so leaving these per-profile split your own thread names by
-# whichever account happened to be active when you set them.
-SHARED_DATA = ["state_5.sqlite", "session_index.jsonl", "history.jsonl"]
+# files.
+#
+# state_5.sqlite must stay profile-local. SQLite derives its -wal and -shm
+# paths from the spelling used to open the database, not from the symlink's
+# resolved target. Linking only state_5.sqlite therefore splits one database
+# between .store and a profile, eventually producing "file is not a database".
+SHARED_DATA = ["session_index.jsonl", "history.jsonl"]
 
 # Version-keyed download caches, identical for every account: the Codex binary
 # (packages, ~300M) and the plugin runtime (plugins, ~350M). Sharing these is
@@ -115,7 +108,7 @@ SHARED_DIRS = ["packages", "plugins", "cache", "skills", "rules", "sessions",
 # properties.  `cdx doctor` compares the live layout with this dated policy and
 # makes additions visible without moving them.  Patterns below are current
 # rebuildable/runtime state, not candidates for SHARED_DATA.
-STORAGE_POLICY_DATE = "2026-09-04"
+STORAGE_POLICY_DATE = "2026-09-08"
 KNOWN_PRIVATE_ENTRIES = {
     ".cdx-usage.json", ".codex-global-state.json", ".codex-global-state.json.bak",
     ".personality_migration", ".sandbox_migration", ".tmp", "ambient-suggestions",
@@ -128,7 +121,7 @@ KNOWN_PRIVATE_ENTRIES = {
 }
 KNOWN_PRIVATE_PATTERNS = (
     re.compile(r"\.\.codex-global-state\.json\.tmp-.*"),
-    re.compile(r"(?:goals|logs|queue|thread_history)_\d+\.sqlite(?:-(?:shm|wal))?"),
+    re.compile(r"(?:goals|logs|memories|queue|state|thread_history)_\d+\.sqlite(?:-(?:shm|wal))?"),
 )
 
 SWITCH_LOCK = PROFILES / ".cdx-switch.lock"
@@ -364,71 +357,11 @@ def links_to(path: Path, want: Path) -> bool:
     return path.is_symlink() and os.readlink(path) == str(want)
 
 
-def sqlite_problem(path: Path) -> str | None:
-    """Return why a SQLite database is unusable, or None when it is healthy.
-
-    Existence is not enough for irreplaceable shared state: a zero-filled or
-    otherwise corrupt state_5.sqlite used to count as a valid store target,
-    letting one profile remain linked to garbage while another profile built
-    a private replacement database and silently split account history.
-    """
-    if not path.is_file():
-        return None
-    uri = "file:" + urllib.parse.quote(str(path), safe="/") + "?mode=ro"
-    try:
-        db = sqlite3.connect(uri, uri=True, timeout=1)
-        try:
-            row = db.execute("PRAGMA quick_check").fetchone()
-        finally:
-            db.close()
-    except sqlite3.Error as exc:
-        return str(exc)
-    if row != ("ok",):
-        return str(row[0] if row else "quick_check returned no result")
-    return None
-
-
-def shared_state_problem() -> str | None:
-    state = STORE / "state_5.sqlite"
-    problem = sqlite_problem(state)
-    if problem is None:
-        return None
-    return f"shared state database is corrupt: {state} ({problem})"
-
-
-def healthy_profile_state_candidates() -> list[Path]:
-    candidates: list[Path] = []
-    if not PROFILES.is_dir():
-        return candidates
-    for profile in sorted(PROFILES.iterdir()):
-        state = profile / "state_5.sqlite"
-        if profile.is_dir() and not profile.name.startswith(".") \
-                and state.is_file() and not state.is_symlink() \
-                and sqlite_problem(state) is None:
-            candidates.append(state)
-    return candidates
-
-
-def require_healthy_shared_state() -> None:
-    problem = shared_state_problem()
-    if problem is None:
-        return
-    candidates = healthy_profile_state_candidates()
-    detail = "\n     refusing to switch or relink accounts"
-    if candidates:
-        label = "candidate" if len(candidates) == 1 else "candidates"
-        detail += (f"\n     valid profile recovery {label}: "
-                   + ", ".join(str(path) for path in candidates))
-    die(problem + detail)
-
-
 def link_shared(home: Path) -> None:
     src = shared_src()
     # The store links to nothing: it is the thing being linked to.
     if home == src:
         return
-    if src == STORE:
-        require_healthy_shared_state()
     for name in SHARED_FILES:
         target, link = src / name, home / name
         if not target.exists() or links_to(link, target):
@@ -1091,8 +1024,6 @@ def list_profiles(argv: list[str]) -> int:
         # the commands that depend on the store refuse outright.
         out(f"\n{C.YELLOW}(no shared store — {PROFILES / 'main'} still holds it; "
             f"'cdx link' explains the fix){C.RESET}")
-    elif problem := shared_state_problem():
-        out(f"\n{C.RED}({problem}; account switching and relinking are disabled){C.RESET}")
     return 0
 
 
@@ -1418,6 +1349,8 @@ def cmd_status(argv: list[str]) -> int:
                     f"  {'app server':<13} PID {pid} — {owner} {C.RED}(MISMATCH){C.RESET}")
                 mismatch = True
 
+    duplicate_servers = sum(owner == active for _, owner in server_rows) > 1
+
     if not as_json:
         section("Account")
         if subject == active:
@@ -1471,7 +1404,11 @@ def cmd_status(argv: list[str]) -> int:
         row("desktop", "not observable from this host")
         out()
 
-    if mismatch:
+    if duplicate_servers:
+        status_word, color = "duplicate-servers", C.RED
+        message = ("DUPLICATE APP SERVERS — run "
+                   f"'cdx use {active} --force' to collapse stale writers.")
+    elif mismatch:
         status_word, color = "mismatch", C.RED
         message = f"MISMATCH — run 'cdx use {active}' to refresh Codex and remote clients."
     elif not server_pids:
@@ -1495,8 +1432,11 @@ def cmd_status(argv: list[str]) -> int:
                           "credits": c.get("credits")}
         except Exception:
             quota_json = None
-        recommended = f"cdx use {active}" if status_word == "mismatch" else (
-            "codex remote-control start" if status_word == "remote-conflict" else None)
+        recommended = (f"cdx use {active} --force"
+                       if status_word == "duplicate-servers" else
+                       f"cdx use {active}" if status_word == "mismatch" else
+                       "codex remote-control start"
+                       if status_word == "remote-conflict" else None)
         out(json.dumps({
             "active_profile": active,
             "reported_profile": subject,
@@ -2195,7 +2135,16 @@ def cmd_doctor(argv: list[str]) -> int:
         servers.append({"pid": pid, "profile": owner,
                         "matches_active_profile": owner == active})
     stale = [server for server in servers if server["profile"] not in (active, "unknown")]
-    healthy = not unknowns and not bad_databases and not stale
+    duplicate_servers = sum(server["matches_active_profile"] for server in servers) > 1
+    unsafe_sqlite_links = []
+    if PROFILES.is_dir():
+        for profile in sorted(PROFILES.iterdir()):
+            if not profile.is_dir() or profile.name.startswith("."):
+                continue
+            unsafe_sqlite_links.extend(str(path) for path in sorted(profile.glob("*.sqlite"))
+                                       if path.is_symlink())
+    healthy = (not unknowns and not bad_databases and not stale
+               and not duplicate_servers and not unsafe_sqlite_links)
     report = {
         "cdx_version": CDX_VERSION,
         "codex_version": codex_version(),
@@ -2204,6 +2153,8 @@ def cmd_doctor(argv: list[str]) -> int:
         "sqlite": databases,
         "active_profile": active,
         "app_servers": servers,
+        "duplicate_app_servers": duplicate_servers,
+        "unsafe_sqlite_links": unsafe_sqlite_links,
         "healthy": healthy,
     }
     if as_json:
@@ -2221,6 +2172,9 @@ def cmd_doctor(argv: list[str]) -> int:
         row("sqlite", f"{len(databases)} checked, {len(bad_databases)} failed")
         for item in bad_databases:
             out(f"  {C.RED}{tilde(str(item['path']))}: {item['detail']}{C.RESET}")
+        for path in unsafe_sqlite_links:
+            out(f"  {C.RED}{tilde(path)}: unsafe SQLite symlink; keep databases "
+                f"profile-local{C.RESET}")
         section("Clients")
         row("active", active)
         if not servers:
@@ -2228,6 +2182,8 @@ def cmd_doctor(argv: list[str]) -> int:
         for server in servers:
             mark = "matches" if server["matches_active_profile"] else "MISMATCH"
             out(f"  app server    PID {server['pid']} — {server['profile']} ({mark})")
+        if duplicate_servers:
+            row("client issue", f"{C.RED}multiple writers on active profile{C.RESET}")
         out()
         if healthy:
             out(f"{C.GREEN}Healthy: cdx recognizes this Codex layout.{C.RESET}")
