@@ -303,8 +303,11 @@ it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/
 
 # Consolidation uses Codex's sqlite_home setting and archives every old
 # per-profile database or sidecar. No live DB is represented by a symlink.
+echo 'broken rebuildable log db' > "$D/profiles/personal/logs_2.sqlite"
 out="$(cdx "$D" share-sqlite)"
 it "share-sqlite configures the store"; assert_contains "$out" "configured sqlite_home = $S"
+it "corrupt logs do not block migration"; assert_contains "$out" "skipping unhealthy rebuildable database logs_2.sqlite"
+it "corrupt logs are left to Codex";    assert_eq "$([ -e "$S/logs_2.sqlite" ] && echo present || echo absent)" "absent"
 it "the setting is shared by profiles"; assert_contains "$(cat "$S/config.toml")" "sqlite_home = \"$S\""
 it "legacy state links are gone";       assert_eq "$(find "$D/profiles" -mindepth 2 -maxdepth 2 -name '*.sqlite' -type l | wc -l | tr -d ' ')" "0"
 it "private databases were archived";  assert_eq "$(find "$D/profiles/.recovery-archive" -name state_5.sqlite | wc -l | tr -d ' ')" "2"
@@ -571,12 +574,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.2\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.3\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.2"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.3"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"

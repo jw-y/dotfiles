@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.2"
+CDX_VERSION = "0.1.3"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -2174,6 +2174,7 @@ def cmd_share_sqlite(argv: list[str]) -> int:
     os.chmod(destination, 0o700)
 
     copied: list[str] = []
+    skipped: list[str] = []
     for name, sources in sorted(candidates.items()):
         target = destination / name
         if target.exists():
@@ -2193,7 +2194,11 @@ def cmd_share_sqlite(argv: list[str]) -> int:
                 healthy_source = source
                 break
         if healthy_source is None:
-            die(f"no healthy source found for {name}; nothing was archived")
+            if name in ("state_5.sqlite", "memories_1.sqlite"):
+                die(f"no healthy source found for canonical {name}; nothing was archived")
+            skipped.append(name)
+            out(f"  skipping unhealthy rebuildable database {name}")
+            continue
         _sqlite_backup(healthy_source, target)
         copied.append(name)
 
@@ -2216,6 +2221,8 @@ def cmd_share_sqlite(argv: list[str]) -> int:
     link_shared(active_home)
     out(f"  configured sqlite_home = {destination}")
     out(f"  copied {len(copied)} database(s); archived {len(archived)} old file(s)")
+    if skipped:
+        out(f"  Codex will recreate: {', '.join(skipped)}")
     if archived:
         out(f"  recovery archive: {archive}")
     out("  Desktop clients may reconnect now.")
