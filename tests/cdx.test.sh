@@ -282,7 +282,7 @@ it "repairs a dangling link";             assert_link "$D/profiles/lab/sessions"
 it "does not create shared state links";  assert_link "$D/profiles/lab/state_5.sqlite" "$D/profiles/main/state_5.sqlite"
 it "doctor rejects legacy state links";  assert_eq "$(cdx "$D" doctor --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["unsafe_sqlite_links"]))')" "1"
 it "recreates a missing link";            assert_link "$D/profiles/lab/AGENTS.md" "$S/AGENTS.md"
-it "repaired data reads correctly";       assert_eq "$(cat "$D/profiles/lab/config.toml")" 'model="gpt-5"'
+it "repaired data reads correctly";       assert_contains "$(cat "$D/profiles/lab/config.toml")" 'model="gpt-5"'
 
 echo 'private-db' > "$D/profiles/personal/state_5.sqlite.tmp"
 rm -f "$D/profiles/personal/state_5.sqlite"
@@ -298,8 +298,17 @@ mv "$D/profiles/personal/memories_1.sqlite.tmp" "$D/profiles/personal/memories_1
 out="$(cdx "$D" link)"
 it "keeps a private memories db";       assert_eq "$(cat "$D/profiles/personal/memories_1.sqlite")" "clobbered-by-codex"
 it "and says nothing about it";          assert_eq "$(printf %s "$out" | grep -c 'memories_1')" "0"
-it "no shared memories db is created";  assert_eq "$([ -e "$S/memories_1.sqlite" ] && echo present || echo absent)" "absent"
+it "the initial memories db is centralized"; assert_eq "$([ -e "$S/memories_1.sqlite" ] && echo present || echo absent)" "present"
 it "state_5 is still guarded";           assert_eq "$(cat "$D/profiles/personal/state_5.sqlite")" "private-db"
+
+# Consolidation uses Codex's sqlite_home setting and archives every old
+# per-profile database or sidecar. No live DB is represented by a symlink.
+out="$(cdx "$D" share-sqlite)"
+it "share-sqlite configures the store"; assert_contains "$out" "configured sqlite_home = $S"
+it "the setting is shared by profiles"; assert_contains "$(cat "$S/config.toml")" "sqlite_home = \"$S\""
+it "legacy state links are gone";       assert_eq "$(find "$D/profiles" -mindepth 2 -maxdepth 2 -name '*.sqlite' -type l | wc -l | tr -d ' ')" "0"
+it "private databases were archived";  assert_eq "$(find "$D/profiles/.recovery-archive" -name state_5.sqlite | wc -l | tr -d ' ')" "2"
+it "doctor accepts the SQLite layout";  assert_eq "$(cdx "$D" doctor --json | python3 -c 'import json,sys;d=json.load(sys.stdin);print(bool(d["sqlite_home"]) and not d["unsafe_sqlite_links"] and all(x["ok"] for x in d["sqlite"]))')" "True"
 
 # Corrupt profile state is visible to doctor, but cannot poison another
 # profile because state databases are no longer linked together.
@@ -549,7 +558,7 @@ it "unknown flags are refused";          assert_contains "$(CDX_USAGE=off cdx "$
 # command has to live where anyone would look for it.
 it "status has its own help";            assert_contains "$(cdx "$U" status -h)" "cdx status [name] [--json]"
 it "help does not run the command";      assert_eq "$(cdx "$U" status -h | grep -c '^Account$')" "0"
-it "every command has help";             assert_eq "$(for c in list status use add app ssh rename rm init link doctor version update; do cdx "$U" "$c" --help | head -1; done | grep -c '^cdx ')" "13"
+it "every command has help";             assert_eq "$(for c in list status use add app ssh rename rm init link share-sqlite doctor version update; do cdx "$U" "$c" --help | head -1; done | grep -c '^cdx ')" "14"
 # 'cdx add work --help' is asking codex login for its help, not cdx for its
 # own, so only the word straight after the command counts.
 it "help is positional";                 assert_eq "$(cdx "$U" add work --help | grep -c '^cdx add')" "0"
@@ -562,12 +571,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.1\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.2\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.1"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.2"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"

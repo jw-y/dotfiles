@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.1"
+CDX_VERSION = "0.1.2"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -83,10 +83,11 @@ SHARED_FILES = ["config.toml", "AGENTS.md", "AGENTS.override.md",
 # names you give threads and the prompts you have typed live *only* in these
 # files.
 #
-# state_5.sqlite must stay profile-local. SQLite derives its -wal and -shm
-# paths from the spelling used to open the database, not from the symlink's
-# resolved target. Linking only state_5.sqlite therefore splits one database
-# between .store and a profile, eventually producing "file is not a database".
+# SQLite databases are shared through Codex's sqlite_home setting, never by
+# symlinking individual database files. SQLite derives its -wal and -shm paths
+# from the spelling used to open the database; linking only the main file can
+# split one database across directories and eventually produce
+# "file is not a database".
 SHARED_DATA = ["session_index.jsonl", "history.jsonl"]
 
 # Version-keyed download caches, identical for every account: the Codex binary
@@ -444,7 +445,10 @@ def sqlite_health() -> list[dict[str, str | bool]]:
     """Read-only quick checks for every real top-level SQLite database."""
     checked: list[dict[str, str | bool]] = []
     seen: set[str] = set()
-    roots = ([STORE] if STORE.is_dir() else [])
+    configured = configured_sqlite_home()
+    roots = ([configured] if configured and configured.is_dir() else [])
+    if STORE.is_dir() and STORE not in roots:
+        roots.append(STORE)
     if PROFILES.is_dir():
         roots += [entry for entry in sorted(PROFILES.iterdir())
                   if entry.is_dir() and not entry.name.startswith(".")]
@@ -511,6 +515,108 @@ def _unlink(path: Path) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+def configured_sqlite_home() -> Path | None:
+    """Return the absolute sqlite_home selected in the shared config.
+
+    cdx writes an absolute path, so every client on a host resolves the same
+    directory regardless of its working directory. A hand-written relative
+    value is deliberately left unresolved here because Codex resolves it from
+    each process's cwd and therefore cannot be a reliable shared location.
+    """
+    config = shared_src() / "config.toml"
+    try:
+        lines = config.read_text().splitlines()
+    except OSError:
+        return None
+    in_top_level = True
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_top_level = False
+        if not in_top_level:
+            continue
+        match = re.match(r'^sqlite_home\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$',
+                         stripped)
+        if match:
+            try:
+                value = json.loads('"' + match.group(1) + '"')
+            except json.JSONDecodeError:
+                return None
+            path = Path(os.path.expanduser(value))
+            return path if path.is_absolute() else None
+    return None
+
+
+def set_configured_sqlite_home(path: Path) -> None:
+    """Set the top-level sqlite_home key without rewriting the user's TOML."""
+    config = shared_src() / "config.toml"
+    try:
+        text = config.read_text()
+    except FileNotFoundError:
+        text = ""
+    except OSError as exc:
+        die(f"could not read {config}: {exc}")
+    replacement = f"sqlite_home = {json.dumps(str(path))}"
+    lines = text.splitlines()
+    found = False
+    in_top_level = True
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_top_level = False
+        if in_top_level and re.match(r"^sqlite_home\s*=", stripped):
+            lines[index] = replacement
+            found = True
+            break
+    if not found:
+        lines.insert(0, replacement)
+    rendered = "\n".join(lines) + "\n"
+    temp = config.with_name(config.name + f".cdx-tmp-{os.getpid()}")
+    try:
+        with temp.open("x") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, config)
+    except OSError as exc:
+        die(f"could not update {config}: {exc}")
+    finally:
+        _unlink(temp)
+
+
+def _sqlite_ok(path: Path) -> tuple[bool, str]:
+    try:
+        db = sqlite3.connect(str(path), timeout=1)
+        try:
+            detail = str(db.execute("PRAGMA quick_check(1)").fetchone()[0])
+        finally:
+            db.close()
+        return detail == "ok", detail
+    except sqlite3.Error as exc:
+        return False, str(exc)
+
+
+def _sqlite_backup(source: Path, destination: Path) -> None:
+    """Create a transactionally consistent copy, including source WAL state."""
+    temp = destination.with_name(destination.name + f".cdx-tmp-{os.getpid()}")
+    _unlink(temp)
+    try:
+        src = sqlite3.connect(str(source), timeout=5)
+        dst = sqlite3.connect(str(temp), timeout=5)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        ok, detail = _sqlite_ok(temp)
+        if not ok:
+            die(f"SQLite backup of {source} failed integrity check: {detail}")
+        os.chmod(temp, 0o600)
+        os.replace(temp, destination)
+    finally:
+        _unlink(temp)
 
 
 # ── quota ────────────────────────────────────────────────────────────────────
@@ -1525,6 +1631,15 @@ def move_store_out_of(src: Path) -> int:
             continue
         os.rename(item, STORE / name)
         moved += 1
+    # New installations use Codex's supported sqlite_home setting. Move the
+    # initial account's databases as a unit into that directory; future
+    # profiles address them there directly rather than through symlinks.
+    for item in sorted(src.glob("*.sqlite*")):
+        if not re.fullmatch(r".+\.sqlite(?:-(?:wal|shm))?", item.name):
+            continue
+        if not item.is_symlink() and not (STORE / item.name).exists():
+            os.rename(item, STORE / item.name)
+            moved += 1
     # sqlite's sidecars must travel with their database or the index looks
     # corrupt; they are recreated next to the resolved path afterwards.
     for name in SHARED_DATA:
@@ -1575,6 +1690,7 @@ def cmd_init(argv: list[str]) -> int:
     out(f"set up: {CODEX_LINK} -> {PROFILES / 'main'}")
     # Hoist the shared data straight out of 'main' so it is never load-bearing.
     move_store_out_of(PROFILES / "main")
+    set_configured_sqlite_home(STORE)
     link_shared(PROFILES / "main")
     out(f"shared store: {STORE}")
     return 0
@@ -2011,6 +2127,101 @@ def cmd_link() -> int:
     return 0
 
 
+def cmd_share_sqlite(argv: list[str]) -> int:
+    """Move live SQLite state behind Codex's supported sqlite_home setting.
+
+    The destination is one directory per host. Profiles then share the same
+    databases without file symlinks, so SQLite keeps each DB and its WAL/SHM
+    sidecars together. Existing per-profile databases are archived rather than
+    deleted; when a destination DB is missing, the active profile is preferred.
+    """
+    force = False
+    destination_arg = ""
+    for arg in argv:
+        if arg == "--force":
+            force = True
+        elif arg.startswith("-"):
+            die(f"unknown option to 'share-sqlite': {arg}")
+        elif destination_arg:
+            die("usage: cdx share-sqlite [absolute-directory] [--force]")
+        else:
+            destination_arg = arg
+    require_store()
+    destination = Path(os.path.expanduser(destination_arg)) if destination_arg else STORE
+    if not destination.is_absolute():
+        die("share-sqlite needs an absolute directory")
+    destination = Path(os.path.abspath(destination))
+
+    active = active_profile()
+    profiles = [entry for entry in sorted(PROFILES.iterdir())
+                if entry.is_dir() and not entry.name.startswith(".")]
+    candidates: dict[str, list[Path]] = {}
+    roots = [STORE]
+    active_home = home_of(active)
+    if active_home in profiles:
+        roots.append(active_home)
+    roots.extend(profile for profile in profiles if profile != active_home)
+    for root in roots:
+        for path in sorted(root.glob("*.sqlite")):
+            candidates.setdefault(path.name, []).append(path)
+    if not candidates:
+        die("no SQLite databases found to migrate")
+
+    out(f"SQLite sharing: {destination}")
+    if stop_bound_to(str(PROFILES), target_profile=active, force=force):
+        die("Codex is still using the old SQLite layout; migration cancelled")
+    destination.mkdir(parents=True, exist_ok=True)
+    os.chmod(destination, 0o700)
+
+    copied: list[str] = []
+    for name, sources in sorted(candidates.items()):
+        target = destination / name
+        if target.exists():
+            ok, detail = _sqlite_ok(target)
+            if not ok:
+                die(f"destination database {target} is unhealthy: {detail}")
+            continue
+        healthy_source = None
+        # Prefer the active profile over dormant copies, except that the old
+        # store copy is canonical for databases formerly shared by cdx.
+        ordered = sources
+        if name not in ("state_5.sqlite", "memories_1.sqlite"):
+            ordered = sorted(sources, key=lambda p: p.parent != active_home)
+        for source in ordered:
+            ok, _detail = _sqlite_ok(source)
+            if ok:
+                healthy_source = source
+                break
+        if healthy_source is None:
+            die(f"no healthy source found for {name}; nothing was archived")
+        _sqlite_backup(healthy_source, target)
+        copied.append(name)
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = PROFILES / ".recovery-archive" / f"sqlite-sharing-{stamp}"
+    archived: list[str] = []
+    for profile in profiles:
+        for path in sorted(profile.glob("*.sqlite*")):
+            # Only database files and their SQLite sidecars belong here.
+            if not re.fullmatch(r".+\.sqlite(?:-(?:wal|shm))?", path.name):
+                continue
+            archive_profile = archive / profile.name
+            archive_profile.mkdir(parents=True, exist_ok=True)
+            os.rename(path, archive_profile / path.name)
+            archived.append(f"{profile.name}/{path.name}")
+    if archived:
+        os.chmod(archive, 0o700)
+
+    set_configured_sqlite_home(destination)
+    link_shared(active_home)
+    out(f"  configured sqlite_home = {destination}")
+    out(f"  copied {len(copied)} database(s); archived {len(archived)} old file(s)")
+    if archived:
+        out(f"  recovery archive: {archive}")
+    out("  Desktop clients may reconnect now.")
+    return 0
+
+
 # ── app, ssh, run ────────────────────────────────────────────────────────────
 def cmd_app(argv: list[str]) -> int:
     """The desktop app defaults to ~/.codex and has no in-app switcher, but
@@ -2143,7 +2354,9 @@ def cmd_doctor(argv: list[str]) -> int:
                 continue
             unsafe_sqlite_links.extend(str(path) for path in sorted(profile.glob("*.sqlite"))
                                        if path.is_symlink())
-    healthy = (not unknowns and not bad_databases and not stale
+    sqlite_home = configured_sqlite_home()
+    healthy = (sqlite_home is not None and sqlite_home.is_dir()
+               and not unknowns and not bad_databases and not stale
                and not duplicate_servers and not unsafe_sqlite_links)
     report = {
         "cdx_version": CDX_VERSION,
@@ -2155,6 +2368,7 @@ def cmd_doctor(argv: list[str]) -> int:
         "app_servers": servers,
         "duplicate_app_servers": duplicate_servers,
         "unsafe_sqlite_links": unsafe_sqlite_links,
+        "sqlite_home": str(sqlite_home) if sqlite_home else None,
         "healthy": healthy,
     }
     if as_json:
@@ -2166,6 +2380,7 @@ def cmd_doctor(argv: list[str]) -> int:
         row("policy", STORAGE_POLICY_DATE)
         section("Storage")
         row("recognized", "yes" if not unknowns else "new entries need review")
+        row("sqlite home", tilde(str(sqlite_home)) if sqlite_home else "not configured")
         for item in unknowns:
             out(f"  {C.YELLOW}{item['profile']}/{item['name']} "
                 f"({item['kind']}){C.RESET}")
@@ -2190,6 +2405,9 @@ def cmd_doctor(argv: list[str]) -> int:
         else:
             out(f"{C.YELLOW}Attention: cdx found compatibility or client-state "
                 f"drift; it changed nothing.{C.RESET}")
+            if sqlite_home is None:
+                out(f"{C.YELLOW}  Run 'cdx share-sqlite' to use one safe SQLite "
+                    f"directory per host.{C.RESET}")
     return 0 if healthy else 1
 
 
@@ -2348,6 +2566,7 @@ re-pointing it and no client needs configuring.
 {C.CYAN}Setup and repair{C.RESET}
   cdx init                 one-time: make {tilde(str(CODEX_LINK))} a switchable link
   cdx link                 rebuild every account's links to the store
+  cdx share-sqlite [dir]   share SQLite safely within this host
   cdx doctor               audit Codex storage and running profile compatibility
 
 {C.CYAN}Keeping cdx current{C.RESET}
@@ -2374,9 +2593,10 @@ re-pointing it and no client needs configuring.
 {C.CYAN}Layout{C.RESET}
   accounts  {tilde(str(PROFILES))}/<name>
   shared    {tilde(str(STORE))}
-  An account holds only its credentials and logs. Everything shareable —
-  config, conversations, memories, attachments, caches — lives once in the
-  store and is symlinked into each account, so accounts stay a few hundred KB,
+  An account holds only its credentials and account-local state. Config,
+  conversations, attachments and caches live once in the store and are
+  symlinked into each account. SQLite state is shared through Codex's
+  sqlite_home setting, never by symlinking database files, so accounts stay small,
   'resume' finds your work whichever account is active, and any account can be
   renamed or deleted. 'cdx link' rebuilds those symlinks if Codex overwrites
   one.
@@ -2479,6 +2699,14 @@ SUB_HELP = {
   if Codex overwrites a link with a real file, or a link is left pointing
   somewhere stale. An account's own data is never replaced — it is reported
   and left alone.""",
+    "share-sqlite": """cdx share-sqlite [absolute-directory] [--force]
+
+  Consolidate this host's SQLite state behind Codex's supported sqlite_home
+  setting. The default directory is the shared store. Use an explicit local
+  path on a host whose home directory is on NFS. Existing per-profile files
+  move to a timestamped recovery archive; nothing is deleted.
+
+  --force       SIGKILL verified Codex processes that survive SIGTERM for 20s""",
     "doctor": """cdx doctor [--json]
 
   Compare the live Codex home layout with cdx's dated storage policy, run
@@ -2529,7 +2757,8 @@ def main(argv: list[str]) -> int:
     # moment that dir moves — a hand-run migration, a renamed store —
     # resolving it fails. Demanding codex here would put the only fix on the
     # far side of the thing that needs fixing. cmd_link shells out to nothing.
-    if command not in ("link", "doctor", "version", "update") and not shutil.which("codex"):
+    if command not in ("link", "share-sqlite", "doctor", "version", "update") \
+            and not shutil.which("codex"):
         die("codex is not on PATH")
 
     if command in ("", "list", "ls"):
@@ -2550,6 +2779,8 @@ def main(argv: list[str]) -> int:
         return cmd_status(rest)
     if command == "doctor":
         return cmd_doctor(rest)
+    if command == "share-sqlite":
+        return cmd_share_sqlite(rest)
     if command == "version":
         return cmd_version(rest)
     if command == "update":
