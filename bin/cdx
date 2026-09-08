@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.3"
+CDX_VERSION = "0.1.4"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -1213,6 +1213,16 @@ class Processes:
                                   capture_output=True, text=True)
             return proc.stdout.strip()
 
+    def parent_pid(self, pid: int) -> int | None:
+        try:
+            tail = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1]
+            return int(tail.split()[1])
+        except (OSError, IndexError, ValueError):
+            proc = subprocess.run(["ps", "-p", str(pid), "-o", "ppid="],
+                                  capture_output=True, text=True)
+            value = proc.stdout.strip()
+            return int(value) if value.isdigit() else None
+
     def open_paths(self, pid: int) -> list[str]:
         return open_paths(pid)
 
@@ -1250,6 +1260,19 @@ PROCS = Processes()
 
 def pgrep(pattern: str) -> list[int]:
     return PROCS.matching(pattern)
+
+
+def app_server_pids() -> list[int]:
+    """One PID per logical server, hiding npm wrapper/child duplication.
+
+    The Node-distributed Codex launcher remains alive as the parent of the
+    native app-server, and both command lines contain the full app-server
+    arguments. Counting both made one healthy server look like two writers.
+    Keep the outer process when both members of that pair are present.
+    """
+    pids = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
+    members = set(pids)
+    return [pid for pid in pids if PROCS.parent_pid(pid) not in members]
 
 
 @dataclass(frozen=True)
@@ -1430,7 +1453,7 @@ def cmd_status(argv: list[str]) -> int:
     session_disp = "shared" if session_store.startswith(f"{STORE}/") else tilde(session_store)
     state_disp = "shared" if state_store.startswith(f"shared -> {STORE}/") else tilde(state_store)
 
-    server_pids = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
+    server_pids = app_server_pids()
     proxy_count = len(pgrep(r"(^|/)codex app-server proxy( |$)"))
     lifecycle = app_server_lifecycle(home_of(active), server_pids)
 
@@ -1948,7 +1971,7 @@ def cmd_use(argv: list[str]) -> int:
     old_target = resolve_dir(CODEX_LINK)
     old_lifecycle = None
     if restart and old_target:
-        old_servers = pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://")
+        old_servers = app_server_pids()
         old_lifecycle = app_server_lifecycle(Path(old_target), old_servers)
     preserve_remote = bool(old_lifecycle and old_lifecycle.managed_remote)
     if dry_run:
@@ -2348,7 +2371,7 @@ def cmd_doctor(argv: list[str]) -> int:
     bad_databases = [item for item in databases if not item["ok"]]
     active = active_profile()
     servers = []
-    for pid in pgrep(r"[cC]odex.*app-server.*--listen[ =]unix://"):
+    for pid in app_server_pids():
         owner = app_server_profile(pid)
         servers.append({"pid": pid, "profile": owner,
                         "matches_active_profile": owner == active})

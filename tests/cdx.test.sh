@@ -574,12 +574,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.3\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.4\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.3"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.4"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"

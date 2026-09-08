@@ -222,6 +222,9 @@ class FakeProcesses:
     def cmdline(self, pid):
         return self.table[pid][0]
 
+    def parent_pid(self, pid):
+        return 1
+
     def open_paths(self, pid):
         return self.table[pid][1]
 
@@ -367,6 +370,23 @@ check("while still reporting the selection", "Stopping 1 process(es)" in text, T
 
 # ── app-server lifecycle ─────────────────────────────────────────────────────
 print("app_server_lifecycle")
+
+
+class ParentProcesses(FakeProcesses):
+    def __init__(self, table, parents):
+        super().__init__(table)
+        self.parents = parents
+
+    def parent_pid(self, pid):
+        return self.parents.get(pid)
+
+
+pair = ParentProcesses({10: BOUND, 11: BOUND}, {10: 1, 11: 10})
+real, cdx.PROCS = cdx.PROCS, pair
+try:
+    check("an npm wrapper and child count as one server", cdx.app_server_pids(), [10])
+finally:
+    cdx.PROCS = real
 
 
 def classify_server(table, *, managed_pid=None, configured=False):
