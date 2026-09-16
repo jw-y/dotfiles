@@ -113,6 +113,9 @@ new_env() {
 for p in sys.argv[1:]:
     db=sqlite3.connect(p); db.execute("create table fixture (value text)"); db.close()' \
         "$d/codex/state_5.sqlite" "$d/codex/memories_1.sqlite"
+    python3 -c 'import sqlite3,sys
+db=sqlite3.connect(sys.argv[1]); db.execute("create table thread_sections (id text primary key, name text not null)"); db.close()' \
+        "$d/codex/state_5.sqlite"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
     echo "$d"
@@ -538,8 +541,11 @@ it "status reports the cached quota";    assert_contains "$(CDX_USAGE=off cdx "$
 out="$(CDX_USAGE=off cdx "$U" status)"
 it "status groups its facts";            assert_eq "$(printf %s "$out" | grep -c '^\(Account\|Storage\|Clients\)$')" "3"
 it "status calls shared data shared";    assert_contains "$out" "conversations shared"
+it "status finds shared sqlite state";   assert_contains "$out" "state index   shared"
+it "status finds shared sidebar state"; assert_contains "$out" "sidebar       shared"
 it "status shortens paths to ~";         assert_contains "$out" "~/profiles/.store"
 it "status still keeps full paths in json"; assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" "$U/profiles/.store/sessions"
+it "status json locates shared sqlite";  assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" "$U/profiles/.store/state_5.sqlite"
 it "status --json carries the quota";    assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_percent"])')" "42"
 it "json quota keeps the raw epoch";     assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(type(json.load(sys.stdin)["quota"]["reset_at"]).__name__)')" "float"
 
