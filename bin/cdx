@@ -1098,13 +1098,15 @@ def list_profiles(argv: list[str]) -> int:
     # below within minutes of being added — the same mistake, twice in one
     # file, is what pct_of() exists to stop.
     BAR_W = 6
+    # Pad the figure independently so digit counts cannot move the bar.
+    figure_w = max([len("USED")] + [len(r.used) for r in rows])
     cells: dict[str, str] = {}
     for r in rows:
         pct = pct_of(r.used)
         if pct is not None:
-            cells[r.name] = f"{bar(pct / 100, BAR_W)} {r.used}"
+            cells[r.name] = f"{bar(pct / 100, BAR_W)} {r.used:>{figure_w}}"
         elif r.used:
-            cells[r.name] = f"{' ' * BAR_W} {r.used}"
+            cells[r.name] = f"{' ' * BAR_W} {r.used:>{figure_w}}"
         else:
             cells[r.name] = ""
 
