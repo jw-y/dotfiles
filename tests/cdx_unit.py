@@ -480,6 +480,40 @@ finally:
 check("a throttled account is retried", fake_opener.calls, 2)
 check("the retry refreshes its quota", (rec["used"], source), (9, "live"))
 
+print("sidebar schema compatibility and name index")
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    db_path = root / "state.sqlite"
+    db = cdx.sqlite3.connect(db_path)
+    db.execute("CREATE TABLE thread_sections (id TEXT, name TEXT)")
+    db.execute("INSERT INTO thread_sections VALUES ('pin', 'Pinned')")
+    db.commit()
+    result = cdx.sidebar_sections(db_path)
+    check("sections work without threads", (result["supported"], result["count"]), (True, 1))
+    check("absent pin schema stays unknown", result["pinned_active"], None)
+    db.execute("CREATE TABLE threads (id TEXT, name TEXT, archived INTEGER, thread_section_id TEXT)")
+    db.execute("INSERT INTO threads VALUES ('one', 'Latest', 0, 'pin')")
+    db.commit()
+    result = cdx.sidebar_sections(db_path)
+    check("current pins need no legacy column", (result["pinned_active"], result["pinned_archived"]), (1, 0))
+    check("missing legacy flags stay unknown", result["legacy_pinned"], None)
+    db.close()
+    original_src = cdx.shared_src
+    cdx.shared_src = lambda: root
+    try:
+        (root / "session_index.jsonl").write_text(
+            'null\n[]\n42\ninvalid\n'
+            '{"id":"one","thread_name":"Old"}\n'
+            '{"id":"one","thread_name":"Latest"}\n')
+        result = cdx.thread_name_consistency(db_path)
+        check("invalid index entries are skipped", result["supported"], True)
+        check("last valid name wins", result["mismatches"], [])
+        (root / "session_index.jsonl").write_text('{"id":"one","thread_name":"Old"}\n')
+        result = cdx.thread_name_consistency(db_path)
+        check("conflicting names are reported", len(result["mismatches"]), 1)
+    finally:
+        cdx.shared_src = original_src
+
 print()
 print(f"{PASS} passed" if not FAIL else f"{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

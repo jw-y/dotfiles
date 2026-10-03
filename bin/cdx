@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.4"
+CDX_VERSION = "0.1.5"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -620,13 +620,23 @@ def state_index(home: Path) -> Path | None:
 
 
 def sidebar_sections(path: Path | None) -> dict[str, object]:
-    """Describe the custom-sidebar-section schema without modifying the DB."""
+    """Describe section-based sidebar state without modifying the database.
+
+    Pinning briefly had its own ``threads.is_pinned`` field before Codex
+    generalized the feature into ``thread_sections``. Current clients model
+    Pinned as a built-in section; report the old flag separately so another
+    storage transition cannot look like ordinary section membership.
+    """
     sqlite_home = configured_sqlite_home()
     result: dict[str, object] = {
         "supported": False,
         "path": str(path) if path else None,
         "shared": bool(path and sqlite_home and path.parent == sqlite_home),
         "count": None,
+        "custom_count": None,
+        "pinned_active": None,
+        "pinned_archived": None,
+        "legacy_pinned": None,
     }
     if path is None:
         return result
@@ -640,10 +650,93 @@ def sidebar_sections(path: Path | None) -> dict[str, object]:
             if exists:
                 result["supported"] = True
                 result["count"] = int(db.execute("SELECT count(*) FROM thread_sections").fetchone()[0])
+                result["custom_count"] = int(db.execute(
+                    "SELECT count(*) FROM thread_sections WHERE name <> 'Pinned'"
+                ).fetchone()[0])
+                columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+                if "is_pinned" in columns:
+                    result["legacy_pinned"] = int(db.execute(
+                        "SELECT count(*) FROM threads WHERE is_pinned <> 0"
+                    ).fetchone()[0])
+                if {"archived", "thread_section_id"} <= columns:
+                    active, archived = db.execute(
+                        """SELECT
+                               sum(CASE WHEN t.archived = 0 THEN 1 ELSE 0 END),
+                               sum(CASE WHEN t.archived <> 0 THEN 1 ELSE 0 END)
+                           FROM threads t
+                           JOIN thread_sections s ON s.id = t.thread_section_id
+                           WHERE s.name = 'Pinned'"""
+                    ).fetchone()
+                    result["pinned_active"] = int(active or 0)
+                    result["pinned_archived"] = int(archived or 0)
         finally:
             db.close()
     except (OSError, sqlite3.Error):
         pass
+    return result
+
+
+def thread_name_consistency(path: Path | None) -> dict[str, object]:
+    """Compare modern SQLite names with the legacy shared name index.
+
+    Both stores remain in use by Codex clients. The JSONL file is append-only,
+    so its last valid entry for a thread is the effective legacy value.
+    Reporting drift is safe; choosing which conflicting name wins is not.
+    """
+    result: dict[str, object] = {
+        "supported": False,
+        "sqlite_named": 0,
+        "index_named": 0,
+        "mismatches": [],
+        "missing_from_index": [],
+    }
+    index = shared_src() / "session_index.jsonl"
+    if path is None or not index.is_file():
+        return result
+    indexed: dict[str, str] = {}
+    try:
+        for line in index.read_text().splitlines():
+            try:
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    continue
+                thread_id, name = item.get("id"), item.get("thread_name")
+                if isinstance(thread_id, str) and isinstance(name, str):
+                    indexed[thread_id] = name
+            except json.JSONDecodeError:
+                continue
+        uri = "file:" + urllib.parse.quote(str(path.resolve(strict=True))) + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True, timeout=0.25)
+        try:
+            exists = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'"
+            ).fetchone()
+            columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+            if not exists or "name" not in columns:
+                return result
+            rows = db.execute(
+                "SELECT id, name FROM threads WHERE name IS NOT NULL"
+            ).fetchall()
+        finally:
+            db.close()
+    except (OSError, UnicodeError, sqlite3.Error):
+        return result
+    mismatches = []
+    missing = []
+    for thread_id, sqlite_name in rows:
+        index_name = indexed.get(thread_id)
+        if index_name is None:
+            missing.append({"id": thread_id, "sqlite_name": sqlite_name})
+        elif index_name != sqlite_name:
+            mismatches.append({"id": thread_id, "sqlite_name": sqlite_name,
+                               "index_name": index_name})
+    result.update({
+        "supported": True,
+        "sqlite_named": len(rows),
+        "index_named": len(indexed),
+        "mismatches": mismatches,
+        "missing_from_index": missing,
+    })
     return result
 
 
@@ -1578,6 +1671,13 @@ def cmd_status(argv: list[str]) -> int:
         row("conversations", session_disp)
         row("state index", state_disp)
         row("sidebar", section_disp)
+        if section_state["supported"] and section_state["pinned_active"] is not None:
+            pins = (f"{section_state['pinned_active']} active, "
+                    f"{section_state['pinned_archived']} archived")
+            if section_state["legacy_pinned"]:
+                pins += f"; {section_state['legacy_pinned']} legacy flags"
+            row("pins", pins)
+            row("custom sections", str(section_state["custom_count"]))
         section("Clients")
         for line in server_lines:
             out(line)
@@ -2442,6 +2542,8 @@ def cmd_doctor(argv: list[str]) -> int:
     sqlite_home = configured_sqlite_home()
     state_file = state_index(home_of(active))
     section_state = sidebar_sections(state_file)
+    name_state = thread_name_consistency(state_file)
+    # Name-index differences are advisory: clients may populate the stores differently.
     healthy = (sqlite_home is not None and sqlite_home.is_dir()
                and not unknowns and not bad_databases and not stale
                and not duplicate_servers and not unsafe_sqlite_links)
@@ -2457,6 +2559,7 @@ def cmd_doctor(argv: list[str]) -> int:
         "unsafe_sqlite_links": unsafe_sqlite_links,
         "sqlite_home": str(sqlite_home) if sqlite_home else None,
         "sidebar_sections": section_state,
+        "thread_names": name_state,
         "healthy": healthy,
     }
     if as_json:
@@ -2471,9 +2574,27 @@ def cmd_doctor(argv: list[str]) -> int:
         row("sqlite home", tilde(str(sqlite_home)) if sqlite_home else "not configured")
         if section_state["supported"]:
             location = "shared" if section_state["shared"] else tilde(str(section_state["path"]))
-            row("sidebar", f"{location} ({section_state['count']} stored sections)")
+            row("sidebar", location)
+            if section_state["pinned_active"] is not None:
+                row("pins", f"{section_state['pinned_active']} active, "
+                            f"{section_state['pinned_archived']} archived")
+            if section_state["legacy_pinned"] is not None:
+                row("legacy pins", str(section_state["legacy_pinned"]))
+            row("custom sections", str(section_state["custom_count"]))
         else:
             row("sidebar", "not supported by this Codex state")
+        if name_state["supported"]:
+            drift_count = (len(name_state["mismatches"])
+                           + len(name_state["missing_from_index"]))
+            row("thread names", (f"{name_state['sqlite_named']} synchronized"
+                                 if not drift_count else f"{drift_count} need review"))
+            for item in name_state["mismatches"]:
+                out(f"  {C.YELLOW}{item['id']}: SQLite {item['sqlite_name']!r}, "
+                    f"index {item['index_name']!r}{C.RESET}")
+            for item in name_state["missing_from_index"]:
+                out(f"  {C.YELLOW}{item['id']}: missing from session index{C.RESET}")
+        else:
+            row("thread names", "not available")
         for item in unknowns:
             out(f"  {C.YELLOW}{item['profile']}/{item['name']} "
                 f"({item['kind']}){C.RESET}")

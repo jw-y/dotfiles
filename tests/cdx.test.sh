@@ -114,8 +114,18 @@ for p in sys.argv[1:]:
     db=sqlite3.connect(p); db.execute("create table fixture (value text)"); db.close()' \
         "$d/codex/state_5.sqlite" "$d/codex/memories_1.sqlite"
     python3 -c 'import sqlite3,sys
-db=sqlite3.connect(sys.argv[1]); db.execute("create table thread_sections (id text primary key, name text not null)"); db.close()' \
+db=sqlite3.connect(sys.argv[1])
+db.execute("create table thread_sections (id text primary key, name text not null)")
+db.execute("create table threads (id text primary key, name text, archived integer not null default 0, is_pinned integer not null default 0, thread_section_id text)")
+db.executemany("insert into thread_sections values (?,?)", [("pinned", "Pinned"), ("research", "Research")])
+db.executemany("insert into threads values (?,?,?,?,?)", [("active-pin","Active pin",0,0,"pinned"), ("archived-pin","Archived pin",1,0,"pinned"), ("research-thread","Research thread",0,0,"research")])
+db.commit(); db.close()' \
         "$d/codex/state_5.sqlite"
+    printf '%s\n' \
+        '{"id":"active-pin","thread_name":"Active pin"}' \
+        '{"id":"archived-pin","thread_name":"Archived pin"}' \
+        '{"id":"research-thread","thread_name":"Research thread"}' \
+        > "$d/codex/session_index.jsonl"
     echo 'transcript'     > "$d/codex/sessions/s1.jsonl"
     echo 'binary-blob'    > "$d/codex/packages/codex-bin"
     echo "$d"
@@ -218,7 +228,7 @@ it "instructions stop Codex first";       assert_contains "$out" "app-server"
 E="$(legacy_env one)"
 # Every shareable item but one — the list has to stay in step with the fixture,
 # since a second leftover puts the braces back and the case goes untested.
-for f in config.toml AGENTS.md state_5.sqlite memories_1.sqlite packages; do
+for f in config.toml AGENTS.md session_index.jsonl state_5.sqlite memories_1.sqlite packages; do
     rm -rf "$E/profiles/main/$f"
 done
 out="$(cdx "$E" init)"
@@ -543,9 +553,12 @@ it "status groups its facts";            assert_eq "$(printf %s "$out" | grep -c
 it "status calls shared data shared";    assert_contains "$out" "conversations shared"
 it "status finds shared sqlite state";   assert_contains "$out" "state index   shared"
 it "status finds shared sidebar state"; assert_contains "$out" "sidebar       shared"
+it "status separates current pins";     assert_contains "$out" "pins          1 active, 1 archived"
+it "status excludes pin from custom";   assert_contains "$out" "custom sections 1"
 it "status shortens paths to ~";         assert_contains "$out" "~/profiles/.store"
 it "status still keeps full paths in json"; assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" "$U/profiles/.store/sessions"
 it "status json locates shared sqlite";  assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" "$U/profiles/.store/state_5.sqlite"
+it "status json exposes legacy pins";   assert_contains "$(CDX_USAGE=off cdx "$U" status --json)" '"legacy_pinned": 0'
 it "status --json carries the quota";    assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_percent"])')" "42"
 it "json quota keeps the raw epoch";     assert_eq "$(CDX_USAGE=off cdx "$U" status --json | python3 -c 'import json,sys;print(type(json.load(sys.stdin)["quota"]["reset_at"]).__name__)')" "float"
 
@@ -580,12 +593,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.4\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.5\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.4"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.5"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"
@@ -593,6 +606,7 @@ it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/
 doctor_json="$(cdx "$U" doctor --json)"
 it "doctor emits valid json";            assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;json.load(sys.stdin);print("ok")')" "ok"
 it "doctor checks every sqlite db";      assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;print(all(x["ok"] for x in json.load(sys.stdin)["sqlite"]))')" "True"
+it "doctor checks shared thread names";  assert_eq "$(printf %s "$doctor_json" | python3 -c 'import json,sys;d=json.load(sys.stdin)["thread_names"];print(d["supported"] and not d["mismatches"] and not d["missing_from_index"])')" "True"
 
 # Explicit cache mode fills an empty cache once and then stays local. Auto,
 # which is the real default outside this network-disabled harness, re-fetches
