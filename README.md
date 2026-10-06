@@ -190,6 +190,27 @@ dotfiles/
 └── fonts/               # Font assets
 ```
 
+## Ghostty over SSH
+
+The Ghostty config enables `ssh-terminfo` and `ssh-env`. With Ghostty shell
+integration active, these prepare SSH hosts using the installed Ghostty
+version's terminal definition rather than a copy pinned in this repository.
+
+As a backup, `.zshrc` checks whether an SSH host can resolve `xterm-ghostty`
+before loading the prompt and plugins. If the definition is missing, it uses
+`xterm-256color` for that shell. This prevents duplicated-looking input,
+though advanced Ghostty terminal features are unavailable during fallback.
+Deploy the shell configuration on remote hosts with `make update` and reconnect.
+
+To install or refresh the definition manually, run this from your local
+Ghostty terminal, then reconnect:
+
+```bash
+infocmp -x xterm-ghostty | ssh YOUR-HOST 'tic -x -'
+```
+
+See [Ghostty's terminfo documentation](https://ghostty.org/docs/help/terminfo#ssh).
+
 ## Customization
 
 - Edit `jungwoo.zsh-theme` for prompt colors and layout.

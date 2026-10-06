@@ -1,3 +1,9 @@
+# Ghostty's SSH integration installs its current terminfo when possible.
+# Fall back before loading ZLE/plugins if this SSH host cannot resolve it.
+if [[ -n ${SSH_TTY-} && ${TERM-} == xterm-ghostty ]] && ! infocmp "$TERM" >/dev/null 2>&1; then
+    export TERM=xterm-256color
+fi
+
 # If you come from bash you might have to change your $PATH.
 export PATH=$HOME/bin:$HOME/.local/bin:/usr/local/bin:$PATH
 
