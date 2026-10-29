@@ -448,9 +448,18 @@ class QuotaOpener:
     def __init__(self, replies):
         self.replies = list(replies)
         self.calls = 0
+        self.requests = []
+        self.accounts = {}
+        self.account_requests = []
 
     def open(self, _req, timeout=0):
+        if _req.full_url.endswith("/accounts/check"):
+            self.account_requests.append(_req)
+            if isinstance(self.accounts, Exception):
+                raise self.accounts
+            return io.BytesIO(json.dumps(self.accounts).encode())
         self.calls += 1
+        self.requests.append(_req)
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -479,6 +488,98 @@ finally:
         _os.environ["CDX_USAGE"] = real_mode
 check("a throttled account is retried", fake_opener.calls, 2)
 check("the retry refreshes its quota", (rec["used"], source), (9, "live"))
+
+print("ChatGPT workspace identity")
+check("workspace names match the selected account", cdx.workspace_name({"accounts": [
+    {"id": "other", "name": "Wrong Team"},
+    {"id": "selected", "name": "Research Team"}]}, "selected"), "Research Team")
+check("workspace names support the map response", cdx.workspace_name({"accounts": {
+    "selected": {"account": {"account_id": "selected", "name": "Research Team"}}}},
+    "selected"), "Research Team")
+check("a mismatched account cannot supply a name", cdx.workspace_name({"accounts": {
+    "selected": {"account": {"account_id": "other", "name": "Wrong Team"}}}},
+    "selected"), "")
+check("personal workspace has a readable fallback", cdx.workspace_name({"accounts": [
+    {"id": "selected", "structure": "personal"}]}, "selected"), "Personal")
+check("an unknown workspace stays unnamed", cdx.workspace_name({"accounts": [
+    {"id": "other", "name": "Wrong Team"}]}, "selected"), "")
+check("workspace names stay on one terminal line", cdx.workspace_name({"accounts": [
+    {"id": "selected", "name": "  Research\nTeam\t "}]}, "selected"), "Research Team")
+real_opener, real_mode, real_force = (
+    cdx._opener, _os.environ.get("CDX_USAGE"), cdx._quota.force)
+try:
+    _os.environ["CDX_USAGE"] = "cache"
+    cdx._quota.force = False
+    fake_opener = QuotaOpener([healthy, {"rate_limit": {
+        "primary_window": {"used_percent": 73}}}])
+    fake_opener.accounts = {"accounts": [
+        {"id": "personal-workspace", "name": "Personal"},
+        {"id": "company-workspace", "name": "Research Team"}]}
+    cdx._opener = fake_opener
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        def workspace_auth(workspace):
+            (home / "auth.json").write_text(json.dumps({
+                "auth_mode": "chatgpt", "tokens": {
+                    "account_id": workspace, "access_token": "same-login-token"}}))
+
+        workspace_auth("personal-workspace")
+        personal = cdx._row("personal", home)
+        check("quota sends the selected workspace", fake_opener.requests[0].get_header(
+            "Chatgpt-account-id"), "personal-workspace")
+        check("the row retains workspace identity", personal.workspace_id, "personal-workspace")
+        check("the row includes the resolved workspace name", personal.workspace_name, "Personal")
+        check("name lookup selects the workspace", fake_opener.account_requests[0].get_header(
+            "Chatgpt-account-id"), "personal-workspace")
+        check("the cache retains workspace identity", json.loads(
+            (home / ".cdx-usage.json").read_text())["workspace_id"], "personal-workspace")
+        cdx._row("personal", home)
+        check("the same workspace reuses its cache", fake_opener.calls, 1)
+        check("the name lookup is cached too", len(fake_opener.account_requests), 1)
+
+        _os.environ["CDX_USAGE"] = "off"
+        workspace_auth("company-workspace")
+        check("offline mode rejects another workspace's quota", cdx._row(
+            "company", home).used, "")
+        check("offline mode rejects another workspace's name", cdx._row(
+            "company", home).workspace_name, "")
+        _os.environ["CDX_USAGE"] = "cache"
+        company = cdx._row("company", home)
+        check("the other workspace resolves its own name", company.workspace_name, "Research Team")
+        check("changing workspace fetches a new quota", fake_opener.calls, 2)
+        check("each workspace has its own quota", (personal.used, company.used), ("9% wk", "73%"))
+        check("the new request selects the new workspace", fake_opener.requests[1].get_header(
+            "Chatgpt-account-id"), "company-workspace")
+        fake_opener.accounts = urllib.error.HTTPError(
+            "https://chatgpt.com/backend-api/wham/accounts/check", 403, "Forbidden", {}, None)
+        fake_opener.replies.append(healthy)
+        cdx._quota.force = True
+        refreshed = cdx._row("company", home)
+        check("a name lookup failure preserves healthy quota", refreshed.state, "ok")
+        check("a name lookup failure retains the cached name", refreshed.workspace_name, "Research Team")
+
+        cache = home / ".cdx-usage.json"
+        cache.write_text(json.dumps({"used": 99, "fetched_at": time.time()}))
+        _os.environ["CDX_USAGE"] = "off"
+        check("unscoped legacy quota cannot describe a workspace", cdx._row(
+            "company", home).used, "")
+finally:
+    cdx._opener = real_opener
+    cdx._quota.force = real_force
+    if real_mode is None:
+        _os.environ.pop("CDX_USAGE", None)
+    else:
+        _os.environ["CDX_USAGE"] = real_mode
+
+request = cdx.urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers={
+    "Authorization": "Bearer secret", "ChatGPT-Account-Id": "company-workspace"})
+redirect = cdx.SameHostAuth()
+same = redirect.redirect_request(request, None, 302, "Found", {}, "https://chatgpt.com/next")
+other = redirect.redirect_request(request, None, 302, "Found", {}, "https://example.com/next")
+check("same-host redirects preserve workspace selection", same.get_header(
+    "Chatgpt-account-id"), "company-workspace")
+check("cross-host redirects remove workspace selection", other.get_header("Chatgpt-account-id"), None)
+check("cross-host redirects remove the token", other.get_header("Authorization"), None)
 
 print("sidebar schema compatibility and name index")
 with tempfile.TemporaryDirectory() as tmp:

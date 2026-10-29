@@ -379,6 +379,9 @@ it "rejects a path separator";           assert_contains "$(cdx "$D" add ../esca
 # suite cannot either).
 echo "${DIM}usage${OFF}"
 U="$(store_env usage)"
+python3 -c 'import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d["tokens"]["account_id"]="company456xyz"
+json.dump(d,open(p,"w"))' "$U/profiles/personal/auth.json"
 # reset_at is generated three days out rather than hardcoded: the column is
 # rendered relative to now, so a fixed timestamp would quietly start reading
 # 'now' once that date passed and the assertion would rot.
@@ -390,6 +393,21 @@ json.dump({"email":"tester@example.com","plan_type":"pro",
 export CDX_USAGE=auto CDX_USAGE_ENDPOINT="file://$U/usage.json"
 out="$(cdx "$U" list)"
 it "list shows the quota column";        assert_contains "$out" "USED"
+it "list shows the workspace column";    assert_contains "$out" "WORKSPACE"
+it "unresolved names are explicit"; assert_contains "$out" "Unknown"
+it "list keeps raw workspace IDs out of the table"; assert_eq "$(printf %s "$out" | grep -c 'acct1234xyz\|company456xyz')" "0"
+it "JSON exposes each profile's workspace"; assert_eq "$(cdx "$U" list --json | python3 -c 'import json,sys;print(next(a["workspace_id"] for a in json.load(sys.stdin)["accounts"] if a["name"]=="personal"))')" "company456xyz"
+it "status identifies the selected workspace"; assert_contains "$(cdx "$U" status personal)" "workspace id  company456xyz"
+it "status JSON exposes workspace identity"; assert_eq "$(cdx "$U" status personal --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["workspace_id"])')" "company456xyz"
+python3 -c 'import json,sys
+for profile,name in (("lab","Research Team"),("personal","Personal")):
+ p=sys.argv[1]+"/profiles/"+profile+"/.cdx-usage.json"
+ d=json.load(open(p)); d["workspace_name"]=name; json.dump(d,open(p,"w"))' "$U"
+named_out="$(CDX_USAGE=off cdx "$U" list)"
+it "list shows the company workspace name"; assert_contains "$named_out" "Research Team"
+it "list shows the personal workspace name"; assert_contains "$named_out" "Personal"
+it "status shows the workspace name"; assert_contains "$(cdx "$U" status personal)" "workspace     Personal"
+it "JSON exposes the workspace name"; assert_eq "$(cdx "$U" list --json | python3 -c 'import json,sys;print(next(a["workspace_name"] for a in json.load(sys.stdin)["accounts"] if a["name"]=="personal"))')" "Personal"
 # Widths follow the content, so a long account name must not be truncated and
 # must not leave the columns ragged: every row is the same length as the header.
 it "columns size to their content";     assert_eq "$(printf %s "$out" | awk '/tester@/{print index($0,"tester@")} ' | sort -u | awk 'END {print NR}')" "1"
@@ -593,12 +611,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.5\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.6\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.5"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.6"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"
@@ -638,8 +656,11 @@ unset CDX_USAGE CDX_USAGE_ENDPOINT
 # assertion green. A fixture that cannot produce the real string cannot catch
 # the real bug.
 write_quota() {  # <profile> <used_percent> [state] [window_seconds]
-    python3 -c 'import json,sys,time
+    python3 -c 'import json,sys,time,pathlib
+p=pathlib.Path(sys.argv[1]) / "auth.json"
+auth=json.loads(p.read_text()) if p.exists() else {}
 json.dump({"fetched_at": time.time(), "used": int(sys.argv[2]),
+           "workspace_id": auth.get("tokens", {}).get("account_id", ""),
            "reset_at": time.time() + 86400, "state": sys.argv[3],
            "window": int(sys.argv[4])},
           open(sys.argv[1] + "/.cdx-usage.json", "w"))' \

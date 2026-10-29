@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.5"
+CDX_VERSION = "0.1.6"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -799,6 +799,7 @@ class SameHostAuth(urllib.request.HTTPRedirectHandler):
         if new is not None and urllib.parse.urlsplit(newurl).netloc != \
                 urllib.parse.urlsplit(req.full_url).netloc:
             new.remove_header("Authorization")
+            new.remove_header("Chatgpt-account-id")
         return new
 
 
@@ -861,8 +862,48 @@ def parse_usage(body: dict) -> dict:
                                   or limits.get("allowed") is False else "ok"}
 
 
-def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
-    """Cached inside the profile, not the store: it is per-account by definition."""
+def workspace_name(body: dict, workspace_id: str) -> str:
+    """Match the selected ChatGPT account, never an API organization title."""
+    accounts = body.get("accounts") or []
+    if isinstance(accounts, dict):
+        entry = accounts.get(workspace_id) or {}
+        account = entry.get("account") or {}
+        if account.get("account_id", workspace_id) != workspace_id:
+            return ""
+    elif isinstance(accounts, list):
+        account = next((a for a in accounts if isinstance(a, dict)
+                        and a.get("id") == workspace_id), {})
+    else:
+        return ""
+    name = account.get("name")
+    if isinstance(name, str) and name.strip():
+        # Names appear in terminal rows; don't let control characters alter them.
+        name = "".join(c for c in name if c.isprintable() or c.isspace())
+        return " ".join(name.split())
+    return "Personal" if account.get("structure") == "personal" else ""
+
+
+def fetch_workspace_name(token: str, workspace_id: str) -> str:
+    # Derive from the usage endpoint so fixture/custom endpoints never send
+    # credentials to an unrelated service. file:// usage fixtures stay offline.
+    if not workspace_id or not USAGE_ENDPOINT.startswith("https://") \
+            or not USAGE_ENDPOINT.endswith("/usage"):
+        return ""
+    endpoint = USAGE_ENDPOINT[:-len("usage")] + "accounts/check"
+    req = urllib.request.Request(endpoint, headers={
+        "Authorization": "Bearer " + token, "User-Agent": "cdx",
+        "ChatGPT-Account-Id": workspace_id})
+    try:
+        with _opener.open(req, timeout=5) as fh:
+            return workspace_name(json.load(fh), workspace_id)
+    except Exception:
+        # A failed name lookup must not change the quota or login verdict.
+        return ""
+
+
+def _quota(home: Path, token: str | None,
+           workspace_id: str = "") -> tuple[dict | None, str]:
+    """Quota belongs to the selected ChatGPT workspace, not just the login."""
     mode = os.environ.get("CDX_USAGE", "auto")
     ttl = int(os.environ.get("CDX_USAGE_TTL") or 900)
     force = _quota.force  # type: ignore[attr-defined]
@@ -870,6 +911,10 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     try:
         cached = json.loads(cache.read_text())
     except Exception:
+        cached = None
+    # A login can belong to several workspaces. Never reuse another workspace's
+    # quota after reauthentication, or an old cache fetched without selection.
+    if cached and cached.get("workspace_id", "") != workspace_id:
         cached = None
     if mode == "off" or not token:
         return cached, "cache"
@@ -879,8 +924,10 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     if cached and not force and (mode == "cache"
                                  or time.time() - cached.get("fetched_at", 0) < ttl):
         return cached, "cache"
-    req = urllib.request.Request(USAGE_ENDPOINT, headers={
-        "Authorization": "Bearer " + token, "User-Agent": "cdx"})
+    headers = {"Authorization": "Bearer " + token, "User-Agent": "cdx"}
+    if workspace_id:
+        headers["ChatGPT-Account-Id"] = workspace_id
+    req = urllib.request.Request(USAGE_ENDPOINT, headers=headers)
     # Accounts are fetched concurrently, and the endpoint can throttle that
     # short burst even though every credential is healthy. Retry only errors
     # which may clear; a rejected credential is final and must not hold up the
@@ -916,6 +963,9 @@ def _quota(home: Path, token: str | None) -> tuple[dict | None, str]:
     # and label it, since 16% of a week and 16% of five hours are not the same
     # news. The others are kept so nothing is lost.
     rec = parse_usage(body)
+    rec["workspace_id"] = workspace_id
+    rec["workspace_name"] = (fetch_workspace_name(token, workspace_id)
+                             or (cached or {}).get("workspace_name", ""))
     try:
         tmp = cache.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(rec))
@@ -998,6 +1048,8 @@ class Row:
     # its limit; 'status' has room for all of them, and an account can be at
     # 0% of five hours and 84% of the week at the same time.
     windows: list = field(default_factory=list)
+    workspace_id: str = ""
+    workspace_name: str = ""
 
 
 def _row(name: str, home: Path) -> Row:
@@ -1011,8 +1063,10 @@ def _row(name: str, home: Path) -> Row:
     kind = auth.get("auth_mode") or ("apikey" if auth.get("OPENAI_API_KEY") else "?")
     claims = _claims(tokens.get("id_token") or "")
     who = claims.get("email") or (tokens.get("account_id") or "")[:8] or "?"
-    plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
-    rec, src = _quota(home, tokens.get("access_token"))
+    auth_claims = claims.get("https://api.openai.com/auth") or {}
+    workspace_id = tokens.get("account_id") or auth_claims.get("chatgpt_account_id") or ""
+    plan = auth_claims.get("chatgpt_plan_type") or ""
+    rec, src = _quota(home, tokens.get("access_token"), workspace_id)
     rec = rec or {}
 
     used = resets = ""
@@ -1072,7 +1126,7 @@ def _row(name: str, home: Path) -> Row:
     return Row(name, kind, rec.get("email") or who, rec.get("plan") or plan,
                used, resets, state, age,
                (auth.get("last_refresh") or "?")[:10], note, allowance,
-               rec.get("windows") or [])
+               rec.get("windows") or [], workspace_id, rec.get("workspace_name") or "")
 
 
 def profile_rows(names: list[str], *, force: bool = False) -> list[Row]:
@@ -1141,6 +1195,8 @@ def list_profiles(argv: list[str]) -> int:
                 "active": r.name == active,
                 "auth_mode": r.kind,
                 "account": r.account,
+                "workspace_id": r.workspace_id or None,
+                "workspace_name": r.workspace_name or None,
                 "plan": r.plan,
                 "used_percent": pct_of(r.used),
                 "window_seconds": next(
@@ -1207,10 +1263,13 @@ def list_profiles(argv: list[str]) -> int:
     # leave a gutter of blanks for everyone who has short ones.
     wn = max([len("NAME")] + [len(r.name) for r in rows])
     wa = max([len("ACCOUNT")] + [len(r.account) for r in rows])
+    workspace_cells = {r.name: r.workspace_name or "Unknown" for r in rows}
+    ww = max([len("WORKSPACE")] + [len(c) for c in workspace_cells.values()])
     wp = max([len("PLAN")] + [len(r.plan) for r in rows])
     wu = max([len("USED")] + [len(c) for c in cells.values()])
 
     out(f"{C.DIM}   {'NAME':<{wn}}  {'ACCOUNT':<{wa}}  "
+        f"{'WORKSPACE':<{ww}}  "
         f"{'PLAN':<{wp}}  {'USED':>{wu}}  RESETS{C.RESET}")
     for r in rows:
         mark = " *" if r.name == active else "  "
@@ -1230,6 +1289,7 @@ def list_profiles(argv: list[str]) -> int:
         else:
             color = C.GREEN
         out(f"{mark} {r.name:<{wn}}  {r.account:<{wa}}  "
+            f"{C.DIM}{workspace_cells[r.name]:<{ww}}{C.RESET}  "
             f"{C.DIM}{r.plan:<{wp}}{C.RESET}  {color}{cells[r.name]:>{wu}}{C.RESET}  "
             f"{C.DIM}{r.resets}{C.RESET}")
 
@@ -1637,6 +1697,8 @@ def cmd_status(argv: list[str]) -> int:
                            f"{C.YELLOW}(not active — '{active}' is){C.RESET}")
         row("signed in", r.account + (f" — {r.kind}" if r.kind else "")
                          + (f", {r.plan}" if r.plan else ""))
+        row("workspace", r.workspace_name or "unknown")
+        row("workspace id", r.workspace_id or "unknown")
         row("quota", quota)
         # Every window, not just the binding one. An account can sit at 0% of
         # its five-hour window and 84% of its week at the same time, and the
@@ -1724,6 +1786,8 @@ def cmd_status(argv: list[str]) -> int:
             "active_profile": active,
             "reported_profile": subject,
             "selected_account": account,
+            "workspace_id": r.workspace_id or None,
+            "workspace_name": r.workspace_name or None,
             "quota": quota_json,
             "conversation_store": session_store,
             "state_index": state_store,
