@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
-CDX_VERSION = "0.1.6"
+CDX_VERSION = "0.1.7"
 DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/jw-y/dotfiles/main/bin/cdx"
 HOME = Path(os.path.expanduser("~"))
 PROFILES = Path(os.environ.get("CODEX_PROFILES") or HOME / ".codex-profiles")
@@ -69,8 +69,8 @@ CODEX_LINK = Path(os.environ.get("CDX_CODEX_LINK")
 # reconstruct any profile's links from scratch at any time.
 STORE = PROFILES / ".store"
 
-# Config, shared so settings live in one place, not N copies. Safe to replace
-# with a link if a profile has its own: nothing here is unrecoverable. SQLite
+# Config, shared so settings live in one place, not N copies. Divergent real
+# files are preserved: clients may replace a symlink when saving settings. SQLite
 # databases are excluded even when rebuildable: their WAL/SHM siblings make a
 # file-level symlink unsafe.
 SHARED_FILES = ["config.toml", "AGENTS.md", "AGENTS.override.md",
@@ -109,14 +109,19 @@ SHARED_DIRS = ["packages", "plugins", "cache", "skills", "rules", "sessions",
 # properties.  `cdx doctor` compares the live layout with this dated policy and
 # makes additions visible without moving them.  Patterns below are current
 # rebuildable/runtime state, not candidates for SHARED_DATA.
-STORAGE_POLICY_DATE = "2026-09-17"
+STORAGE_POLICY_DATE = "2026-11-01"
+# The maintenance lock belongs beside the SQLite databases, including in the
+# shared store. Keep it in place. Review-plugin and Node REPL runtime state
+# stays profile-local; recognizing these names must never share their contents.
 KNOWN_PRIVATE_ENTRIES = {
     ".cdx-usage.json", ".codex-global-state.json", ".codex-global-state.json.bak",
-    ".personality_migration", ".sandbox_migration", ".tmp", "ambient-suggestions",
+    ".personality_migration", ".sandbox_migration", ".sqlite-maintenance.lock",
+    ".tmp", "ambient-suggestions",
     "app-server-control", "app-server-daemon", "auth.json",
-    "chrome-native-hosts-v2.json", "cloud-config-bundle-cache.json", "computer-use",
+    "chrome-native-hosts-v2.json", "cloud-config-bundle-cache.json",
+    "code-review-plugin", "computer-use",
     "dictation-history", "electron", "installation_id", "ipc", "log",
-    "mcp-oauth-locks", "pets", "process_manager", "shell_snapshots", "sqlite",
+    "mcp-oauth-locks", "node_repl", "pets", "process_manager", "shell_snapshots", "sqlite",
     "rollout-migrations", "thread-writer-locks", "tmp", "transcription-history.jsonl",
     "tui-thread-reference-capabilities", "vendor_imports", "version.json",
 }
@@ -367,8 +372,12 @@ def link_shared(home: Path) -> None:
         target, link = src / name, home / name
         if not target.exists() or links_to(link, target):
             continue
-        # Safe to clobber: a real file here is a copy Codex wrote over the
-        # link (it rewrites config.toml atomically), not unrecoverable data.
+        # An atomic save replaces the link with the user's latest settings.
+        # Keep divergent files rather than silently restoring stale settings.
+        if link.exists() and not link.is_symlink():
+            if not link.is_file() or link.read_bytes() != target.read_bytes():
+                die(f"{link} differs from shared {target} — both files preserved.\n"
+                    "     Reconcile the files, then run 'cdx link' to restore sharing.")
         _unlink(link)
         os.symlink(target, link)
     # History: a real file here is this profile's own conversations. Never
@@ -1403,10 +1412,16 @@ class Processes:
     def matching(self, pattern: str) -> list[int]:
         proc = subprocess.run(["pgrep", "-u", self.username(), "-f", pattern],
                               capture_output=True, text=True)
+        # pgrep returns 1 for no matches; other failures do not prove that
+        # clients have stopped and must block operations that rely on this.
+        if proc.returncode not in (0, 1):
+            die(f"cannot inspect running processes: {proc.stderr.strip() or 'pgrep failed'}")
         return [int(p) for p in proc.stdout.split() if p.isdigit()]
 
     def username(self) -> str:
         proc = subprocess.run(["id", "-un"], capture_output=True, text=True)
+        if proc.returncode or not proc.stdout.strip():
+            die(f"cannot identify current user: {proc.stderr.strip() or 'id -un failed'}")
         return proc.stdout.strip()
 
     def cmdline(self, pid: int) -> str:
@@ -2278,9 +2293,9 @@ def cmd_add(argv: list[str]) -> int:
     else:
         out(f"→ logging in to '{name}' (a browser window will open)")
     env = dict(os.environ, CODEX_HOME=str(home))
-    subprocess.run(["codex", "login", *login_args], env=env)
+    result = subprocess.run(["codex", "login", *login_args], env=env)
     secure_profile(home)
-    return 0
+    return result.returncode
 
 
 # ── rename, rm, link ─────────────────────────────────────────────────────────
@@ -2518,14 +2533,14 @@ def cmd_app(argv: list[str]) -> int:
     if stock:
         # Reuse the app's default Electron session — the existing ChatGPT
         # desktop login — rather than giving this profile its own.
-        subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
-                        "-a", app, workspace])
+        result = subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
+                                 "-a", app, workspace])
     else:
         (home / "electron").mkdir(parents=True, exist_ok=True)
-        subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
-                        "-a", app, workspace,
-                        "--args", f"--user-data-dir={home}/electron"])
-    return 0
+        result = subprocess.run(["open", "-n", "--env", f"CODEX_HOME={home}",
+                                 "-a", app, workspace,
+                                 "--args", f"--user-data-dir={home}/electron"])
+    return result.returncode
 
 
 def cmd_ssh(argv: list[str]) -> int:

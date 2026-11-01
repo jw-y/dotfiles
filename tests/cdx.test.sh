@@ -289,8 +289,13 @@ rm -f "$D/profiles/lab/config.toml"; echo 'clobbered' > "$D/profiles/lab/config.
 ln -sfn "$D/profiles/nowhere/sessions" "$D/profiles/lab/sessions"                       # dangling
 ln -sfn "$D/profiles/main/state_5.sqlite" "$D/profiles/lab/state_5.sqlite"              # stale, points at a profile
 rm -f "$D/profiles/lab/AGENTS.md"                                                        # missing entirely
+out="$(cdx "$D" link)"
+it "reports divergent settings";          assert_contains "$out" "both files preserved"
+it "keeps settings Codex saved";          assert_eq "$(cat "$D/profiles/lab/config.toml")" "clobbered"
+it "keeps the shared settings";           assert_contains "$(cat "$S/config.toml")" 'model="gpt-5"'
+cp "$S/config.toml" "$D/profiles/lab/config.toml"
 cdx "$D" link >/dev/null
-it "repairs a link Codex overwrote";      assert_link "$D/profiles/lab/config.toml" "$S/config.toml"
+it "repairs a reconciled config link";    assert_link "$D/profiles/lab/config.toml" "$S/config.toml"
 it "repairs a dangling link";             assert_link "$D/profiles/lab/sessions" "$S/sessions"
 it "does not create shared state links";  assert_link "$D/profiles/lab/state_5.sqlite" "$D/profiles/main/state_5.sqlite"
 it "doctor rejects legacy state links";  assert_eq "$(cdx "$D" doctor --json | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["unsafe_sqlite_links"]))')" "1"
@@ -611,12 +616,12 @@ cp "$CDX" "$ROOT/self-update/cdx"
 cp "$CDX" "$ROOT/self-update/latest"
 python3 -c 'import pathlib,sys
 p=pathlib.Path(sys.argv[1]); data=p.read_text();
-p.write_text(data.replace("CDX_VERSION = \"0.1.6\"", "CDX_VERSION = \"0.2.0\"", 1))' \
+p.write_text(data.replace("CDX_VERSION = \"0.1.7\"", "CDX_VERSION = \"0.2.0\"", 1))' \
     "$ROOT/self-update/latest"
 chmod +x "$ROOT/self-update/cdx" "$ROOT/self-update/latest"
 update_env=(env -i HOME="$U" PATH="/usr/bin:/bin:/usr/sbin" TMPDIR=/tmp NO_COLOR=1 TERM=dumb
     CDX_UPDATE_URL="file://$ROOT/self-update/latest")
-it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.6"
+it "version is embedded in cdx";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.1.7"
 it "update check sees a newer release";  assert_contains "$("${update_env[@]}" "$ROOT/self-update/cdx" update --check)" "0.2.0 is available"
 "${update_env[@]}" "$ROOT/self-update/cdx" update >/dev/null
 it "update installs atomically";         assert_eq "$("${update_env[@]}" "$ROOT/self-update/cdx" version)" "cdx 0.2.0"
@@ -713,10 +718,19 @@ rm -f "$U"/profiles/*/.cdx-usage.json
 # as the workspace path — and launch non-stock anyway.
 echo "${DIM}app${OFF}"
 APP="$(store_env app)"
-# Reaching the macOS check means the words were parsed as flag/name, not
-# rejected as a bad profile name or swallowed as the workspace path.
-it "--stock is a flag, not a name";      assert_contains "$(cdx "$APP" app --stock)" "macOS-only"
-it "--stock is a flag, not a workspace"; assert_contains "$(cdx "$APP" app lab --stock)" "macOS-only"
+# Stub the launcher on macOS: parsing tests must never launch the real app.
+cat > "$APP/bin/open" <<'STUB'
+#!/bin/sh
+printf 'launcher %s\n' "$*"
+STUB
+chmod +x "$APP/bin/open"
+if [ "$(uname -s)" = Darwin ]; then
+    it "--stock is a flag, not a name";      assert_contains "$(cdx "$APP" app --stock)" "CODEX_HOME=$APP/profiles/main -a"
+    it "--stock is a flag, not a workspace"; assert_contains "$(cdx "$APP" app lab --stock)" "CODEX_HOME=$APP/profiles/lab -a"
+else
+    it "--stock is a flag, not a name";      assert_contains "$(cdx "$APP" app --stock)" "macOS-only"
+    it "--stock is a flag, not a workspace"; assert_contains "$(cdx "$APP" app lab --stock)" "macOS-only"
+fi
 it "still rejects unknown options";      assert_contains "$(cdx "$APP" app lab --bogus)" "unknown option to 'app'"
 it "rejects a third positional";         assert_contains "$(cdx "$APP" app lab /tmp extra)" "unexpected argument"
 

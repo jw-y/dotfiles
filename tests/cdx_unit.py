@@ -18,13 +18,16 @@ rather than imported by name.
 
 import importlib.machinery
 import importlib.util
+import contextlib
 import io
 import json
 import sys
 import tempfile
 import time
+import subprocess
 import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parent.parent / "bin" / "cdx"
 spec = importlib.util.spec_from_loader(
@@ -614,6 +617,90 @@ with tempfile.TemporaryDirectory() as tmp:
         check("conflicting names are reported", len(result["mismatches"]), 1)
     finally:
         cdx.shared_src = original_src
+
+print("reviewed storage policy")
+with tempfile.TemporaryDirectory() as tmp:
+    profiles = Path(tmp)
+    store, home = profiles / ".store", profiles / "work"
+    store.mkdir(); home.mkdir()
+    (store / ".sqlite-maintenance.lock").touch()
+    (home / "node_repl" / "active_execs").mkdir(parents=True)
+    (home / "code-review-plugin").mkdir()
+    (home / "future-state").mkdir()
+    with patch.multiple(cdx, PROFILES=profiles, STORE=store):
+        unknowns = cdx.storage_unknowns()
+        cdx.link_shared(home)
+    check("reviewed storage names are recognized", [item["name"] for item in unknowns], ["future-state"])
+    check("runtime state stays local", (home / "node_repl").is_dir() and not (home / "node_repl").is_symlink(), True)
+    check("maintenance lock stays in the store", (store / ".sqlite-maintenance.lock").exists(), True)
+
+print("process inspection and command failures")
+for status, expected in [(0, [123]), (1, []), (3, "error")]:
+    result = subprocess.CompletedProcess(["pgrep"], status,
+                                         "123\n" if status == 0 else "",
+                                         "permission denied" if status == 3 else "")
+    with patch.object(cdx.Processes, "username", return_value="testuser"), \
+            patch.object(cdx.subprocess, "run", return_value=result), \
+            contextlib.redirect_stderr(io.StringIO()):
+        try:
+            actual = cdx.Processes().matching("codex")
+        except SystemExit:
+            actual = "error"
+    check(f"pgrep exit {status} is handled correctly", actual, expected)
+
+with patch.object(cdx.subprocess, "run", return_value=subprocess.CompletedProcess(["id"], 1, "", "denied")), \
+        contextlib.redirect_stderr(io.StringIO()):
+    try:
+        cdx.Processes().username()
+        refused = False
+    except SystemExit:
+        refused = True
+check("failed user lookup stops inspection", refused, True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    store, home = root / ".store", root / "work"
+    store.mkdir(); home.mkdir()
+    (store / "config.toml").write_text('model = "old"\n')
+    (home / "config.toml").write_text('model = "updated"\n')
+    with patch.object(cdx, "shared_src", return_value=store), \
+            contextlib.redirect_stderr(io.StringIO()):
+        try:
+            cdx.link_shared(home)
+            refused = False
+        except SystemExit:
+            refused = True
+    check("divergent settings stop the command", refused, True)
+    check("app settings survive repair", (home / "config.toml").read_text(), 'model = "updated"\n')
+    check("shared settings survive repair", (store / "config.toml").read_text(), 'model = "old"\n')
+    link = root / ".codex"
+    link.symlink_to(home)
+    (root / "new").mkdir()
+    with patch.multiple(cdx, CODEX_LINK=link, PROFILES=root), \
+            patch.object(cdx, "acquire_switch_lock"), \
+            patch.object(cdx.Processes, "username", return_value="testuser"), \
+            patch.object(cdx.subprocess, "run", return_value=subprocess.CompletedProcess(["pgrep"], 3, "", "denied")), \
+            contextlib.redirect_stderr(io.StringIO()):
+        try:
+            cdx.cmd_use(["new"])
+            refused = False
+        except SystemExit:
+            refused = True
+    check("failed inspection blocks switching", refused, True)
+    check("failed inspection preserves the active profile", link.resolve(), home.resolve())
+    with patch.object(cdx, "home_of", return_value=home), \
+            patch.object(cdx, "link_shared"), \
+            patch.object(cdx.os, "uname") as uname, \
+            patch.dict(cdx.os.environ, {"CHATGPT_APP": "/fake/ChatGPT.app"}), \
+            patch.object(cdx.subprocess, "run", return_value=subprocess.CompletedProcess([], 7)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        uname.return_value.sysname = "Darwin"
+        stock_status = cdx.cmd_app(["work", "--stock"])
+        profile_status = cdx.cmd_app(["work"])
+        login_status = cdx.cmd_add(["work"])
+    check("stock launch propagates failure", stock_status, 7)
+    check("profile launch propagates failure", profile_status, 7)
+    check("login propagates failure", login_status, 7)
 
 print()
 print(f"{PASS} passed" if not FAIL else f"{PASS} passed, {FAIL} failed")
