@@ -54,12 +54,15 @@ On each server, from your dotfiles checkout:
 ./bin/ts-user ssh         # opt in to SSH forwarding on tailnet port 2222
 ```
 
-Open the login URL on your laptop. Once authenticated, the device is named
-`<hostname>-<username>` (for example `server1-alice`). From a laptop connected to
-the same tailnet, use `ssh -p 2222 alice@server1-alice`, or use its Tailscale IP
+Open the login URL on your laptop. Tailscale uses its default device name,
+derived from the server's hostname. From a laptop connected to
+the same tailnet, use `ssh -p 2222 alice@server1`, or use its Tailscale IP
 if MagicDNS is unavailable. Tailnet access rules must allow TCP port 2222.
 Forwarding uses the server's existing SSH service and its normal login rules;
 it does not restrict SSH authentication to your Linux account.
+
+If an earlier setup set a custom hostname, clear that override once with
+`./bin/ts-user cli set --hostname=` to return to Tailscale's default naming.
 
 After `make update`, the helper is also available as `ts-user` on PATH:
 

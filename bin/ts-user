@@ -3,7 +3,6 @@
 
 import argparse
 import fcntl
-import getpass
 import hashlib
 import json
 import os
@@ -177,8 +176,7 @@ def main():
         if args.command == "stop":
             ts.stop()
     if args.command == "setup":
-        return ts.cli("up", "--hostname=" + ts.host + "-" + getpass.getuser(),
-                      "--accept-dns=false", "--accept-routes=false").returncode
+        return ts.cli("up", "--accept-dns=false", "--accept-routes=false").returncode
     if args.command == "ssh":
         return ts.cli("serve", "--bg", "--tcp=2222", "tcp://127.0.0.1:22").returncode
     if args.command in ("cli", "status"):
