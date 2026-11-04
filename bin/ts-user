@@ -155,7 +155,7 @@ def main():
             command_parser.add_argument("--version", help="Use a specific release for a fresh install (default: latest stable)")
     sub.add_parser("cli", help="Pass remaining arguments to the private Tailscale CLI").add_argument(
         "args", nargs=argparse.REMAINDER)
-    sub.add_parser("ssh", help="Forward tailnet port 2222 to local SSH port 22")
+    sub.add_parser("ssh", help="Optional alternate SSH entry: tailnet port 2222 to local port 22")
     argv = sys.argv[1:]
     if argv[:1] == ["cli"]:
         argv.insert(1, "--")  # Leave even --help to the Tailscale CLI.

@@ -51,15 +51,20 @@ On each server, from your dotfiles checkout:
 ```bash
 ./bin/ts-user setup       # download verified binaries, start, print login URL
 ./bin/ts-user status
-./bin/ts-user ssh         # opt in to SSH forwarding on tailnet port 2222
 ```
 
 Open the login URL on your laptop. Tailscale uses its default device name,
 derived from the server's hostname. From a laptop connected to
-the same tailnet, use `ssh -p 2222 alice@server1`, or use its Tailscale IP
-if MagicDNS is unavailable. Tailnet access rules must allow TCP port 2222.
-Forwarding uses the server's existing SSH service and its normal login rules;
-it does not restrict SSH authentication to your Linux account.
+the same tailnet, use `ssh alice@server1`, or use its Tailscale IP
+if MagicDNS is unavailable. Tailnet access rules must allow TCP port 22.
+Userspace mode forwards incoming connections to the same port on localhost,
+so the existing SSH service on port 22 is reachable without a Serve rule.
+It retains its normal login rules and does not restrict authentication to your
+Linux account. Other localhost services can also be reachable through the
+tailnet, subject to its access rules.
+
+`ts-user ssh` is optional: it adds an alternate SSH entry on tailnet port 2222
+using Tailscale Serve. Only that alternate entry needs `ssh -p 2222`.
 
 If an earlier setup set a custom hostname, clear that override once with
 `./bin/ts-user cli set --hostname=` to return to Tailscale's default naming.
@@ -67,7 +72,7 @@ If an earlier setup set a custom hostname, clear that override once with
 After `make update`, the helper is also available as `ts-user` on PATH:
 
 ```bash
-ts-user start            # restart with saved credentials and forwarding
+ts-user start            # restart with saved credentials
 ts-user stop             # stop only this host's verified daemon
 ts-user cli ip -4
 ts-user cli serve status
@@ -92,7 +97,8 @@ allows it. Root on the server can still access your Tailscale credentials.
 
 References: [userspace networking](https://tailscale.com/docs/concepts/userspace-networking),
 [TCP forwarding](https://tailscale.com/docs/reference/tailscale-cli/serve),
-[official downloads and checksums](https://pkgs.tailscale.com/stable/).
+[official downloads and checksums](https://pkgs.tailscale.com/stable/),
+[incoming userspace connections](https://hub.docker.com/r/tailscale/tailscale).
 
 ## Switching Codex accounts (`cdx`)
 
