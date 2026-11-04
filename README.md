@@ -84,15 +84,38 @@ specific release, use `ts-user setup --version X.Y.Z`. Rerunning setup preserves
 existing binaries and credentials; it does not automatically upgrade an existing
 installation. No local SOCKS proxy is opened by default.
 
-The daemon detaches from your terminal, but this does **not** configure reboot
-startup or guarantee survival if the server terminates processes at logout.
-Run `ts-user start` after a reboot; automatic startup needs a separately
-configured service supported by the server. Use this where the owner's policy
-allows it. Root on the server can still access your Tailscale credentials.
+Enable automatic startup once on each server after completing setup:
+
+```bash
+ts-user enable-autostart
+```
+
+This creates a host-specific systemd user service, starts it at boot, and
+restarts it after a crash. It reuses the existing credentials. The command
+checks the user service manager and enables lingering for your account if the
+server permits it. If permission is denied, it prints the command an
+administrator needs to run; it does not claim boot startup is configured.
+Lingering keeps the user service manager running without an SSH login.
+
+Use your original SSH connection when enabling or disabling the service:
+migrating from the manual daemon briefly interrupts Tailscale connections.
+The service manager completes the handover independently of your SSH session.
+`ts-user start` and `ts-user stop` control the service once configured. Service
+logs are in `journalctl --user -u ts-user-$(hostname -s).service`, rather than
+the manual daemon's log file. Run `ts-user disable-autostart` to disable boot
+startup and stop the daemon; this retains credentials and does not disable
+account-wide lingering that other services might use. The service references
+this dotfiles checkout, so keep it at its current location or rerun
+`enable-autostart` after moving it.
+
+Without automatic startup, the daemon detaches from the terminal but might be
+terminated at logout and needs `ts-user start` after a reboot. Use this where
+the owner's policy allows it. Root can still access your Tailscale credentials.
 
 References: [userspace networking](https://tailscale.com/docs/concepts/userspace-networking),
 [official downloads and checksums](https://pkgs.tailscale.com/stable/),
 [incoming userspace connections](https://hub.docker.com/r/tailscale/tailscale).
+See also [systemd user lingering](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html).
 
 ## Switching Codex accounts (`cdx`)
 

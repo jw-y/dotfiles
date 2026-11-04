@@ -12,6 +12,7 @@ import re
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -28,14 +29,94 @@ class Error(Exception):
 
 class Tailscale:
     def __init__(self):
-        self.host = socket.gethostname().split(".")[0]
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.host):
-            raise Error("Hostname must contain only letters, digits, underscores or hyphens")
+        self.hostname = socket.gethostname()
+        self.host = self.hostname.split(".")[0]
+        if not self.host or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.hostname):
+            raise Error("Hostname must contain only letters, digits, dots, underscores or hyphens")
         self.root = Path.home() / ".local/share/ts-user" / self.host
         self.bins = self.root / "bin"
         self.sock = self.root / "tailscaled.sock"
         self.pidfile = self.root / "tailscaled.pid"
         self.log = self.root / "tailscaled.log"
+        self.unit_name = "ts-user-" + self.host + ".service"
+        self.unit = Path.home() / ".config/systemd/user" / self.unit_name
+
+    def systemctl(self, *args, **kwargs):
+        return subprocess.run(["systemctl", "--user", *args], **kwargs)
+
+    def daemon_args(self):
+        return [str(self.bins / "tailscaled"), "--tun=userspace-networking",
+                "--socket=" + str(self.sock), "--state=" + str(self.root / "state")]
+
+    def clear_stale_socket(self):
+        if self.sock.exists():
+            if not stat.S_ISSOCK(self.sock.lstat().st_mode):
+                raise Error("Socket already exists as a non-socket file: " + str(self.sock))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.connect(str(self.sock))
+                except ConnectionRefusedError:
+                    self.sock.unlink()
+                    return
+            raise Error("Socket already exists; inspect it before restarting: " + str(self.sock))
+
+    def enable_autostart(self):
+        if not all((self.bins / name).is_file() for name in ("tailscale", "tailscaled")):
+            raise Error("Run ts-user setup first")
+        if self.systemctl("show-environment", stdout=subprocess.DEVNULL).returncode:
+            raise Error("A working systemd user manager is required for automatic startup")
+
+        def lingering():
+            result = subprocess.run(["loginctl", "show-user", str(os.getuid()),
+                                     "--property=Linger", "--value"],
+                                    stdout=subprocess.PIPE, text=True)
+            return result.returncode == 0 and result.stdout.strip() == "yes"
+
+        if not lingering():
+            subprocess.run(["loginctl", "--no-ask-password", "enable-linger"])
+            if not lingering():
+                raise Error("Boot startup needs lingering. Ask the administrator to run: "
+                            "loginctl enable-linger " + str(os.getuid()))
+
+        # systemd command lines have their own quoting and expansion rules.
+        def quote(value):
+            return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace(
+                "%", "%%").replace("$", "$$") + '"'
+
+        prepare = [sys.executable, str(Path(__file__).resolve()), "_prepare-service"]
+        content = ("# Managed by ts-user enable-autostart\n"
+                   "[Unit]\nDescription=Per-user Tailscale\nConditionHost=" + self.hostname + "\n\n"
+                   "[Service]\nType=simple\nUMask=0077\n"
+                   "ExecStartPre=" + " ".join(map(quote, prepare)) + "\n"
+                   "ExecStart=" + " ".join(map(quote, self.daemon_args())) + "\n"
+                   "Restart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n"
+                   "[Install]\nWantedBy=default.target\n")
+        if self.unit.exists() and not self.unit.read_text().startswith(
+                "# Managed by ts-user enable-autostart\n"):
+            raise Error("Refusing to overwrite an unmanaged unit: " + str(self.unit))
+        self.unit.parent.mkdir(parents=True, exist_ok=True)
+        self.unit.write_text(content)
+        if self.systemctl("daemon-reload").returncode:
+            raise Error("Could not reload systemd user services")
+        # ExecStartPre performs migration inside the service manager, so it completes
+        # even if stopping the manual daemon interrupts this SSH connection.
+        if self.systemctl("enable", "--now", self.unit_name).returncode:
+            raise Error("Could not start service; inspect: journalctl --user -u " + self.unit_name)
+        print("Boot startup enabled: " + self.unit_name)
+        print("Service logs: journalctl --user -u " + self.unit_name)
+
+    def disable_autostart(self):
+        if not self.unit.exists():
+            print("Automatic startup is not configured on this host.")
+            return
+        if not self.unit.read_text().startswith("# Managed by ts-user enable-autostart\n"):
+            raise Error("Refusing to remove an unmanaged unit: " + str(self.unit))
+        if self.systemctl("disable", "--now", self.unit_name).returncode:
+            raise Error("Could not disable user service")
+        self.unit.unlink()
+        if self.systemctl("daemon-reload").returncode:
+            raise Error("Could not reload systemd user services")
+        print("Automatic startup disabled; daemon stopped and credentials retained.")
 
     def cli(self, *args, **kwargs):
         return subprocess.run([str(self.bins / "tailscale"),
@@ -106,16 +187,12 @@ class Tailscale:
         if self.pid():
             print("Daemon already running.")
             return
-        if self.sock.exists():
-            # A daemon may be running without our PID file. Never unlink its socket.
-            raise Error("Socket already exists; inspect it before restarting: " + str(self.sock))
+        self.clear_stale_socket()
         if len(os.fsencode(self.sock)) > 100:
             raise Error("Home path is too long for the private Unix socket")
         with self.log.open("ab") as log:
-            process = subprocess.Popen([
-                str(self.bins / "tailscaled"), "--tun=userspace-networking",
-                "--socket=" + str(self.sock), "--state=" + str(self.root / "state"),
-            ], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            process = subprocess.Popen(self.daemon_args(), stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=log, start_new_session=True)
         self.pidfile.write_text(str(process.pid) + "\n")
         for _ in range(100):
             if process.poll() is not None:
@@ -149,7 +226,8 @@ class Tailscale:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("install", "setup", "start", "stop", "status"):
+    for command in ("install", "setup", "start", "stop", "status",
+                    "enable-autostart", "disable-autostart", "_prepare-service"):
         command_parser = sub.add_parser(command)
         if command in ("install", "setup"):
             command_parser.add_argument("--version", help="Use a specific release for a fresh install (default: latest stable)")
@@ -165,15 +243,32 @@ def main():
     ts = Tailscale()
     ts.root.mkdir(parents=True, exist_ok=True, mode=0o700)
     ts.root.chmod(0o700)
+    if args.command == "enable-autostart":
+        ts.enable_autostart()
+        return 0
+    if args.command == "disable-autostart":
+        ts.disable_autostart()
+        return 0
+    if args.command in ("start", "stop") and ts.unit.exists():
+        return ts.systemctl(args.command, ts.unit_name).returncode
     # Serialize lifecycle commands, but don't hold the lock during interactive login.
     with (ts.root / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command in ("install", "setup"):
             ts.install(args.version)
-        if args.command in ("start", "setup"):
+        if args.command in ("start", "setup") and not ts.unit.exists():
             ts.start()
         if args.command == "stop":
             ts.stop()
+        if args.command == "_prepare-service":
+            if ts.pid():
+                ts.stop()
+            ts.clear_stale_socket()
+            ts.pidfile.unlink(missing_ok=True)
+    if args.command == "setup" and ts.unit.exists():
+        result = ts.systemctl("start", ts.unit_name)
+        if result.returncode:
+            return result.returncode
     if args.command == "setup":
         return ts.cli("up", "--accept-dns=false", "--accept-routes=false").returncode
     if args.command in ("cli", "status"):

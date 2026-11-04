@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import runpy
+import socket
 import tarfile
 import tempfile
 import unittest
@@ -143,6 +144,94 @@ class TailscaleTests(unittest.TestCase):
             self.ts.cli("status")
         self.assertEqual(run.call_args.args[0], [str(self.ts.bins / "tailscale"),
                          "--socket=" + str(self.ts.sock), "status"])
+
+    def prepare_binaries(self):
+        self.ts.bins.mkdir()
+        for name in ("tailscale", "tailscaled"):
+            (self.ts.bins / name).touch()
+
+    def test_autostart_requires_lingering_before_writing_unit(self):
+        self.prepare_binaries()
+        with patch.object(self.ts, "systemctl", return_value=SimpleNamespace(returncode=0)), patch(
+            "subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="no\n")
+        ), patch.object(self.ts, "stop") as stop:
+            with self.assertRaisesRegex(Error, "administrator"):
+                self.ts.enable_autostart()
+        self.assertFalse(self.ts.unit.exists())
+        stop.assert_not_called()
+
+    def test_autostart_unit_is_host_scoped_and_supervises_daemon(self):
+        self.prepare_binaries()
+        with patch.object(self.ts, "systemctl", return_value=SimpleNamespace(returncode=0)) as ctl, patch(
+            "subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="yes\n")
+        ), patch.object(self.ts, "stop") as stop:
+            self.ts.enable_autostart()
+        text = self.ts.unit.read_text()
+        self.assertIn("ConditionHost=server1.example.org\n", text)
+        self.assertIn("Restart=on-failure\n", text)
+        self.assertIn("UMask=0077\n", text)
+        self.assertIn("_prepare-service", text)
+        self.assertIn(str(self.ts.root / "state"), text)
+        self.assertIn("--tun=userspace-networking", text)
+        self.assertEqual(ctl.call_args.args, ("enable", "--now", self.ts.unit_name))
+        stop.assert_not_called()  # Migration belongs to systemd, not the SSH caller.
+
+    def test_autostart_enables_lingering_when_permitted(self):
+        self.prepare_binaries()
+        with patch.object(self.ts, "systemctl", return_value=SimpleNamespace(returncode=0)), patch(
+            "subprocess.run", side_effect=[SimpleNamespace(returncode=0, stdout="no\n"),
+                                          SimpleNamespace(returncode=0),
+                                          SimpleNamespace(returncode=0, stdout="yes\n")]
+        ) as run:
+            self.ts.enable_autostart()
+        self.assertEqual(run.call_args_list[1].args[0],
+                         ["loginctl", "--no-ask-password", "enable-linger"])
+
+    def test_autostart_requires_user_manager(self):
+        self.prepare_binaries()
+        with patch.object(self.ts, "systemctl", return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(Error, "user manager"):
+                self.ts.enable_autostart()
+        self.assertFalse(self.ts.unit.exists())
+
+    def test_start_stop_delegate_to_installed_service(self):
+        self.ts.unit.parent.mkdir(parents=True)
+        self.ts.unit.touch()
+        for command in ("start", "stop"):
+            with self.subTest(command=command), patch("sys.argv", ["ts-user", command]), patch(
+                "platform.system", return_value="Linux"
+            ), patch("socket.gethostname", return_value="server1.example.org"), patch(
+                "subprocess.run", return_value=SimpleNamespace(returncode=0)
+            ) as run, patch.object(Tailscale, "start") as start, patch.object(Tailscale, "stop") as stop:
+                self.assertEqual(MODULE["main"](), 0)
+                self.assertEqual(run.call_args.args[0], ["systemctl", "--user", command, self.ts.unit_name])
+                start.assert_not_called()
+                stop.assert_not_called()
+
+    def test_disable_preserves_credentials(self):
+        self.ts.unit.parent.mkdir(parents=True)
+        self.ts.unit.write_text("# Managed by ts-user enable-autostart\n")
+        state = self.ts.root / "state"
+        state.write_text("credentials")
+        with patch.object(self.ts, "systemctl", return_value=SimpleNamespace(returncode=0)) as ctl:
+            self.ts.disable_autostart()
+        self.assertEqual(ctl.call_args_list[0].args, ("disable", "--now", self.ts.unit_name))
+        self.assertFalse(self.ts.unit.exists())
+        self.assertEqual(state.read_text(), "credentials")
+
+    def test_stale_socket_after_crash_is_removed(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.bind(str(self.ts.sock))
+        self.ts.clear_stale_socket()
+        self.assertFalse(self.ts.sock.exists())
+
+    def test_untracked_live_daemon_socket_is_preserved(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.bind(str(self.ts.sock))
+            sock.listen(1)
+            with self.assertRaisesRegex(Error, "Socket already exists"):
+                self.ts.clear_stale_socket()
+        self.assertTrue(self.ts.sock.exists())
 
 
 if __name__ == "__main__":
