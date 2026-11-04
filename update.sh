@@ -25,6 +25,7 @@ TOOLS=(
     cdx
     cdc
     smux
+    ts-user
 )
 
 backup_path() {

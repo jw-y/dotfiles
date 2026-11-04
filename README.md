@@ -40,6 +40,57 @@ make dry-run
 
 Run `make help` for all targets and environment-variable overrides.
 
+## Per-user Tailscale on Linux servers (`ts-user`)
+
+`ts-user` is an opt-in setup for Linux hosts where you can run user processes.
+It requires Python 3.8+, outbound HTTPS, and x86_64 or aarch64. No sudo is used. The normal dotfiles
+installer only links the helper; it does not download or start Tailscale.
+
+On each server, from your dotfiles checkout:
+
+```bash
+./bin/ts-user setup       # download verified binaries, start, print login URL
+./bin/ts-user status
+./bin/ts-user ssh         # opt in to SSH forwarding on tailnet port 2222
+```
+
+Open the login URL on your laptop. Once authenticated, the device is named
+`<hostname>-<username>` (for example `server1-alice`). From a laptop connected to
+the same tailnet, use `ssh -p 2222 alice@server1-alice`, or use its Tailscale IP
+if MagicDNS is unavailable. Tailnet access rules must allow TCP port 2222.
+Forwarding uses the server's existing SSH service and its normal login rules;
+it does not restrict SSH authentication to your Linux account.
+
+After `make update`, the helper is also available as `ts-user` on PATH:
+
+```bash
+ts-user start            # restart with saved credentials and forwarding
+ts-user stop             # stop only this host's verified daemon
+ts-user cli ip -4
+ts-user cli serve status
+ts-user cli serve --tcp=2222 off
+ts-user cli --help
+```
+
+Binaries, credentials, PID, private socket, and logs are stored under
+`~/.local/share/ts-user/<hostname>/`, with private permissions and separate state
+for hosts sharing a home directory. Keep hostnames unique and do not commit this
+state. A fresh installation resolves the latest stable Linux release from the
+official package server and verifies its published SHA-256 checksum. For a
+specific release, use `ts-user setup --version X.Y.Z`. Rerunning setup preserves
+existing binaries and credentials; it does not automatically upgrade an existing
+installation. No local SOCKS proxy is opened by default.
+
+The daemon detaches from your terminal, but this does **not** configure reboot
+startup or guarantee survival if the server terminates processes at logout.
+Run `ts-user start` after a reboot; automatic startup needs a separately
+configured service supported by the server. Use this where the owner's policy
+allows it. Root on the server can still access your Tailscale credentials.
+
+References: [userspace networking](https://tailscale.com/docs/concepts/userspace-networking),
+[TCP forwarding](https://tailscale.com/docs/reference/tailscale-cli/serve),
+[official downloads and checksums](https://pkgs.tailscale.com/stable/).
+
 ## Switching Codex accounts (`cdx`)
 
 Every Codex client — CLI, desktop app, VS Code, and the app's SSH remote — reads `~/.codex`. `cdx` makes that path a symlink, so activating an account is just re-pointing it and no client needs configuring.

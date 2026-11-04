@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Opt-in, rootless Tailscale for Linux SSH hosts (Python 3.8+)."""
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+PACKAGE_URL = "https://pkgs.tailscale.com/stable/"
+
+
+class Error(Exception):
+    pass
+
+
+class Tailscale:
+    def __init__(self):
+        self.host = socket.gethostname().split(".")[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.host):
+            raise Error("Hostname must contain only letters, digits, underscores or hyphens")
+        self.root = Path.home() / ".local/share/ts-user" / self.host
+        self.bins = self.root / "bin"
+        self.sock = self.root / "tailscaled.sock"
+        self.pidfile = self.root / "tailscaled.pid"
+        self.log = self.root / "tailscaled.log"
+
+    def cli(self, *args, **kwargs):
+        return subprocess.run([str(self.bins / "tailscale"),
+                               "--socket=" + str(self.sock), *args], **kwargs)
+
+    def install(self, version=None):
+        if all((self.bins / name).is_file() for name in ("tailscale", "tailscaled")):
+            print("Binaries already installed; leaving them unchanged.")
+            return
+        arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+        if not arch:
+            raise Error("Supported architectures: x86_64 and aarch64")
+        if version is None:
+            with urllib.request.urlopen(PACKAGE_URL + "?mode=json", timeout=30) as response:
+                metadata = json.load(response)
+            version = metadata.get("TarballsVersion") if isinstance(metadata, dict) else None
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise Error("Expected a numeric release version (major.minor.patch)")
+        name = "tailscale_" + version + "_" + arch
+        url = PACKAGE_URL + name + ".tgz"
+        # Only the two named regular files are copied; no archive paths are extracted.
+        with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+            archive = Path(tmp) / "download.tgz"
+            with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as out:
+                shutil.copyfileobj(response, out)
+            with urllib.request.urlopen(url + ".sha256", timeout=30) as response:
+                expected = response.read().decode().split()[0]
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            if digest != expected:
+                raise Error("Download checksum mismatch; no binaries installed")
+            with tarfile.open(archive) as tar:
+                for binary in ("tailscale", "tailscaled"):
+                    member = tar.getmember(name + "/" + binary)
+                    if not member.isfile():
+                        raise Error("Archive binary is not a regular file")
+                    target = Path(tmp) / binary
+                    with tar.extractfile(member) as source, target.open("wb") as out:
+                        shutil.copyfileobj(source, out)
+                    target.chmod(0o700)
+            self.bins.mkdir(exist_ok=True, mode=0o700)
+            for binary in ("tailscale", "tailscaled"):
+                os.replace(Path(tmp) / binary, self.bins / binary)
+        print("Installed Tailscale " + version)
+
+    def pid(self):
+        try:
+            pid = int(self.pidfile.read_text().strip())
+        except FileNotFoundError:
+            return None
+        if pid <= 1:
+            raise Error("Invalid daemon PID")
+        proc = Path("/proc") / str(pid)
+        try:
+            args = (proc / "cmdline").read_bytes().split(b"\0")
+            if args == [b""]:
+                return None  # Exited process awaiting reaping.
+            matches = (proc.stat().st_uid == os.getuid()
+                       and ("--socket=" + str(self.sock)).encode() in args
+                       and b"--tun=userspace-networking" in args
+                       and (proc / "exe").resolve() == (self.bins / "tailscaled").resolve())
+        except FileNotFoundError:
+            return None
+        if not matches:
+            raise Error("PID does not identify this daemon; refusing to signal or replace it")
+        return pid
+
+    def start(self):
+        if self.pid():
+            print("Daemon already running.")
+            return
+        if self.sock.exists():
+            # A daemon may be running without our PID file. Never unlink its socket.
+            raise Error("Socket already exists; inspect it before restarting: " + str(self.sock))
+        if len(os.fsencode(self.sock)) > 100:
+            raise Error("Home path is too long for the private Unix socket")
+        with self.log.open("ab") as log:
+            process = subprocess.Popen([
+                str(self.bins / "tailscaled"), "--tun=userspace-networking",
+                "--socket=" + str(self.sock), "--state=" + str(self.root / "state"),
+            ], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        self.pidfile.write_text(str(process.pid) + "\n")
+        for _ in range(100):
+            if process.poll() is not None:
+                self.pidfile.unlink(missing_ok=True)
+                raise Error("Daemon exited; inspect " + str(self.log))
+            if self.sock.exists():
+                print("Daemon started. Log: " + str(self.log))
+                return
+            time.sleep(0.1)
+        raise Error("Daemon is still starting; inspect " + str(self.log))
+
+    def stop(self):
+        pid = self.pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(100):
+                if not self.pid():
+                    break
+                time.sleep(0.1)
+            else:
+                raise Error("Daemon has not stopped; inspect " + str(self.log))
+        elif self.sock.exists():
+            raise Error("Socket exists without a verified PID; inspect " + str(self.sock))
+        self.pidfile.unlink(missing_ok=True)
+        # Only after verifying the tracked process exited.
+        if pid:
+            self.sock.unlink(missing_ok=True)
+        print("Daemon stopped; credentials and forwarding configuration retained.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for command in ("install", "setup", "start", "stop", "status"):
+        command_parser = sub.add_parser(command)
+        if command in ("install", "setup"):
+            command_parser.add_argument("--version", help="Use a specific release for a fresh install (default: latest stable)")
+    sub.add_parser("cli", help="Pass remaining arguments to the private Tailscale CLI").add_argument(
+        "args", nargs=argparse.REMAINDER)
+    sub.add_parser("ssh", help="Forward tailnet port 2222 to local SSH port 22")
+    argv = sys.argv[1:]
+    if argv[:1] == ["cli"]:
+        argv.insert(1, "--")  # Leave even --help to the Tailscale CLI.
+    args = parser.parse_args(argv)
+    if platform.system() != "Linux":
+        raise Error("ts-user runs on Linux servers; use the regular Tailscale app on macOS")
+    os.umask(0o077)
+    ts = Tailscale()
+    ts.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ts.root.chmod(0o700)
+    # Serialize lifecycle commands, but don't hold the lock during interactive login.
+    with (ts.root / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command in ("install", "setup"):
+            ts.install(args.version)
+        if args.command in ("start", "setup"):
+            ts.start()
+        if args.command == "stop":
+            ts.stop()
+    if args.command == "setup":
+        return ts.cli("up", "--hostname=" + ts.host + "-" + getpass.getuser(),
+                      "--accept-dns=false", "--accept-routes=false").returncode
+    if args.command == "ssh":
+        return ts.cli("serve", "--bg", "--tcp=2222", "tcp://127.0.0.1:22").returncode
+    if args.command in ("cli", "status"):
+        return ts.cli(*(args.args[1:] if args.command == "cli" else ["status"])).returncode
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Error, OSError, ValueError, tarfile.TarError) as error:
+        print("ts-user: " + str(error), file=sys.stderr)
+        sys.exit(1)
