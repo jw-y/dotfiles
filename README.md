@@ -63,9 +63,6 @@ It retains its normal login rules and does not restrict authentication to your
 Linux account. Other localhost services can also be reachable through the
 tailnet, subject to its access rules.
 
-`ts-user ssh` is optional: it adds an alternate SSH entry on tailnet port 2222
-using Tailscale Serve. Only that alternate entry needs `ssh -p 2222`.
-
 If an earlier setup set a custom hostname, clear that override once with
 `./bin/ts-user cli set --hostname=` to return to Tailscale's default naming.
 
@@ -75,8 +72,6 @@ After `make update`, the helper is also available as `ts-user` on PATH:
 ts-user start            # restart with saved credentials
 ts-user stop             # stop only this host's verified daemon
 ts-user cli ip -4
-ts-user cli serve status
-ts-user cli serve --tcp=2222 off
 ts-user cli --help
 ```
 
@@ -96,7 +91,6 @@ configured service supported by the server. Use this where the owner's policy
 allows it. Root on the server can still access your Tailscale credentials.
 
 References: [userspace networking](https://tailscale.com/docs/concepts/userspace-networking),
-[TCP forwarding](https://tailscale.com/docs/reference/tailscale-cli/serve),
 [official downloads and checksums](https://pkgs.tailscale.com/stable/),
 [incoming userspace connections](https://hub.docker.com/r/tailscale/tailscale).
 
