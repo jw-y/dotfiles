@@ -42,14 +42,15 @@ Run `make help` for all targets and environment-variable overrides.
 
 ## Per-user Tailscale on Linux servers (`ts-user`)
 
-`ts-user` is an opt-in setup for Linux hosts where you can run user processes.
-It requires Python 3.8+, outbound HTTPS, and x86_64 or aarch64. No sudo is used. The normal dotfiles
+`ts-user` sets up Tailscale for Linux hosts where you can run user processes.
+It requires Python 3.8+, outbound HTTPS, x86_64 or aarch64, and a working systemd
+user manager with lingering permitted for your account. No sudo is used. The normal dotfiles
 installer only links the helper; it does not download or start Tailscale.
 
 On each server, from your dotfiles checkout:
 
 ```bash
-./bin/ts-user setup       # download verified binaries, start, print login URL
+./bin/ts-user setup       # install, enable boot startup, start, print login URL
 ./bin/ts-user status
 ```
 
@@ -84,17 +85,12 @@ specific release, use `ts-user setup --version X.Y.Z`. Rerunning setup preserves
 existing binaries and credentials; it does not automatically upgrade an existing
 installation. No local SOCKS proxy is opened by default.
 
-Enable automatic startup once on each server after completing setup:
-
-```bash
-ts-user enable-autostart
-```
-
-This creates a host-specific systemd user service, starts it at boot, and
-restarts it after a crash. It reuses the existing credentials. The command
+`setup` enables automatic startup by default. It creates a host-specific systemd
+user service, starts it at boot, and restarts it after a crash. Rerun `setup`
+to migrate an existing manual daemon, preserving credentials. The command
 checks the user service manager and enables lingering for your account if the
 server permits it. If permission is denied, it prints the command an
-administrator needs to run; it does not claim boot startup is configured.
+administrator needs to run and fails before downloading or starting a daemon.
 Lingering keeps the user service manager running without an SSH login.
 
 Use your original SSH connection when enabling or disabling the service:
@@ -106,9 +102,11 @@ the manual daemon's log file. Run `ts-user disable-autostart` to disable boot
 startup and stop the daemon; this retains credentials and does not disable
 account-wide lingering that other services might use. The service references
 this dotfiles checkout, so keep it at its current location or rerun
-`enable-autostart` after moving it.
+`setup` after moving it. `enable-autostart` remains available to enable the
+service separately for an existing installation.
 
-Without automatic startup, the daemon detaches from the terminal but might be
+For a deliberately manual installation, `install` only downloads the binaries
+and `start` runs the daemon without configuring boot startup. In this mode it might be
 terminated at logout and needs `ts-user start` after a reboot. Use this where
 the owner's policy allows it. Root can still access your Tailscale credentials.
 

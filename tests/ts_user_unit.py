@@ -28,6 +28,9 @@ class TailscaleTests(unittest.TestCase):
         with patch("socket.gethostname", return_value="server1.example.org"):
             self.ts = Tailscale()
         self.ts.root.mkdir(parents=True)
+        ready_patch = patch.object(self.ts, "wait_ready")
+        ready_patch.start()
+        self.addCleanup(ready_patch.stop)
 
     def archive(self, link=False):
         stream = io.BytesIO()
@@ -207,6 +210,47 @@ class TailscaleTests(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0], ["systemctl", "--user", command, self.ts.unit_name])
                 start.assert_not_called()
                 stop.assert_not_called()
+
+    def test_setup_enables_autostart_before_login_without_manual_daemon(self):
+        events = []
+        with patch("sys.argv", ["ts-user", "setup"]), patch(
+            "platform.system", return_value="Linux"
+        ), patch("socket.gethostname", return_value="server1.example.org"), patch.object(
+            Tailscale, "require_autostart", side_effect=lambda: events.append("preflight")
+        ), patch.object(Tailscale, "install", side_effect=lambda version: events.append("install")), patch.object(
+            Tailscale, "enable_autostart", side_effect=lambda: events.append("service")
+        ), patch.object(Tailscale, "cli", side_effect=lambda *a: (
+            events.append("login") or SimpleNamespace(returncode=0)
+        )), patch.object(Tailscale, "start") as manual:
+            self.assertEqual(MODULE["main"](), 0)
+        self.assertEqual(events, ["preflight", "install", "service", "login"])
+        manual.assert_not_called()
+
+    def test_setup_stops_before_install_if_autostart_unavailable(self):
+        with patch("sys.argv", ["ts-user", "setup"]), patch(
+            "platform.system", return_value="Linux"
+        ), patch("socket.gethostname", return_value="server1.example.org"), patch.object(
+            Tailscale, "require_autostart", side_effect=Error("administrator needed")
+        ), patch.object(Tailscale, "install") as install, patch.object(
+            Tailscale, "enable_autostart"
+        ) as enable, patch.object(Tailscale, "cli") as cli:
+            with self.assertRaisesRegex(Error, "administrator"):
+                MODULE["main"]()
+        install.assert_not_called()
+        enable.assert_not_called()
+        cli.assert_not_called()
+
+    def test_wait_ready_accepts_daemon_needing_login(self):
+        self.ts.sock.touch()
+        with patch.object(self.ts, "cli", return_value=SimpleNamespace(
+            returncode=1, stdout='{"BackendState": "NeedsLogin"}'
+        )):
+            Tailscale.wait_ready(self.ts)
+
+    def test_wait_ready_reports_service_failure(self):
+        with patch("time.sleep"):
+            with self.assertRaisesRegex(Error, "Service is not ready"):
+                Tailscale.wait_ready(self.ts)
 
     def test_disable_preserves_credentials(self):
         self.ts.unit.parent.mkdir(parents=True)

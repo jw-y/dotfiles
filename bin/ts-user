@@ -60,9 +60,7 @@ class Tailscale:
                     return
             raise Error("Socket already exists; inspect it before restarting: " + str(self.sock))
 
-    def enable_autostart(self):
-        if not all((self.bins / name).is_file() for name in ("tailscale", "tailscaled")):
-            raise Error("Run ts-user setup first")
+    def require_autostart(self):
         if self.systemctl("show-environment", stdout=subprocess.DEVNULL).returncode:
             raise Error("A working systemd user manager is required for automatic startup")
 
@@ -78,6 +76,23 @@ class Tailscale:
                 raise Error("Boot startup needs lingering. Ask the administrator to run: "
                             "loginctl enable-linger " + str(os.getuid()))
 
+    def wait_ready(self):
+        for _ in range(50):
+            if self.sock.exists():
+                try:
+                    result = self.cli("status", "--json", stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True, timeout=1)
+                    if json.loads(result.stdout).get("BackendState"):
+                        return
+                except (ValueError, subprocess.TimeoutExpired):
+                    pass
+            time.sleep(0.1)
+        raise Error("Service is not ready; inspect: journalctl --user -u " + self.unit_name)
+
+    def enable_autostart(self):
+        if not all((self.bins / name).is_file() for name in ("tailscale", "tailscaled")):
+            raise Error("Run ts-user setup first")
+        self.require_autostart()
         # systemd command lines have their own quoting and expansion rules.
         def quote(value):
             return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace(
@@ -102,6 +117,7 @@ class Tailscale:
         # even if stopping the manual daemon interrupts this SSH connection.
         if self.systemctl("enable", "--now", self.unit_name).returncode:
             raise Error("Could not start service; inspect: journalctl --user -u " + self.unit_name)
+        self.wait_ready()
         print("Boot startup enabled: " + self.unit_name)
         print("Service logs: journalctl --user -u " + self.unit_name)
 
@@ -241,6 +257,8 @@ def main():
         raise Error("ts-user runs on Linux servers; use the regular Tailscale app on macOS")
     os.umask(0o077)
     ts = Tailscale()
+    if args.command == "setup":
+        ts.require_autostart()
     ts.root.mkdir(parents=True, exist_ok=True, mode=0o700)
     ts.root.chmod(0o700)
     if args.command == "enable-autostart":
@@ -256,7 +274,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command in ("install", "setup"):
             ts.install(args.version)
-        if args.command in ("start", "setup") and not ts.unit.exists():
+        if args.command == "start" and not ts.unit.exists():
             ts.start()
         if args.command == "stop":
             ts.stop()
@@ -265,11 +283,8 @@ def main():
                 ts.stop()
             ts.clear_stale_socket()
             ts.pidfile.unlink(missing_ok=True)
-    if args.command == "setup" and ts.unit.exists():
-        result = ts.systemctl("start", ts.unit_name)
-        if result.returncode:
-            return result.returncode
     if args.command == "setup":
+        ts.enable_autostart()
         return ts.cli("up", "--accept-dns=false", "--accept-routes=false").returncode
     if args.command in ("cli", "status"):
         return ts.cli(*(args.args[1:] if args.command == "cli" else ["status"])).returncode
