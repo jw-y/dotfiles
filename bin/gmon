@@ -2,7 +2,10 @@
 """GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
 
 import argparse
+import math
 import os
+import selectors
+import shlex
 import shutil
 import socket
 import subprocess
@@ -23,7 +26,7 @@ STALE_FACTOR = 3     # rows dim out if their last good poll is older than STALE_
 # ─────────────────────────────────────────────────────────────────────────────
 
 QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed"
-# Fetches GPU stats then process→user mapping in one SSH round-trip
+# Fetches GPU stats then process→user mapping in one snapshot
 # Uses gpu_uuid to correlate apps→GPU index (gpu_index not supported on all drivers)
 CMD = (
     f"nvidia-smi --query-gpu={QUERY} --format=csv,noheader,nounits 2>/dev/null; "
@@ -169,40 +172,44 @@ def query_host(host, ssh_opts):
         if not result.stdout.strip():
             return host, None, "no output"
 
-        sections = result.stdout.strip().split("---\n", 1)
-        gpu_lines = sections[0].strip().splitlines()
-        proc_lines = sections[1].strip().splitlines() if len(sections) > 1 else []
-
-        uuid_users: dict[str, list[str]] = {}
-        for line in proc_lines:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2:
-                uuid, user = parts
-                uuid_users.setdefault(uuid, [])
-                if user and user not in uuid_users[uuid]:
-                    uuid_users[uuid].append(user)
-
-        gpus = []
-        for line in gpu_lines:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 8:
-                continue
-            name, uuid, idx, util, mem_used, mem_total, temp, fan = parts[:8]
-            gpus.append({
-                "name":      name.removeprefix("NVIDIA ").strip(),
-                "idx":       idx,
-                "util":      _int(util),
-                "mem_used":  _int(mem_used),
-                "mem_total": _int(mem_total),
-                "temp":      _int(temp),
-                "fan":       _int(fan),
-                "users":     uuid_users.get(uuid, []),
-            })
-        return host, gpus, None
+        return host, parse_snapshot(result.stdout), None
     except subprocess.TimeoutExpired:
         return host, None, "timeout"
     except Exception as e:
         return host, None, str(e)
+
+
+def parse_snapshot(output):
+    sections = output.strip().split("---\n", 1)
+    gpu_lines = sections[0].strip().splitlines()
+    proc_lines = sections[1].strip().splitlines() if len(sections) > 1 else []
+
+    uuid_users: dict[str, list[str]] = {}
+    for line in proc_lines:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2:
+            uuid, user = parts
+            uuid_users.setdefault(uuid, [])
+            if user and user not in uuid_users[uuid]:
+                uuid_users[uuid].append(user)
+
+    gpus = []
+    for line in gpu_lines:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+        name, uuid, idx, util, mem_used, mem_total, temp, fan = parts[:8]
+        gpus.append({
+            "name":      name.removeprefix("NVIDIA ").strip(),
+            "idx":       idx,
+            "util":      _int(util),
+            "mem_used":  _int(mem_used),
+            "mem_total": _int(mem_total),
+            "temp":      _int(temp),
+            "fan":       _int(fan),
+            "users":     uuid_users.get(uuid, []),
+        })
+    return gpus
 
 
 def _int(val):
@@ -481,8 +488,86 @@ def run_once(hosts, ssh_opts):
     sys.stdout.flush()
 
 
+# A request/response loop inside ONE shell session. Refreshes write a newline
+# to the existing stdin; they never launch another ssh or SSH exec channel.
+# EOF on stdin ends the remote loop when gmon exits.
+FRAME_END = b"\n__GMON_FRAME_END__\n"
+STREAM_CMD = "while IFS= read -r request; do " + CMD + "; printf '\\n__GMON_FRAME_END__\\n'; done"
+
+
+def monitor_host(host, ssh_opts, stop, update):
+    """Keep a session until it fails; back off 5–60 seconds before reconnecting."""
+    retry_delay = 5.0
+    while not stop.is_set():
+        proc = None
+        try:
+            argv = (["bash", "-c", STREAM_CMD] if is_local(host) else
+                    ["ssh", *ssh_opts, "-T", "-o", "ServerAliveInterval=15",
+                     "-o", "ServerAliveCountMax=2", host,
+                     "bash -c " + shlex.quote(STREAM_CMD)])
+            # stderr goes to a file so diagnostics cannot fill a pipe and
+            # block the session. Surface the last diagnostic on disconnect.
+            with tempfile.TemporaryFile() as errors:
+                try:
+                    proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=errors)
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(proc.stdout, selectors.EVENT_READ)
+                        pending = b""
+                        while not stop.is_set():
+                            proc.stdin.write(b"\n")
+                            proc.stdin.flush()
+                            deadline = time.monotonic() + SSH_TIMEOUT
+                            while FRAME_END not in pending:
+                                if stop.is_set():
+                                    return
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError("timeout")
+                                if not selector.select(min(remaining, 0.2)):
+                                    continue
+                                chunk = os.read(proc.stdout.fileno(), 65536)
+                                if not chunk:
+                                    raise ConnectionError("session disconnected")
+                                pending += chunk
+                            snapshot, pending = pending.split(FRAME_END, 1)
+                            update(parse_snapshot(snapshot.decode(errors="replace")), None)
+                            retry_delay = 5.0
+                            if stop.wait(REFRESH_SECONDS):
+                                return
+                except (ConnectionError, BrokenPipeError) as exc:
+                    errors.seek(0, os.SEEK_END)
+                    errors.seek(max(0, errors.tell() - 2048))
+                    detail = errors.read().decode(errors="replace").strip()
+                    raise ConnectionError(detail or "session disconnected") from exc
+                finally:
+                    if proc is not None:
+                        # Closing stdin lets the remote read loop exit even
+                        # when the SSH transport is shared with other clients.
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                        try:
+                            proc.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=0.5)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait()
+                        proc.stdout.close()
+        except Exception as exc:
+            if not stop.is_set():
+                update(None, f"{exc}; retry in {retry_delay:g}s")
+        if stop.wait(retry_delay):
+            return
+        retry_delay = min(retry_delay * 2, 60.0)
+
+
 def run_loop(hosts, ssh_opts):
-    """Live refresh loop with independent per-host pollers.
+    """Live refresh loop with an independent persistent session per host.
 
     Each host runs its own poll thread and writes into a shared state dict.
     The render loop reads that dict on its own cadence — so one stuck SSH
@@ -497,22 +582,20 @@ def run_loop(hosts, ssh_opts):
     state = {h: (None, "connecting", None) for h in hosts}
     stop = threading.Event()
 
+    def update(host, gpus, err):
+        if gpus is not None:
+            state[host] = (gpus, None, time.monotonic())
+        else:
+            prev_gpus, _, prev_ts = state[host]
+            state[host] = (prev_gpus, err, prev_ts)
+
     def poller(host):
-        while not stop.is_set():
-            _, gpus, err = query_host(host, ssh_opts)
-            if gpus is not None:
-                state[host] = (gpus, None, time.monotonic())
-            else:
-                # Keep last-good data (if any) so the table stays useful;
-                # record the latest failure so it can be shown inline.
-                prev_gpus, _, prev_ts = state[host]
-                state[host] = (prev_gpus, err, prev_ts)
-            if stop.wait(REFRESH_SECONDS):
-                return
+        monitor_host(host, ssh_opts, stop, lambda gpus, err: update(host, gpus, err))
 
     clear()
-    for h in hosts:
-        threading.Thread(target=poller, args=(h,), daemon=True).start()
+    threads = [threading.Thread(target=poller, args=(h,), daemon=True) for h in hosts]
+    for thread in threads:
+        thread.start()
 
     try:
         while not stop.is_set():
@@ -530,6 +613,8 @@ def run_loop(hosts, ssh_opts):
                 break
     finally:
         stop.set()
+        for thread in threads:
+            thread.join()
 
 
 def parse_args(argv):
@@ -554,7 +639,7 @@ def parse_args(argv):
     p.add_argument("-r", "--refresh", type=float, default=REFRESH_SECONDS, metavar="SEC",
                    help=f"refresh interval in seconds (default: {REFRESH_SECONDS:g})")
     p.add_argument("-t", "--timeout", type=int, default=SSH_TIMEOUT, metavar="SEC",
-                   help=f"per-host SSH timeout in seconds (default: {SSH_TIMEOUT})")
+                   help=f"per-host snapshot timeout in seconds (default: {SSH_TIMEOUT})")
     p.add_argument("-f", "--free-mem", type=int, default=FREE_MEM_MIB, metavar="MIB",
                    help=f"MiB used below which an idle GPU counts as free (default: {FREE_MEM_MIB})")
     jg = p.add_mutually_exclusive_group()
@@ -562,7 +647,12 @@ def parse_args(argv):
                     help="override the jump host from config")
     jg.add_argument("--no-jump", action="store_true",
                     help="ignore the jump host from config")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not math.isfinite(args.refresh) or args.refresh <= 0:
+        p.error("--refresh must be a finite number greater than zero")
+    if args.timeout <= 0:
+        p.error("--timeout must be greater than zero")
+    return args
 
 
 def main():
@@ -592,7 +682,7 @@ def main():
     ssh_opts = build_ssh_opts(jump)
 
     # CLI args override config file hosts (jump flags above apply either way)
-    hosts = args.hosts or config_hosts
+    hosts = list(dict.fromkeys(args.hosts or config_hosts))
 
     # Validate before entering the alternate screen, otherwise leave_screen()
     # wipes this message before the user can read it.

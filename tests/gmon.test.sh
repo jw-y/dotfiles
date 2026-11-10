@@ -16,6 +16,7 @@ GMON="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/gmon"
 
 PASS=0 FAIL=0 CURRENT=""
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gmon-test.XXXXXX")"
+ROOT="$(cd "$ROOT" && pwd)"
 trap 'rm -rf "$ROOT"' EXIT
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
@@ -247,16 +248,16 @@ echo "${DIM}local${OFF}"
 # hand — so the keyword must bypass ssh entirely.
 printf 'local\n' > "$CONFIG"
 out="$(gmon --once)"
-it "polls this machine directly";    assert_eq "$(wc -l < "$GMON_SSH_LOG")" "0"
+it "polls this machine directly";    assert_eq "$(wc -l < "$GMON_SSH_LOG" | tr -d '[:space:]')" "0"
 it "and still renders its GPUs";     assert_contains "$out" "H200"
 # Writing the box's own hostname is the obvious thing to try, and it must mean
 # the same thing rather than quietly opening a connection to ourselves.
 printf '%s\n' "$(hostname)" > "$CONFIG"
 gmon --once >/dev/null
-it "the real hostname is local too"; assert_eq "$(wc -l < "$GMON_SSH_LOG")" "0"
+it "the real hostname is local too"; assert_eq "$(wc -l < "$GMON_SSH_LOG" | tr -d '[:space:]')" "0"
 printf '%s\n' "$(hostname | cut -d. -f1)" > "$CONFIG"
 gmon --once >/dev/null
-it "so is its short form";           assert_eq "$(wc -l < "$GMON_SSH_LOG")" "0"
+it "so is its short form";           assert_eq "$(wc -l < "$GMON_SSH_LOG" | tr -d '[:space:]')" "0"
 
 # ------------------------------------------------------------- no GPUs -----
 echo "${DIM}degraded hosts${OFF}"

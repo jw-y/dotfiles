@@ -185,6 +185,20 @@ Claude's remote-control feature (claude.ai/code, the mobile app) talks to a loca
 
 Run `cdc --help` for the command map, and `make test` for the regression suite. `cdc` needs `python3` on `PATH`.
 
+## GPU monitoring (`gmon`)
+
+Run `gmon --edit` to configure SSH aliases in `~/.config/gmon/hosts`, then
+run `gmon` for a live GPU table. Use `local` to monitor this machine without
+SSH, or pass host aliases directly: `gmon gpu-a gpu-b`.
+
+Live mode keeps one SSH shell session open per host and requests updates
+through that session every 3 seconds. Refreshes do not open new SSH sessions.
+If a session disconnects or a query times out, `gmon` keeps the last GPU data
+and retries after 5 seconds, increasing the delay up to 60 seconds for
+consecutive failures. Ctrl-C closes the sessions. `gmon -r 10` changes the
+refresh interval; `gmon --once` (also used for redirected output) fetches a
+single snapshot and exits.
+
 ## Multiplexing independent Slurm clusters (`smux`)
 
 `smux` submits and inspects jobs across several independent Slurm controllers
