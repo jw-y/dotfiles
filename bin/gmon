@@ -14,18 +14,21 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # ── Config (defaults; overridable via CLI flags) ──────────────────────────────
 CONFIG_FILE = Path("~/.config/gmon/hosts").expanduser()
 REFRESH_SECONDS = 3.0
 SSH_TIMEOUT = 15
+DISK_PATH = "~"  # evaluated on each monitored host
 FREE_MEM_MIB = 1024  # a GPU with no users and less VRAM used than this counts as "free"
 STALE_FACTOR = 3     # rows dim out if their last good poll is older than STALE_FACTOR × REFRESH_SECONDS
 # ─────────────────────────────────────────────────────────────────────────────
 
-QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed"
+QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu"
 # Fetches GPU stats then process→user mapping in one snapshot
 # Uses gpu_uuid to correlate apps→GPU index (gpu_index not supported on all drivers)
 CMD = (
@@ -38,6 +41,49 @@ CMD = (
     "  [ -n \"$user\" ] && echo \"$uuid,$user\"; "
     "done"
 )
+
+# Linux host metrics: sample CPU counters across the GPU query plus a short
+# interval, including in --once mode. MemAvailable excludes reclaimable cache
+# from used RAM. Missing /proc leaves host metrics unavailable.
+CPU_SAMPLE = "awk '/^cpu / {for(i=2;i<=9;i++) t+=$i; printf \"%.0f %.0f\\n\", t, $5+$6; exit}' /proc/stat"
+CMD = (
+    "gmon_cpu_before=''; "
+    "if [ -r /proc/stat ] && [ -r /proc/meminfo ]; then "
+    f"gmon_cpu_before=$({CPU_SAMPLE}); fi; "
+    + CMD + "; echo '---system---'; "
+    "if [ -n \"$gmon_cpu_before\" ]; then sleep 0.2; "
+    "awk -v before=\"$gmon_cpu_before\" '"
+    "/^cpu / {split(before,b); for(i=2;i<=9;i++) t+=$i; "
+    "dt=t-b[1]; idle=$5+$6-b[2]; cpu=(dt>0 ? 100*(dt-idle)/dt : -1)} "
+    "/^MemTotal:/ {total=$2} /^MemAvailable:/ {available=$2; have_available=1} "
+    "END {printf \"%.1f,%.0f,%.0f\\n\", cpu, "
+    "(have_available ? total-available : -1), total}' /proc/stat /proc/meminfo; fi"
+)
+
+
+@dataclass
+class Snapshot:
+    gpus: list
+    cpu: Optional[float] = None
+    mem_used_kib: Optional[int] = None
+    mem_total_kib: Optional[int] = None
+    disk_available_kib: Optional[int] = None
+    disk_used_percent: Optional[int] = None
+
+
+def query_command():
+    """Quote the path locally, but resolve ~ using the monitored host's HOME."""
+    if DISK_PATH == "~":
+        path = '"$HOME"'
+    elif DISK_PATH.startswith("~/"):
+        path = '"$HOME"/' + shlex.quote(DISK_PATH[2:])
+    else:
+        # Prefix relative paths to keep leading '-' from becoming df flags.
+        path = shlex.quote(DISK_PATH if DISK_PATH.startswith("/") else "./" + DISK_PATH)
+    return (CMD + "; echo '---disk---'; "
+            + f"LC_ALL=C df -Pk {path} 2>/dev/null | "
+            + "awk 'NR==2 {print $4 \" , \" $5}'")
+
 
 def _fg(r, g, b):
     return f"\033[38;2;{r};{g};{b}m"
@@ -165,7 +211,7 @@ def is_local(host):
 
 def query_host(host, ssh_opts):
     try:
-        argv = ["bash", "-c", CMD] if is_local(host) else ["ssh", *ssh_opts, host, CMD]
+        argv = ["bash", "-c", query_command()] if is_local(host) else ["ssh", *ssh_opts, host, query_command()]
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=SSH_TIMEOUT
         )
@@ -180,7 +226,9 @@ def query_host(host, ssh_opts):
 
 
 def parse_snapshot(output):
-    sections = output.strip().split("---\n", 1)
+    output, _, disk_output = output.partition("---disk---\n")
+    gpu_output, _, system_output = output.partition("---system---\n")
+    sections = gpu_output.strip().split("---\n", 1)
     gpu_lines = sections[0].strip().splitlines()
     proc_lines = sections[1].strip().splitlines() if len(sections) > 1 else []
 
@@ -196,9 +244,9 @@ def parse_snapshot(output):
     gpus = []
     for line in gpu_lines:
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 8:
+        if len(parts) < 7:
             continue
-        name, uuid, idx, util, mem_used, mem_total, temp, fan = parts[:8]
+        name, uuid, idx, util, mem_used, mem_total, temp = parts[:7]
         gpus.append({
             "name":      name.removeprefix("NVIDIA ").strip(),
             "idx":       idx,
@@ -206,10 +254,28 @@ def parse_snapshot(output):
             "mem_used":  _int(mem_used),
             "mem_total": _int(mem_total),
             "temp":      _int(temp),
-            "fan":       _int(fan),
             "users":     uuid_users.get(uuid, []),
         })
-    return gpus
+    snapshot = Snapshot(gpus)
+    try:
+        cpu, used, total = system_output.strip().split(",")
+        cpu, used, total = float(cpu), int(used), int(total)
+        if math.isfinite(cpu) and 0 <= cpu <= 100:
+            snapshot.cpu = cpu
+        if 0 <= used <= total and total > 0:
+            snapshot.mem_used_kib, snapshot.mem_total_kib = used, total
+    except ValueError:
+        pass
+    try:
+        available, used_percent = disk_output.strip().split(",")
+        available = int(available.strip())
+        used_percent = int(used_percent.strip().removesuffix("%"))
+        if available >= 0 and 0 <= used_percent <= 100:
+            snapshot.disk_available_kib = available
+            snapshot.disk_used_percent = used_percent
+    except ValueError:
+        pass
+    return snapshot
 
 
 def _int(val):
@@ -301,7 +367,7 @@ def compress_indices(indexes):
 
 
 def render(results, live=True):
-    """Render a frame. `results` is a list of (host, gpus, err, age_seconds).
+    """Render a frame. `results` is a list of (host, snapshot, err, age_seconds).
 
     age_seconds is None for one-shot mode or hosts that have never returned;
     otherwise it's seconds since the last *successful* poll for that host.
@@ -309,10 +375,13 @@ def render(results, live=True):
     now = datetime.now().strftime("%H:%M:%S")
     lines = []
 
-    srt = sorted(results, key=lambda r: r[0])
+    # Keep configuration/CLI order, including the free-GPU summary.
+    snapshots = {host: snapshot for host, snapshot, _, _ in results}
+    results = [(host, snapshot.gpus if snapshot is not None else None, err, age)
+               for host, snapshot, err, age in results]
 
-    free = {}  # host -> [idx, ...], in host-sorted order
-    for host, gpus, *_ in srt:
+    free = {}  # host -> [idx, ...], in configured order
+    for host, gpus, *_ in results:
         for gpu in gpus or []:
             if is_free(gpu):
                 free.setdefault(host, []).append(gpu["idx"])
@@ -347,25 +416,18 @@ def render(results, live=True):
     ])
     # util cell = 10-wide bar + space + 6-wide " 100%"  (each block = 10%, matches mem)
     # mem cell  = 10-wide bar + space + 13-wide "used/total" (fits H200's 143771/143771)
-    # Datacentre cards report no fan at all, so on a fleet of them the column
-    # is five characters of '—' on every row. Shown only when something on
-    # screen actually has a reading — the same rule the other conditional
-    # columns here follow.
-    show_fan = any(g["fan"] is not None
-                   for _, gpus, _, _ in results if gpus for g in gpus)
-    col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 17, "mem": 24, "temp": 6, "fan": 5, "users": users_w}
+    col_w = {"host": host_w, "gpu": gpu_w, "idx": 3, "util": 17, "mem": 24, "temp": 6, "users": users_w}
     header = (
         f"  {'HOST':<{col_w['host']}}  {'GPU':<{col_w['gpu']}}  "
         f"{'#':>{col_w['idx']}}  {'UTIL%':^{col_w['util']}}  "
         f"{'MEMORY (MiB)':^{col_w['mem']}}  {'TEMP':>{col_w['temp']}}  "
-        + (f"{'FAN%':>{col_w['fan']}}  " if show_fan else "")
         + f"{'USERS':<{col_w['users']}}"
     )
     # No rule under the header: the header is already dimmed away from the
     # data, and a full-width line costs a row to repeat that.
     lines.append(c("subtext0", header))
 
-    for i, (host, gpus, err, age) in enumerate(srt):
+    for i, (host, gpus, err, age) in enumerate(results):
         # A blank row between hosts. The hostname column and the rotating
         # accent already mark where a group starts, so this is not needed to
         # parse the table — it is needed to read it, and four rows across five
@@ -385,12 +447,20 @@ def render(results, live=True):
                 msg = c("overlay1", "no data")
             lines.append(f"  {host_cell}  {msg}")
             continue
+        stale = age is not None and age > REFRESH_SECONDS * STALE_FACTOR
+        snapshot = snapshots[host]
+        cpu = f"{snapshot.cpu:.0f}%" if snapshot.cpu is not None else "?"
+        ram = (f"{snapshot.mem_used_kib / 1048576:.1f}/{snapshot.mem_total_kib / 1048576:.1f} GiB"
+               if snapshot.mem_total_kib is not None else "?")
+        disk = (f"{snapshot.disk_available_kib / 1048576:.1f} GiB free ({snapshot.disk_used_percent}% used)"
+                if snapshot.disk_available_kib is not None else "?")
+        disk_label = "home" if DISK_PATH == "~" else DISK_PATH
+        lines.append(f"  {host_cell}  " + c("overlay0" if stale else "subtext0",
+                                          f"CPU {cpu}   RAM {ram}   DISK {disk_label} {disk}"))
+        host_cell = " " * col_w["host"]
         if not gpus:
             lines.append(f"  {host_cell}  " + c("yellow", "no GPUs / nvidia-smi not found"))
-            continue
 
-        # We have data, but the latest poll(s) may have failed → dim the row
-        stale = age is not None and age > REFRESH_SECONDS * STALE_FACTOR
         # Stale rows render uniformly dim; otherwise each cell picks its own color
         dim = lambda vivid: "overlay0" if stale else vivid
 
@@ -408,8 +478,6 @@ def render(results, live=True):
             mem_cell   = c(dim("subtext1"), f"{mem_str:>13}")
             temp_cell  = (c(dim(temp_color(temp)), f"{temp:>4}°C") if temp is not None
                           else c(dim("overlay1"), "   ?°C"))
-            fan_cell   = (c(dim("overlay1"), f"{gpu['fan']:>4}%") if gpu["fan"] is not None
-                          else c(dim("overlay1"), f"{'—':>5}"))
             users_cell = (c(dim("subtext1"), ", ".join(users)) if users
                           else c(dim("overlay0"), "idle"))
             ubar = util_bar(util, dim=stale)
@@ -422,7 +490,6 @@ def render(results, live=True):
                 f"{ubar} {util_text}  "
                 f"{mbar} {mem_cell}  "
                 f"{temp_cell}  "
-                + (f"{fan_cell}  " if show_fan else "")
                 + f"{users_cell}"
             )
             lines.append(line)
@@ -478,7 +545,8 @@ def poll(hosts, ssh_opts):
         futures = {ex.submit(query_host, h, ssh_opts): h for h in hosts}
         for f in as_completed(futures):
             results.append(f.result())
-    return results
+    by_host = {row[0]: row for row in results}
+    return [by_host[host] for host in hosts]
 
 
 def run_once(hosts, ssh_opts):
@@ -492,7 +560,8 @@ def run_once(hosts, ssh_opts):
 # to the existing stdin; they never launch another ssh or SSH exec channel.
 # EOF on stdin ends the remote loop when gmon exits.
 FRAME_END = b"\n__GMON_FRAME_END__\n"
-STREAM_CMD = "while IFS= read -r request; do " + CMD + "; printf '\\n__GMON_FRAME_END__\\n'; done"
+def stream_command():
+    return "while IFS= read -r request; do " + query_command() + "; printf '\\n__GMON_FRAME_END__\\n'; done"
 
 
 def monitor_host(host, ssh_opts, stop, update):
@@ -501,10 +570,10 @@ def monitor_host(host, ssh_opts, stop, update):
     while not stop.is_set():
         proc = None
         try:
-            argv = (["bash", "-c", STREAM_CMD] if is_local(host) else
+            argv = (["bash", "-c", stream_command()] if is_local(host) else
                     ["ssh", *ssh_opts, "-T", "-o", "ServerAliveInterval=15",
                      "-o", "ServerAliveCountMax=2", host,
-                     "bash -c " + shlex.quote(STREAM_CMD)])
+                     "bash -c " + shlex.quote(stream_command())])
             # stderr goes to a file so diagnostics cannot fill a pipe and
             # block the session. Surface the last diagnostic on disconnect.
             with tempfile.TemporaryFile() as errors:
@@ -578,19 +647,19 @@ def run_loop(hosts, ssh_opts):
     the table) but stash the failure reason in `err`, which the render
     surfaces inline as "stale Ns (timeout)" etc.
     """
-    # host -> (gpus_or_None, err_or_None, last_successful_ts_or_None)
+    # host -> (snapshot_or_None, err_or_None, last_successful_ts_or_None)
     state = {h: (None, "connecting", None) for h in hosts}
     stop = threading.Event()
 
-    def update(host, gpus, err):
-        if gpus is not None:
-            state[host] = (gpus, None, time.monotonic())
+    def update(host, snapshot, err):
+        if snapshot is not None:
+            state[host] = (snapshot, None, time.monotonic())
         else:
-            prev_gpus, _, prev_ts = state[host]
-            state[host] = (prev_gpus, err, prev_ts)
+            prev_snapshot, _, prev_ts = state[host]
+            state[host] = (prev_snapshot, err, prev_ts)
 
     def poller(host):
-        monitor_host(host, ssh_opts, stop, lambda gpus, err: update(host, gpus, err))
+        monitor_host(host, ssh_opts, stop, lambda snapshot, err: update(host, snapshot, err))
 
     clear()
     threads = [threading.Thread(target=poller, args=(h,), daemon=True) for h in hosts]
@@ -602,9 +671,9 @@ def run_loop(hosts, ssh_opts):
             now = time.monotonic()
             results = []
             for h in hosts:
-                gpus, err, ts = state[h]
+                snapshot, err, ts = state[h]
                 age = (now - ts) if ts is not None else None
-                results.append((h, gpus, err, age))
+                results.append((h, snapshot, err, age))
             # Home cursor and overwrite in place; clear-below wipes any rows
             # left over from a taller previous frame
             sys.stdout.write("\033[H" + render(results) + "\033[J")
@@ -642,6 +711,8 @@ def parse_args(argv):
                    help=f"per-host snapshot timeout in seconds (default: {SSH_TIMEOUT})")
     p.add_argument("-f", "--free-mem", type=int, default=FREE_MEM_MIB, metavar="MIB",
                    help=f"MiB used below which an idle GPU counts as free (default: {FREE_MEM_MIB})")
+    p.add_argument("--disk-path", default=DISK_PATH, metavar="PATH",
+                   help="filesystem path to check on each host (default: remote home)")
     jg = p.add_mutually_exclusive_group()
     jg.add_argument("-j", "--jump", metavar="HOST",
                     help="override the jump host from config")
@@ -652,11 +723,13 @@ def parse_args(argv):
         p.error("--refresh must be a finite number greater than zero")
     if args.timeout <= 0:
         p.error("--timeout must be greater than zero")
+    if not args.disk_path or any(ord(char) < 32 or ord(char) == 127 for char in args.disk_path):
+        p.error("--disk-path must be a nonempty path without control characters")
     return args
 
 
 def main():
-    global REFRESH_SECONDS, SSH_TIMEOUT, FREE_MEM_MIB
+    global REFRESH_SECONDS, SSH_TIMEOUT, FREE_MEM_MIB, DISK_PATH
     args = parse_args(sys.argv[1:])
 
     if args.edit:
@@ -666,6 +739,7 @@ def main():
     REFRESH_SECONDS = args.refresh
     SSH_TIMEOUT = args.timeout
     FREE_MEM_MIB = args.free_mem
+    DISK_PATH = args.disk_path
 
     # One-shot if asked, or whenever stdout isn't a terminal (piped/redirected) —
     # a live refresh loop only makes sense on an interactive screen.

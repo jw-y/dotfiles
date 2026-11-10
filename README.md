@@ -188,8 +188,17 @@ Run `cdc --help` for the command map, and `make test` for the regression suite. 
 ## GPU monitoring (`gmon`)
 
 Run `gmon --edit` to configure SSH aliases in `~/.config/gmon/hosts`, then
-run `gmon` for a live GPU table. Use `local` to monitor this machine without
-SSH, or pass host aliases directly: `gmon gpu-a gpu-b`.
+run `gmon` for a live GPU table. Servers stay in host-file order (or the order
+of explicit host arguments). Each server shows CPU utilization and used/total
+system RAM, plus disk free space and percent used, once above its GPU rows. CPU utilization is sampled over a short
+interval; used RAM excludes available cache using Linux `MemAvailable`.
+Host metrics show `?` where Linux `/proc` counters are unavailable. Use `local`
+to monitor this machine without SSH, or pass host aliases directly:
+`gmon gpu-a gpu-b`.
+Disk usage defaults to the filesystem containing your remote home directory;
+use `gmon --disk-path /scratch` to check another filesystem on every host.
+The summary labels the path being checked. Unavailable disk readings show `?`.
+Disk readings come from `df` and do not represent your personal storage quota.
 
 Live mode keeps one SSH shell session open per host and requests updates
 through that session every 3 seconds. Refreshes do not open new SSH sessions.

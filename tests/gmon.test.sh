@@ -45,13 +45,8 @@ cat > "$BIN/nvidia-smi" <<'STUB'
 case "$*" in
     *--query-gpu=*)
         if [ -n "${GMON_FAKE_NO_GPUS:-}" ]; then exit 0; fi
-        if [ -n "${GMON_FAKE_NO_FAN:-}" ]; then
-            echo 'NVIDIA H200, GPU-aaaa, 0, 0, 12, 143771, 31, [N/A]'
-            echo 'NVIDIA H200, GPU-bbbb, 1, 97, 120000, 143771, 84, [N/A]'
-            exit 0
-        fi
-        echo 'NVIDIA H200, GPU-aaaa, 0, 0, 12, 143771, 31, [N/A]'
-        echo 'NVIDIA H200, GPU-bbbb, 1, 97, 120000, 143771, 84, 61'
+        echo 'NVIDIA H200, GPU-aaaa, 0, 0, 12, 143771, 31'
+        echo 'NVIDIA H200, GPU-bbbb, 1, 97, 120000, 143771, 84'
         ;;
     *--query-compute-apps=*)
         [ -n "${GMON_FAKE_NO_GPUS:-}" ] && exit 0
@@ -157,8 +152,8 @@ spec = importlib.util.spec_from_loader(
 gmon = importlib.util.module_from_spec(spec)
 sys.modules["gmon"] = gmon
 spec.loader.exec_module(gmon)
-rows = [("alpha", [{"name": "A100", "idx": "0", "util": 0, "mem_used": 0,
-                    "mem_total": 81920, "temp": 40, "fan": 30, "users": []}], None, None)]
+rows = [("alpha", gmon.Snapshot([{"name": "A100", "idx": "0", "util": 0, "mem_used": 0,
+                    "mem_total": 81920, "temp": 40, "users": []}]), None, None)]
 print("live-newline" if gmon.render(rows, live=True).endswith("\n") else "live-clean",
       "once-newline" if gmon.render(rows, live=False).endswith("\n") else "once-clean")
 PYEOF
@@ -169,19 +164,9 @@ it "drops the NVIDIA name prefix";   assert_missing "$out" "NVIDIA H200"
 it "shows utilisation";              assert_contains "$out" "97%"
 it "shows memory used and total";    assert_contains "$out" "120000/143771"
 it "shows temperature";              assert_contains "$out" "84°C"
-# A fan reading of [N/A] is normal on datacentre cards; it must render as a
-# dash rather than crashing the int conversion or printing 'None'.
-it "renders an absent fan reading";  assert_contains "$out" "—"
+it "does not show fan speed";        assert_missing "$out" "FAN%"
+it "does not query fan speed";       assert_missing "$(cat "$GMON_SSH_LOG")" "fan.speed"
 it "never prints a bare None";       assert_missing "$out" "None"
-
-# Datacentre cards report no fan, so on a fleet of them the column is five
-# characters of '—' per row. It appears only when something on screen has a
-# reading — here one card does.
-it "fan shows when one card has it"; assert_contains "$out" "FAN%"
-nofan="$(GMON_FAKE_NO_FAN=1 gmon --once)"
-it "and vanishes when none do";      assert_missing "$nofan" "FAN%"
-it "taking its dashes with it";      assert_missing "$nofan" "—"
-it "while the rest still renders";   assert_contains "$nofan" "120000/143771"
 
 # Utilisation and memory do not change colour with their value: a GPU at 97%
 # is working, not in trouble, and a number that shifts hue as it climbs reads
