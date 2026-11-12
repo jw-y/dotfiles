@@ -30,15 +30,23 @@ STALE_FACTOR = 3     # rows dim out if their last good poll is older than STALE_
 
 QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gpu"
 # Fetches GPU stats then process→user mapping in one snapshot
-# Uses gpu_uuid to correlate apps→GPU index (gpu_index not supported on all drivers)
+# Structured compute records use UUIDs. The full process table supplements
+# them with graphics/MPS records keyed by index (no graphics CSV query).
 CMD = (
     f"nvidia-smi --query-gpu={QUERY} --format=csv,noheader,nounits 2>/dev/null; "
     "echo '---'; "
-    "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits 2>/dev/null "
-    "| while IFS=, read uuid pid; do "
+    "{ nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits 2>/dev/null; "
+    "LC_ALL=C nvidia-smi 2>/dev/null | awk '"
+    "/Processes:/ {processes=1} "
+    "processes && $1==\"|\" && $2 ~ /^[0-9]+$/ {"
+    "for(i=3;i<=NF;i++) "
+    "if($i ~ /^[CGMO](\\+[CGMO])*$/ && $(i-1) ~ /^[0-9]+$/) {"
+    "print \"index:\" $2 \",\" $(i-1); break}}'; } "
+    "| sort -u | while IFS=, read uuid pid; do "
     "  uuid=$(echo $uuid | tr -d ' '); pid=$(echo $pid | tr -d ' '); "
-    "  user=$(ps -o user= -p $pid 2>/dev/null | tr -d ' '); "
-    "  [ -n \"$user\" ] && echo \"$uuid,$user\"; "
+    "  user=$(ps -o user:256= -p $pid 2>/dev/null | tr -d ' '); "
+    "  [ -n \"$user\" ] || user=\"unknown (PID $pid)\"; "
+    "  echo \"$uuid,$user\"; "
     "done"
 )
 
@@ -254,7 +262,8 @@ def parse_snapshot(output):
             "mem_used":  _int(mem_used),
             "mem_total": _int(mem_total),
             "temp":      _int(temp),
-            "users":     uuid_users.get(uuid, []),
+            "users":     list(dict.fromkeys(uuid_users.get(uuid, [])
+                                            + uuid_users.get(f"index:{idx}", []))),
         })
     snapshot = Snapshot(gpus)
     try:
@@ -338,8 +347,15 @@ def util_bar(util, width=10, dim=False):
 
 
 def is_free(gpu):
-    """A GPU with no compute processes and near-empty VRAM is grabbable."""
-    return not gpu["users"] and (gpu["mem_used"] or 0) < FREE_MEM_MIB
+    """A GPU with no known users, no activity and near-empty VRAM is grabbable."""
+    return (not gpu["users"] and gpu["mem_used"] is not None
+            and gpu["mem_used"] < FREE_MEM_MIB and gpu["util"] == 0)
+
+
+def gpu_users_label(gpu):
+    if gpu["users"]:
+        return ", ".join(gpu["users"])
+    return "idle" if is_free(gpu) else "unknown"
 
 
 def compress_indices(indexes):
@@ -364,6 +380,16 @@ def compress_indices(indexes):
         parts.append(str(start) if start == previous else f"{start}-{previous}")
         start = previous = number
     return ",".join(parts)
+
+
+def host_metrics(snapshot):
+    cpu = f"{snapshot.cpu:.0f}%" if snapshot.cpu is not None else "?"
+    ram = (f"{snapshot.mem_used_kib / 1048576:.1f}/{snapshot.mem_total_kib / 1048576:.1f} GiB"
+           if snapshot.mem_total_kib is not None else "?")
+    disk = (f"{snapshot.disk_available_kib / 1048576:.1f} GiB free ({snapshot.disk_used_percent}% used)"
+            if snapshot.disk_available_kib is not None else "?")
+    disk_label = "home" if DISK_PATH == "~" else DISK_PATH
+    return f"CPU {cpu:>4}", f"RAM {ram}", f"DISK {disk_label} {disk}"
 
 
 def render(results, live=True):
@@ -407,11 +433,17 @@ def render(results, live=True):
         lines.append(cb("green" if n_free else "overlay1", f"  {summary}")
                      + c("subtext0", f"  {detail}"))
 
+    # Size host summary columns across the whole frame before adding colors.
+    metrics = {host: host_metrics(snapshot) for host, snapshot in snapshots.items()
+               if snapshot is not None}
+    metric_widths = [max((len(cells[i]) for cells in metrics.values()), default=0)
+                     for i in range(2)]
+
     # host/gpu/users size to the widest value present (floored at the header label)
     host_w = max([len("HOST")] + [len(h) for h, _, _, _ in results])
     gpu_w = max([len("GPU")] + [len(g["name"]) for _, gpus, _, _ in results if gpus for g in gpus])
     users_w = max([len("USERS")] + [
-        len(", ".join(g["users"]) if g["users"] else "idle")
+        len(gpu_users_label(g))
         for _, gpus, _, _ in results if gpus for g in gpus
     ])
     # util cell = 10-wide bar + space + 6-wide " 100%"  (each block = 10%, matches mem)
@@ -448,15 +480,9 @@ def render(results, live=True):
             lines.append(f"  {host_cell}  {msg}")
             continue
         stale = age is not None and age > REFRESH_SECONDS * STALE_FACTOR
-        snapshot = snapshots[host]
-        cpu = f"{snapshot.cpu:.0f}%" if snapshot.cpu is not None else "?"
-        ram = (f"{snapshot.mem_used_kib / 1048576:.1f}/{snapshot.mem_total_kib / 1048576:.1f} GiB"
-               if snapshot.mem_total_kib is not None else "?")
-        disk = (f"{snapshot.disk_available_kib / 1048576:.1f} GiB free ({snapshot.disk_used_percent}% used)"
-                if snapshot.disk_available_kib is not None else "?")
-        disk_label = "home" if DISK_PATH == "~" else DISK_PATH
-        lines.append(f"  {host_cell}  " + c("overlay0" if stale else "subtext0",
-                                          f"CPU {cpu}   RAM {ram}   DISK {disk_label} {disk}"))
+        cpu, ram, disk = metrics[host]
+        summary = f"{cpu:<{metric_widths[0]}}   {ram:<{metric_widths[1]}}   {disk}"
+        lines.append(f"  {host_cell}  " + c("overlay0" if stale else "subtext0", summary))
         host_cell = " " * col_w["host"]
         if not gpus:
             lines.append(f"  {host_cell}  " + c("yellow", "no GPUs / nvidia-smi not found"))
@@ -478,8 +504,7 @@ def render(results, live=True):
             mem_cell   = c(dim("subtext1"), f"{mem_str:>13}")
             temp_cell  = (c(dim(temp_color(temp)), f"{temp:>4}°C") if temp is not None
                           else c(dim("overlay1"), "   ?°C"))
-            users_cell = (c(dim("subtext1"), ", ".join(users)) if users
-                          else c(dim("overlay0"), "idle"))
+            users_cell = c(dim("subtext1" if users else "overlay0"), gpu_users_label(gpu))
             ubar = util_bar(util, dim=stale)
             mbar = mem_bar(mu, mt, dim=stale)
 

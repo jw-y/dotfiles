@@ -203,7 +203,21 @@ printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/test 24
             view = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", gmon.render(rows, live=live))
             self.assertLess(view.index('zeta:0'), view.index('alpha:0'))
             self.assertLess(view.index('zeta '), view.index('alpha '))
-            self.assertEqual(view.count('CPU 24%   RAM 6.0/8.0 GiB'), 2)
+            self.assertEqual(view.count('CPU  24%   RAM 6.0/8.0 GiB'), 2)
+
+    def test_host_metrics_align_with_different_values_and_missing_data(self):
+        rows = [('short', gmon.Snapshot([], 1, 1048576, 8388608, 1048576, 1), None, None),
+                ('longer-host', gmon.Snapshot([], 100, 128*1048576, 512*1048576,
+                                               420*1048576, 82), None, 100),
+                ('unknown', gmon.Snapshot([]), None, None)]
+        for live in (True, False):
+            view = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", gmon.render(rows, live=live))
+            summaries = [line for line in view.splitlines() if 'CPU ' in line]
+            self.assertEqual(len(summaries), 3)
+            for label in ('CPU ', 'RAM ', 'DISK home '):
+                self.assertEqual(len({line.index(label) for line in summaries}), 1)
+            self.assertIn('100%', summaries[1])
+            self.assertIn('128.0/512.0 GiB', summaries[1])
 
     def test_disk_path_is_quoted_and_home_resolves_on_host(self):
         home = str(self.root / 'remote home')
@@ -233,6 +247,55 @@ printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/test 24
         self.assertIn('DISK home 420.0 GiB free (82% used)', view)
         for data in ('garbage', '-1,50%', '100,101%', '100,NaN'):
             self.assertIsNone(gmon.parse_snapshot('---disk---\n' + data).disk_available_kib)
+
+    def test_allocated_or_active_gpu_without_owner_is_not_idle(self):
+        for used, util in [(48941, 0), (12, 95), (None, 0), (12, None)]:
+            with self.subTest(used=used, util=util):
+                gpu = dict(name='H100', idx='7', util=util, mem_used=used,
+                           mem_total=81559, temp=29, users=[])
+                self.assertFalse(gmon.is_free(gpu))
+                self.assertEqual(gmon.gpu_users_label(gpu), 'unknown')
+                view = gmon.render([('keti1', gmon.Snapshot([gpu]), None, None)])
+                self.assertIn('unknown', view)
+                self.assertNotIn('keti1:7', view)
+
+    def test_unresolved_process_keeps_its_pid(self):
+        (self.root / 'ps').write_text('#!/usr/bin/env bash\nexit 0\n')
+        _, snapshot, err = gmon.query_host('fake-host', [])
+        self.assertIsNone(err)
+        self.assertEqual(snapshot.gpus[0]['users'], ['unknown (PID 4242)'])
+        self.assertFalse(gmon.is_free(snapshot.gpus[0]))
+
+    def test_graphics_process_owner_in_modern_and_legacy_tables(self):
+        smi = self.root / 'nvidia-smi'
+        ps = self.root / 'ps'
+        ps.write_text('#!/usr/bin/env bash\necho minjaeoh\n')
+        for process_row in [
+            '|    7   N/A  N/A         3225204      G   .../venv/bin/python      48926MiB |',
+            '|    7   3225204      G   .../venv/bin/python      48926MiB |',
+            '|    7   N/A  N/A         3225204      C+G   python      48926MiB |',
+            '|    7   N/A  N/A         3225204      M+C   python      48926MiB |',
+        ]:
+            smi.write_text("""#!/usr/bin/env bash
+case "$*" in
+  *--query-gpu=*) echo 'NVIDIA H100, GPU-g, 7, 0, 48941, 81559, 29' ;;
+  *--query-compute-apps=*) exit 0 ;;
+  *) printf '%s\\n' '| Processes: |' """ + gmon.shlex.quote(process_row) + """ ;;
+esac
+""")
+            _, snapshot, err = gmon.query_host('fake-host', [])
+            self.assertIsNone(err)
+            self.assertEqual(snapshot.gpus[0]['users'], ['minjaeoh'])
+            self.assertFalse(gmon.is_free(snapshot.gpus[0]))
+
+    def test_compute_and_full_table_records_deduplicate_users(self):
+        smi = self.root / 'nvidia-smi'
+        script = smi.read_text().replace('esac', """  *) printf '%s\\n' '| Processes: |' '| 0 N/A N/A 4242 C python 12MiB |' ;;
+esac""")
+        smi.write_text(script)
+        _, snapshot, err = gmon.query_host('fake-host', [])
+        self.assertIsNone(err)
+        self.assertEqual(snapshot.gpus[0]['users'], ['alice'])
 
     def test_invalid_intervals_are_rejected(self):
         for value in ('0', '-1', 'nan', 'inf'):
