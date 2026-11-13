@@ -2,8 +2,10 @@
 """GPU monitor — polls nvidia-smi across SSH hosts and renders a live table."""
 
 import argparse
+import json
 import math
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -14,7 +16,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,6 +25,8 @@ from typing import Optional
 CONFIG_FILE = Path("~/.config/gmon/hosts").expanduser()
 REFRESH_SECONDS = 3.0
 SSH_TIMEOUT = 15
+SHOW_TOPOLOGY = False
+GPU_BACKEND = "auto"  # prefer NVML, fall back to nvidia-smi
 DISK_PATH = "~"  # evaluated on each monitored host
 FREE_MEM_MIB = 1024  # a GPU with no users and less VRAM used than this counts as "free"
 STALE_FACTOR = 3     # rows dim out if their last good poll is older than STALE_FACTOR × REFRESH_SECONDS
@@ -32,23 +36,67 @@ QUERY = "name,uuid,index,utilization.gpu,memory.used,memory.total,temperature.gp
 # Fetches GPU stats then process→user mapping in one snapshot
 # Structured compute records use UUIDs. The full process table supplements
 # them with graphics/MPS records keyed by index (no graphics CSV query).
-CMD = (
-    f"nvidia-smi --query-gpu={QUERY} --format=csv,noheader,nounits 2>/dev/null; "
-    "echo '---'; "
-    "{ nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits 2>/dev/null; "
-    "LC_ALL=C nvidia-smi 2>/dev/null | awk '"
-    "/Processes:/ {processes=1} "
-    "processes && $1==\"|\" && $2 ~ /^[0-9]+$/ {"
-    "for(i=3;i<=NF;i++) "
-    "if($i ~ /^[CGMO](\\+[CGMO])*$/ && $(i-1) ~ /^[0-9]+$/) {"
-    "print \"index:\" $2 \",\" $(i-1); break}}'; } "
-    "| sort -u | while IFS=, read uuid pid; do "
-    "  uuid=$(echo $uuid | tr -d ' '); pid=$(echo $pid | tr -d ' '); "
-    "  user=$(ps -o user:256= -p $pid 2>/dev/null | tr -d ' '); "
-    "  [ -n \"$user\" ] || user=\"unknown (PID $pid)\"; "
-    "  echo \"$uuid,$user\"; "
-    "done"
-)
+# Bound each probe inside the persistent shell; batch all PID owner lookups.
+PROBE_HELPERS = r"""
+gmon_run() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground -k 0.2 "$@"
+    else
+        python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+except FileNotFoundError:
+    sys.exit(127)
+' "$@"
+    fi
+}
+gmon_stage() {
+    gmon_label=$1; shift
+    gmon_run "$gmon_timeout" "$@"
+    gmon_rc=$?
+    if [ "$gmon_rc" -ne 0 ]; then
+        printf '\n!gmon:%s:%s\n' "$gmon_label" "$gmon_rc"
+    fi
+}
+"""
+CMD = r"""gmon_stage gpu nvidia-smi --query-gpu=QUERY_FIELDS --format=csv,noheader,nounits
+echo '---'
+gmon_apps=$( {
+    gmon_stage compute nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits
+    gmon_stage processes nvidia-smi | awk '
+        /^!gmon:/ {print; next}
+        /Processes:/ {processes=1}
+        processes && $1=="|" && $2 ~ /^[0-9]+$/ {
+            for(i=3;i<=NF;i++)
+                if($i ~ /^[CGMO]([+][CGMO])*$/ && $(i-1) ~ /^[0-9]+$/) {
+                    print "index:" $2 "," $(i-1); break
+                }
+        }'
+} | sort -u)
+gmon_pids=$(printf '%s\n' "$gmon_apps" | awk -F, '
+    $2 ~ /^[[:space:]]*[0-9]+$/ {gsub(/[[:space:]]/,"",$2); print $2}' | sort -u | paste -sd, -)
+gmon_users=''
+if [ -n "$gmon_pids" ]; then
+    gmon_users=$(gmon_stage owners ps -o pid=,user:256= -p "$gmon_pids")
+fi
+printf '%s\n' "$gmon_apps" | GMON_OWNERS="$gmon_users" awk -F, '
+    BEGIN {
+        n=split(ENVIRON["GMON_OWNERS"],lines,"\n")
+        for(i=1;i<=n;i++) {
+            if(lines[i] ~ /^!gmon:/) {print lines[i]; continue}
+            gsub(/^[[:space:]]+|[[:space:]]+$/,"",lines[i])
+            split(lines[i],parts,/[[:space:]]+/); users[parts[1]]=parts[2]
+        }
+    }
+    /^!gmon:/ {print; next}
+    $2 ~ /^[[:space:]]*[0-9]+$/ {
+        gsub(/[[:space:]]/,"",$2)
+        print $1 "," (users[$2] != "" ? users[$2] : "unknown (PID " $2 ")")
+    }'""".replace("QUERY_FIELDS", QUERY)
+
+GPU_CMD = CMD
 
 # Linux host metrics: sample CPU counters across the GPU query plus a short
 # interval, including in --once mode. MemAvailable excludes reclaimable cache
@@ -77,9 +125,14 @@ class Snapshot:
     mem_total_kib: Optional[int] = None
     disk_available_kib: Optional[int] = None
     disk_used_percent: Optional[int] = None
+    warnings: list = field(default_factory=list)
+    gpu_available: bool = True
+    gpu_age: Optional[float] = None
+    topology: list = field(default_factory=list)
+    topology_pending: bool = False
 
 
-def query_command():
+def query_command(include_topology=True, include_gpu=True):
     """Quote the path locally, but resolve ~ using the monitored host's HOME."""
     if DISK_PATH == "~":
         path = '"$HOME"'
@@ -88,9 +141,31 @@ def query_command():
     else:
         # Prefix relative paths to keep leading '-' from becoming df flags.
         path = shlex.quote(DISK_PATH if DISK_PATH.startswith("/") else "./" + DISK_PATH)
-    return (CMD + "; echo '---disk---'; "
-            + f"LC_ALL=C df -Pk {path} 2>/dev/null | "
-            + "awk 'NR==2 {print $4 \" , \" $5}'")
+    # One-shot queries prefer NVML too, but reserve time for the CLI fallback
+    # and host metrics if initialization takes too long.
+    native_budget = max(0.05, SSH_TIMEOUT * 0.5)
+    budget = max(0.01, min(3.0, (SSH_TIMEOUT - 1) / 7))
+    gpu_command = GPU_CMD if include_gpu else "true"
+    if include_gpu and GPU_BACKEND != "smi":
+        native = ("printf '\\n' | gmon_run " + str(native_budget)
+                  + " python3 -u -c " + shlex.quote(NVML_WORKER))
+        fallback = GPU_CMD if GPU_BACKEND == "auto" else "printf '\\n!gmon:gpu:1\\n'"
+        gpu_command = (
+            "gmon_native=$(" + native + "); gmon_native_rc=$?; "
+            "case \"$gmon_native\" in *'!gmon:nvml:'*) gmon_native_rc=1;; esac; "
+            "if [ \"$gmon_native_rc\" -eq 0 ]; then printf '%s\\n' \"$gmon_native\"; "
+            "else gmon_left=$((gmon_snapshot_budget - (SECONDS - gmon_started))); "
+            "gmon_timeout=$(awk -v left=\"$gmon_left\" "
+            "'BEGIN {n=left/7; if(n>3)n=3; if(n<0.01)n=0.01; print n}'); "
+            + fallback + "; fi")
+    command = (PROBE_HELPERS + f"export LC_ALL=C; gmon_timeout={budget:g}; "
+               + f"gmon_started=$SECONDS; gmon_snapshot_budget={max(0, SSH_TIMEOUT-1)}; "
+               + CMD.replace(GPU_CMD, gpu_command) + "; echo '---disk---'; "
+               + f"gmon_stage disk df -Pk {path} 2>/dev/null | "
+               + """awk '/^!gmon:/ {print; next} NR==2 {print $4 "," $5}'""")
+    if include_topology and SHOW_TOPOLOGY:
+        command += "; echo '---topology---'; gmon_stage topology nvidia-smi topo -m"
+    return command
 
 
 def _fg(r, g, b):
@@ -219,7 +294,7 @@ def is_local(host):
 
 def query_host(host, ssh_opts):
     try:
-        argv = ["bash", "-c", query_command()] if is_local(host) else ["ssh", *ssh_opts, host, query_command()]
+        argv = ["bash", "-c", query_command()] if is_local(host) else ["ssh", *ssh_opts, host, "bash -c " + shlex.quote(query_command())]
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=SSH_TIMEOUT
         )
@@ -234,6 +309,16 @@ def query_host(host, ssh_opts):
 
 
 def parse_snapshot(output):
+    failed = {}
+    clean = []
+    for line in output.splitlines():
+        if line.startswith("!gmon:"):
+            _, label, code = line.split(":", 2)
+            failed[label] = code
+        else:
+            clean.append(line)
+    output = "\n".join(clean) + "\n"
+    output, _, topology_output = output.partition("---topology---\n")
     output, _, disk_output = output.partition("---disk---\n")
     gpu_output, _, system_output = output.partition("---system---\n")
     sections = gpu_output.strip().split("---\n", 1)
@@ -265,7 +350,25 @@ def parse_snapshot(output):
             "users":     list(dict.fromkeys(uuid_users.get(uuid, [])
                                             + uuid_users.get(f"index:{idx}", []))),
         })
-    snapshot = Snapshot(gpus)
+    age = failed.pop("age", None)
+    snapshot = Snapshot(gpus, gpu_available=not ({"gpu", "pending"} & failed.keys())
+                        and not ("collection" in failed and not gpus))
+    if age is not None:
+        try:
+            snapshot.gpu_age = max(0, float(age))
+        except ValueError:
+            pass
+    snapshot.topology = parse_topology(topology_output)
+    snapshot.topology_pending = topology_output.strip() == "pending"
+    labels = {"gpu": "GPU stats", "compute": "Compute processes",
+              "processes": "Graphics processes", "owners": "Owner lookup", "disk": "Disk",
+              "pending": "GPU data", "collection": "GPU collection", "host": "Host metrics", "topology": "GPU topology"}
+    for label, code in failed.items():
+        reason = "pending" if label == "pending" else ("timed out" if code in ("124", "137") else "unavailable")
+        snapshot.warnings.append(f"{labels.get(label, label)} {reason}")
+    for gpu in gpus:
+        gpu["owners_complete"] = not ({"compute", "processes", "owners", "collection"} & failed.keys())
+
     try:
         cpu, used, total = system_output.strip().split(",")
         cpu, used, total = float(cpu), int(used), int(total)
@@ -285,6 +388,33 @@ def parse_snapshot(output):
     except ValueError:
         pass
     return snapshot
+
+
+def parse_topology(output):
+    """Keep only the GPU-to-GPU matrix; omit NICs and CPU-affinity columns."""
+    header, columns, rows = [], [], []
+    # Some driver versions underline the header even when stdout is a pipe.
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    for line in output.splitlines():
+        tokens = line.split()
+        if not tokens:
+            continue
+        if not header:
+            columns = [i for i, token in enumerate(tokens)
+                       if token.startswith("GPU") and token[3:].isdigit()]
+            if columns and columns[0] == 0:
+                header = [tokens[i] for i in columns]
+            continue
+        if tokens[0] in header and len(tokens) > max(columns) + 1:
+            cells = [tokens[i + 1] for i in columns]
+            if all(cell in ("X", "SYS", "NODE", "PHB", "PXB", "PIX")
+                   or (cell.startswith("NV") and cell[2:].isdigit()) for cell in cells):
+                rows.append([tokens[0], *cells])
+    if not rows or len(rows) != len(header):
+        return []
+    table = [["", *header], *rows]
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    return ["  ".join(f"{cell:>{widths[i]}}" for i, cell in enumerate(row)) for row in table]
 
 
 def _int(val):
@@ -348,7 +478,7 @@ def util_bar(util, width=10, dim=False):
 
 def is_free(gpu):
     """A GPU with no known users, no activity and near-empty VRAM is grabbable."""
-    return (not gpu["users"] and gpu["mem_used"] is not None
+    return (gpu.get("owners_complete", True) and not gpu["users"] and gpu["mem_used"] is not None
             and gpu["mem_used"] < FREE_MEM_MIB and gpu["util"] == 0)
 
 
@@ -408,6 +538,10 @@ def render(results, live=True):
 
     free = {}  # host -> [idx, ...], in configured order
     for host, gpus, *_ in results:
+        if (snapshots[host] is None or not snapshots[host].gpu_available
+                or (snapshots[host].gpu_age is not None
+                    and snapshots[host].gpu_age > REFRESH_SECONDS * STALE_FACTOR)):
+            continue
         for gpu in gpus or []:
             if is_free(gpu):
                 free.setdefault(host, []).append(gpu["idx"])
@@ -484,11 +618,20 @@ def render(results, live=True):
         summary = f"{cpu:<{metric_widths[0]}}   {ram:<{metric_widths[1]}}   {disk}"
         lines.append(f"  {host_cell}  " + c("overlay0" if stale else "subtext0", summary))
         host_cell = " " * col_w["host"]
-        if not gpus:
+        snapshot = snapshots[host]
+        if snapshot.warnings:
+            lines.append(f"  {host_cell}  " + c("overlay0" if stale else "yellow",
+                                              "; ".join(snapshot.warnings)))
+        if not gpus and snapshot.gpu_available:
             lines.append(f"  {host_cell}  " + c("yellow", "no GPUs / nvidia-smi not found"))
 
-        # Stale rows render uniformly dim; otherwise each cell picks its own color
-        dim = lambda vivid: "overlay0" if stale else vivid
+        gpu_stale = (not snapshot.gpu_available or (snapshot.gpu_age is not None
+                     and snapshot.gpu_age > REFRESH_SECONDS * STALE_FACTOR))
+        if gpu_stale and snapshot.gpus:
+            age_text = f" ({snapshot.gpu_age:.0f}s old)" if snapshot.gpu_age is not None else ""
+            lines.append(f"  {host_cell}  " + c("yellow", "GPU readings stale" + age_text))
+        # Host metrics remain fresh while an old GPU snapshot dims.
+        dim = lambda vivid: "overlay0" if stale or gpu_stale else vivid
 
         for gpu in gpus:
             util = gpu["util"]
@@ -505,8 +648,8 @@ def render(results, live=True):
             temp_cell  = (c(dim(temp_color(temp)), f"{temp:>4}°C") if temp is not None
                           else c(dim("overlay1"), "   ?°C"))
             users_cell = c(dim("subtext1" if users else "overlay0"), gpu_users_label(gpu))
-            ubar = util_bar(util, dim=stale)
-            mbar = mem_bar(mu, mt, dim=stale)
+            ubar = util_bar(util, dim=stale or gpu_stale)
+            mbar = mem_bar(mu, mt, dim=stale or gpu_stale)
 
             line = (
                 f"  {host_cell}  "
@@ -519,6 +662,17 @@ def render(results, live=True):
             )
             lines.append(line)
             host_cell = " " * col_w["host"]  # only show hostname on first GPU row
+
+        if SHOW_TOPOLOGY:
+            if snapshot.topology:
+                lines.append(f"  {host_cell}  " + c("subtext0", "GPU links"))
+                for topology_row in snapshot.topology:
+                    lines.append(f"  {host_cell}  " + c("overlay1", topology_row))
+                lines.append(f"  {host_cell}  " + c("overlay0",
+                    "NV# = NVLink links; PIX/PXB = PCIe switches; PHB/NODE/SYS = CPU/PCIe paths"))
+            else:
+                status = "pending" if snapshot.topology_pending else "unavailable"
+                lines.append(f"  {host_cell}  " + c("overlay1", f"GPU links {status}"))
 
         if stale:
             why = f" ({err})" if err else ""
@@ -581,12 +735,335 @@ def run_once(hosts, ssh_opts):
     sys.stdout.flush()
 
 
-# A request/response loop inside ONE shell session. Refreshes write a newline
-# to the existing stdin; they never launch another ssh or SSH exec channel.
-# EOF on stdin ends the remote loop when gmon exits.
+# One remote agent answers refresh requests through the existing SSH channel.
+# Slow GPU collection runs separately from host metrics. EOF stops the agent
+# and its probes without launching another SSH process per refresh.
 FRAME_END = b"\n__GMON_FRAME_END__\n"
+NVML_WORKER = r"""import ctypes as c
+import os
+import pwd
+import sys
+
+class NvmlError(Exception):
+    pass
+
+class Memory(c.Structure):
+    _fields_ = [("total", c.c_ulonglong), ("free", c.c_ulonglong), ("used", c.c_ulonglong)]
+
+class Utilization(c.Structure):
+    _fields_ = [("gpu", c.c_uint), ("memory", c.c_uint)]
+
+class Process(c.Structure):
+    # Explicit v2 ABI: never pass this layout to an unversioned/v3 function.
+    _fields_ = [("pid", c.c_uint), ("used", c.c_ulonglong),
+                ("gpu_instance", c.c_uint), ("compute_instance", c.c_uint)]
+
+class Nvml:
+    def __init__(self):
+        self.lib = c.CDLL("libnvidia-ml.so.1")
+        self.bind("nvmlInit_v2", [])
+        self.bind("nvmlShutdown", [])
+        self.bind("nvmlDeviceGetCount_v2", [c.POINTER(c.c_uint)])
+        self.bind("nvmlDeviceGetHandleByIndex_v2", [c.c_uint, c.POINTER(c.c_void_p)])
+        for name in ("Name", "UUID"):
+            self.bind("nvmlDeviceGet" + name, [c.c_void_p, c.c_char_p, c.c_uint])
+        self.bind("nvmlDeviceGetMemoryInfo", [c.c_void_p, c.POINTER(Memory)])
+        self.bind("nvmlDeviceGetUtilizationRates", [c.c_void_p, c.POINTER(Utilization)])
+        self.bind("nvmlDeviceGetTemperature", [c.c_void_p, c.c_uint, c.POINTER(c.c_uint)])
+        for kind in ("Compute", "Graphics"):
+            self.bind("nvmlDeviceGet" + kind + "RunningProcesses_v2",
+                      [c.c_void_p, c.POINTER(c.c_uint), c.POINTER(Process)])
+        self.call("nvmlInit_v2")
+        self.names = {}
+        self.uid_names = {}
+
+    def bind(self, name, args):
+        func = getattr(self.lib, name)
+        func.argtypes = args
+        func.restype = c.c_uint
+
+    def call(self, name, *args):
+        code = getattr(self.lib, name)(*args)
+        if code:
+            raise NvmlError(str(code))
+        return code
+
+    def text(self, handle, name):
+        data = c.create_string_buffer(256)
+        self.call("nvmlDeviceGet" + name, handle, data, len(data))
+        return data.value.decode(errors="replace")
+
+    def processes(self, handle, kind):
+        func = getattr(self.lib, "nvmlDeviceGet" + kind + "RunningProcesses_v2")
+        capacity = 32
+        for attempt in range(4):
+            count = c.c_uint(capacity)
+            data = (Process * capacity)()
+            code = func(handle, c.byref(count), data)
+            if code == 7:  # NVML_ERROR_INSUFFICIENT_SIZE; the list may grow mid-query.
+                capacity = max(capacity * 2, count.value + 8)
+                continue
+            if code:
+                raise NvmlError(str(code))
+            return [data[i].pid for i in range(count.value)]
+        raise NvmlError("process list kept growing")
+
+    def owner(self, pid):
+        try:
+            with open("/proc/" + str(pid) + "/status") as status:
+                for line in status:
+                    if line.startswith("Uid:"):
+                        uid = int(line.split()[1])
+                        if uid not in self.uid_names:
+                            try:
+                                self.uid_names[uid] = pwd.getpwuid(uid).pw_name
+                            except KeyError:
+                                self.uid_names[uid] = str(uid)
+                        return self.uid_names[uid]
+        except (OSError, ValueError):
+            pass
+        return "unknown (PID " + str(pid) + ")"
+
+    def snapshot(self):
+        count = c.c_uint()
+        self.call("nvmlDeviceGetCount_v2", c.byref(count))
+        rows, processes, warnings = [], [], []
+        owners = {}
+        for index in range(count.value):
+            handle = c.c_void_p()
+            self.call("nvmlDeviceGetHandleByIndex_v2", index, c.byref(handle))
+            if index not in self.names:
+                self.names[index] = (self.text(handle, "Name"), self.text(handle, "UUID"))
+            name, uuid = self.names[index]
+            memory, util, temperature = Memory(), Utilization(), c.c_uint()
+            memory_code = self.lib.nvmlDeviceGetMemoryInfo(handle, c.byref(memory))
+            util_code = self.lib.nvmlDeviceGetUtilizationRates(handle, c.byref(util))
+            temp_code = self.lib.nvmlDeviceGetTemperature(handle, 0, c.byref(temperature))
+            rows.append(",".join(map(str, [
+                name, uuid, index, util.gpu if not util_code else "N/A",
+                memory.used // 1048576 if not memory_code else "N/A",
+                memory.total // 1048576 if not memory_code else "N/A",
+                temperature.value if not temp_code else "N/A"])))
+            pids = set()
+            for kind, label in (("Compute", "compute"), ("Graphics", "processes")):
+                try:
+                    pids.update(self.processes(handle, kind))
+                except NvmlError as exc:
+                    warnings.append("!gmon:" + label + ":" + str(exc))
+            for pid in sorted(pids):
+                if pid not in owners:
+                    owners[pid] = self.owner(pid)
+                processes.append(uuid + "," + owners[pid])
+        return "\n".join(rows + ["---"] + processes + list(dict.fromkeys(warnings))) + "\n"
+
+def main():
+    nvml = None
+    try:
+        nvml = Nvml()
+        for request in sys.stdin:
+            try:
+                output = nvml.snapshot()
+            except (NvmlError, OSError, AttributeError):
+                output = "!gmon:nvml:1\n"
+            sys.stdout.write(output + "\n__GMON_FRAME_END__\n")
+            sys.stdout.flush()
+    except (OSError, AttributeError, NvmlError):
+        sys.stdout.write("!gmon:nvml:127\n\n__GMON_FRAME_END__\n")
+        sys.stdout.flush()
+    finally:
+        if nvml is not None:
+            nvml.lib.nvmlShutdown()
+
+if __name__ == "__main__":
+    main()
+"""
+
+GPU_TIMEOUT = 60.0
+LIVE_AGENT = r"""import json, os, selectors, signal, subprocess, sys, threading, time
+
+config = json.loads(sys.argv[1])
+stop = threading.Event()
+lock = threading.Lock()
+children = {}
+cache = {"data": "!gmon:pending:0\n", "sampled": None, "topology": "pending"}
+gpu_ready = threading.Event()
+
+def capture(command, deadline, label):
+    with lock:
+        if stop.is_set():
+            return ""
+        proc = subprocess.Popen(["bash", "-c", command], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        children[proc] = label
+    try:
+        output, _ = proc.communicate(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            output, _ = proc.communicate(timeout=0.3)
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or b""
+        output += ("\n!gmon:" + label + ":124\n").encode()
+    finally:
+        with lock:
+            if proc.poll() is not None:
+                children.pop(proc, None)
+    return output.decode(errors="replace")
+
+nvml_proc = None
+nvml_buffer = b""
+
+def nvml_snapshot():
+    global nvml_proc, nvml_buffer
+    if nvml_proc is None:
+        with lock:
+            if stop.is_set():
+                return ""
+            nvml_proc = subprocess.Popen([sys.executable, "-u", "-c", config["nvml"]],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, start_new_session=True)
+            children[nvml_proc] = "nvml"
+    proc = nvml_proc
+    proc.stdin.write(b"\n")
+    proc.stdin.flush()
+    end = b"\n__GMON_FRAME_END__\n"
+    deadline = time.monotonic() + config["gpu_timeout"]
+    with selectors.DefaultSelector() as selector:
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while end not in nvml_buffer:
+            if stop.is_set():
+                return ""
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NVML timeout")
+            if not selector.select(0.2):
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError("NVML stopped")
+            nvml_buffer += chunk
+    output, nvml_buffer = nvml_buffer.split(end, 1)
+    output = output.decode(errors="replace")
+    if "!gmon:nvml:" in output:
+        raise RuntimeError("NVML unavailable")
+    return output + "\n"
+
+def close_nvml():
+    global nvml_proc, nvml_buffer
+    with lock:
+        proc, nvml_proc = nvml_proc, None
+        nvml_buffer = b""
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    proc.stdout.close()
+    with lock:
+        if proc.poll() is not None:
+            children.pop(proc, None)
+
+
+def collect_gpus():
+    last_good = ""
+    sampled = None
+    backend = config["backend"]
+    while not stop.is_set():
+        started = time.monotonic()
+        if backend == "smi":
+            output = capture(config["gpu"], config["gpu_timeout"], "collection")
+        else:
+            try:
+                output = nvml_snapshot()
+            except (RuntimeError, TimeoutError, OSError, ValueError):
+                close_nvml()
+                if backend == "auto":
+                    backend = "smi"
+                    output = capture(config["gpu"], config["gpu_timeout"], "collection")
+                else:
+                    output = "!gmon:gpu:1\n"
+        # Retain previous GPU readings if the primary statistics probe failed.
+        has_rows = any(len(line.split(",")) >= 7 for line in output.split("---", 1)[0].splitlines())
+        if "!gmon:gpu:" not in output and has_rows:
+            last_good, sampled = output, started
+        elif last_good:
+            output = last_good + "\n" + "\n".join(
+                line for line in output.splitlines() if line.startswith("!gmon:"))
+        with lock:
+            cache.update(data=output, sampled=sampled)
+        gpu_ready.set()
+        if stop.wait(config["refresh"]):
+            return
+        # A driver process stuck in the kernel must not accumulate new probes.
+        while not stop.is_set():
+            with lock:
+                blocked = any(label == "collection" and proc.poll() is None for proc, label in children.items())
+            if not blocked:
+                break
+            stop.wait(0.2)
+
+def collect_topology():
+    while not stop.is_set():
+        if gpu_ready.wait(0.2):
+            break
+    if stop.is_set():
+        return
+    output = capture("LC_ALL=C nvidia-smi topo -m", config["gpu_timeout"], "topology")
+    with lock:
+        cache["topology"] = output
+
+
+gpu_thread = threading.Thread(target=collect_gpus, daemon=True)
+gpu_thread.start()
+if config["topology"]:
+    threading.Thread(target=collect_topology, daemon=True).start()
+try:
+    for request in sys.stdin:
+        host = capture(config["host"], config["host_timeout"], "host")
+        with lock:
+            data, sampled = cache["data"], cache["sampled"]
+            topology = "\n---topology---\n" + cache["topology"] if config["topology"] else ""
+        age = "" if sampled is None else "\n!gmon:age:" + str(time.monotonic() - sampled) + "\n"
+        sys.stdout.write(data + "\n" + host + age + topology + "\n__GMON_FRAME_END__\n")
+        sys.stdout.flush()
+finally:
+    with lock:
+        stop.set()
+        for proc in children:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    gpu_thread.join(timeout=0.2)
+    close_nvml()
+"""
+
+
 def stream_command():
-    return "while IFS= read -r request; do " + query_command() + "; printf '\\n__GMON_FRAME_END__\\n'; done"
+    """One remote Python agent keeps slow GPU collection off the refresh path."""
+    config = dict(
+        gpu=PROBE_HELPERS + f"export LC_ALL=C; gmon_timeout={GPU_TIMEOUT:g}; " + GPU_CMD,
+        gpu_timeout=GPU_TIMEOUT,
+        backend=GPU_BACKEND,
+        nvml=NVML_WORKER,
+        host=query_command(include_topology=False, include_gpu=False),
+        topology=SHOW_TOPOLOGY,
+        host_timeout=max(0.1, SSH_TIMEOUT * 0.8),
+        refresh=REFRESH_SECONDS,
+    )
+    return "python3 -u -c " + shlex.quote(LIVE_AGENT) + " " + shlex.quote(json.dumps(config))
 
 
 def monitor_host(host, ssh_opts, stop, update):
@@ -738,6 +1215,10 @@ def parse_args(argv):
                    help=f"MiB used below which an idle GPU counts as free (default: {FREE_MEM_MIB})")
     p.add_argument("--disk-path", default=DISK_PATH, metavar="PATH",
                    help="filesystem path to check on each host (default: remote home)")
+    p.add_argument("--backend", choices=("auto", "nvml", "smi"), default=GPU_BACKEND,
+                   help="GPU collector (default: auto prefers NVML, with nvidia-smi fallback)")
+    p.add_argument("--topology", action="store_true",
+                   help="show GPU hardware links (NVLink/PCIe); cached once per live session")
     jg = p.add_mutually_exclusive_group()
     jg.add_argument("-j", "--jump", metavar="HOST",
                     help="override the jump host from config")
@@ -754,7 +1235,7 @@ def parse_args(argv):
 
 
 def main():
-    global REFRESH_SECONDS, SSH_TIMEOUT, FREE_MEM_MIB, DISK_PATH
+    global REFRESH_SECONDS, SSH_TIMEOUT, FREE_MEM_MIB, DISK_PATH, GPU_BACKEND, SHOW_TOPOLOGY
     args = parse_args(sys.argv[1:])
 
     if args.edit:
@@ -765,6 +1246,8 @@ def main():
     SSH_TIMEOUT = args.timeout
     FREE_MEM_MIB = args.free_mem
     DISK_PATH = args.disk_path
+    GPU_BACKEND = args.backend
+    SHOW_TOPOLOGY = args.topology
 
     # One-shot if asked, or whenever stdout isn't a terminal (piped/redirected) —
     # a live refresh loop only makes sense on an interactive screen.

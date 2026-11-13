@@ -57,7 +57,7 @@ esac
 STUB
 chmod +x "$BIN/nvidia-smi"
 
-# gmon resolves a pid to an owner with 'ps -o user= -p'. Answering from a table
+# gmon resolves owners in one batch with 'ps -o pid=,user:256= -p'. Answering from a table
 # keeps the test independent of what is actually running on this machine.
 cat > "$BIN/ps" <<'STUB'
 #!/usr/bin/env bash
@@ -66,10 +66,12 @@ while [ $# -gt 0 ]; do
     case "$1" in -p) pid="$2"; shift ;; esac
     shift
 done
-case "$pid" in
-    4242) echo alice ;;
-    4243) echo bob ;;
-esac
+for entry in $(printf %s "$pid" | tr , ' '); do
+    case "$entry" in
+        4242) echo '4242 alice' ;;
+        4243) echo '4243 bob' ;;
+    esac
+done
 STUB
 chmod +x "$BIN/ps"
 
@@ -78,7 +80,7 @@ chmod +x "$BIN/ps"
 # the network.
 cat > "$BIN/ssh" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${GMON_SSH_LOG:?}"
+printf 'SSH invocation\n%s\n' "$*" >> "${GMON_SSH_LOG:?}"
 if [ -n "${GMON_SSH_FAIL:-}" ]; then
     echo "ssh: connect to host port 22: Connection refused" >&2
     exit 255
@@ -206,7 +208,7 @@ it "--free-mem can exclude it";      assert_contains "$(gmon --once --free-mem 8
 # ------------------------------------------------------------------ ssh -----
 echo "${DIM}ssh${OFF}"
 gmon --once >/dev/null
-it "polls a remote host over ssh";   assert_eq "$(grep -c 'nvidia-smi' "$GMON_SSH_LOG")" "1"
+it "polls a remote host over ssh";   assert_eq "$(grep -c '^SSH invocation$' "$GMON_SSH_LOG")" "1"
 it "keeps the connection warm";      assert_contains "$(cat "$GMON_SSH_LOG")" "ControlPersist=30s"
 it "never prompts for a password";   assert_contains "$(cat "$GMON_SSH_LOG")" "BatchMode=yes"
 

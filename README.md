@@ -190,8 +190,8 @@ Run `cdc --help` for the command map, and `make test` for the regression suite. 
 Run `gmon --edit` to configure SSH aliases in `~/.config/gmon/hosts`, then
 run `gmon` for a live GPU table. Servers stay in host-file order (or the order
 of explicit host arguments). Each server shows CPU utilization and used/total
-system RAM, plus disk free space and percent used, once above its GPU rows. CPU utilization is sampled over a short
-interval; used RAM excludes available cache using Linux `MemAvailable`.
+system RAM, plus disk free space and percent used, once above its GPU rows.
+CPU utilization is sampled over a short interval; used RAM excludes available cache using Linux `MemAvailable`.
 Host metrics show `?` where Linux `/proc` counters are unavailable. Use `local`
 to monitor this machine without SSH, or pass host aliases directly:
 `gmon gpu-a gpu-b`.
@@ -200,13 +200,36 @@ use `gmon --disk-path /scratch` to check another filesystem on every host.
 The summary labels the path being checked. Unavailable disk readings show `?`.
 Disk readings come from `df` and do not represent your personal storage quota.
 
-Live mode keeps one SSH shell session open per host and requests updates
-through that session every 3 seconds. Refreshes do not open new SSH sessions.
-If a session disconnects or a query times out, `gmon` keeps the last GPU data
-and retries after 5 seconds, increasing the delay up to 60 seconds for
-consecutive failures. Ctrl-C closes the sessions. `gmon -r 10` changes the
-refresh interval; `gmon --once` (also used for redirected output) fetches a
-single snapshot and exits.
+Live mode keeps one SSH session and a small Python 3 agent per host, requesting
+host updates every 3 seconds. NVML is the default GPU collector: it keeps
+the NVIDIA driver library initialized and reads compute and graphics process
+owners without installing a Python package. If NVML is unavailable, it falls
+back to `nvidia-smi`. Use `--backend nvml` to require NVML or `--backend smi` to
+explicitly use the command-based collector.
+
+GPU collection runs independently in the background with a 60-second deadline, so slow NVIDIA queries do not block CPU/RAM/disk.
+Old GPU readings dim and show their age; missing or incomplete readings are not
+counted as free. Individual probe timeouts appear beside the affected metrics
+and do not reconnect SSH. NVML resolves owners through Linux process metadata;
+the command fallback uses one batch of PID lookups.
+
+If the session disconnects or stops responding, `gmon` keeps the last snapshot
+and reconnects after 5 seconds, increasing to 60 seconds for consecutive
+failures. Ctrl-C closes the session and stops its probes. `gmon -r 10` changes
+the refresh interval. `gmon --once` (also used for redirected output) fetches
+one snapshot with individually bounded probes and exits; `--timeout` controls
+its total snapshot budget. One-shot mode also tries NVML, with time reserved
+for host metrics and the command fallback if initialization stalls.
+
+Use `gmon --topology` to show the GPU-to-GPU hardware link matrix beneath each
+server. NV# means bonded NVLink links; PIX/PXB indicate PCIe-switch paths,
+and PHB/NODE/SYS indicate paths through host bridges or CPU interconnects.
+Topology is queried once per live session in the background and cached, so it
+does not slow normal refreshes or create new SSH sessions. NIC and CPU-affinity
+columns are omitted. Unavailable topology is labeled rather than guessed.
+
+Remote hosts need Python 3, Bash, and the standard
+`ps`, `awk`, and `df` commands; Linux hosts use GNU `timeout` when available.
 
 ## Multiplexing independent Slurm clusters (`smux`)
 
